@@ -1,0 +1,307 @@
+#!/usr/bin/env perl
+
+# Copyright (c) 2026 Todd T. Fries <todd@fries.net>
+#
+# Permission to use, copy, modify, and distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+use strict;
+use warnings;
+use Config::IniFiles;
+use Mail::IMAPClient;
+use IO::Socket::SSL;
+use IO::Select;
+use Sys::Syslog qw(:standard :macros);
+use Time::HiRes qw(time);
+use File::Path qw(make_path);
+use POSIX qw(:sys_wait_h setsid);
+
+# ================== PATHS ==================
+my $CONFIG_DIR  = "$ENV{HOME}/.config/imapidle";
+my $CONFIG_FILE = "$CONFIG_DIR/imapidle.conf";
+my $KNOWN_HOSTS = "$CONFIG_DIR/known_hosts";
+make_path($CONFIG_DIR) unless -d $CONFIG_DIR;
+
+openlog('imap-idle-notify', 'cons,pid', 'mail');
+
+# Global structures
+my %accounts;
+my %conns;
+my $select = IO::Select->new();
+my %sock_to_name;
+my %known_fingerprints;
+
+# ================== LOGGING (syslog only) ==================
+sub log_info  { syslog(LOG_INFO,  "%s", $_[0]); }
+sub log_warn  { syslog(LOG_WARNING, "%s", $_[0]); }
+sub log_error { syslog(LOG_ERR,     "%s", $_[0]); }
+
+# ================== CERTIFICATE TOFU (SSH-like) ==================
+sub load_known_hosts {
+    %known_fingerprints = ();
+    return unless -f $KNOWN_HOSTS;
+    open my $fh, '<', $KNOWN_HOSTS or return;
+    while (<$fh>) {
+        chomp;
+        next if /^\s*#/ or /^\s*$/;
+        my ($hostkey, $fp) = split /\s+/, $_, 2;
+        $known_fingerprints{$hostkey} = $fp if $hostkey && $fp;
+    }
+    close $fh;
+}
+
+sub save_known_hosts {
+    open my $fh, '>', $KNOWN_HOSTS or do { log_error("Cannot write $KNOWN_HOSTS: $!"); return; };
+    print $fh "# imap-idle-notify known_hosts (TOFU)\n";
+    print $fh "# format: server:port\tSHA256:fingerprint\n\n";
+    for my $k (sort keys %known_fingerprints) {
+        print $fh "$k\t$known_fingerprints{$k}\n";
+    }
+    close $fh;
+}
+
+sub approve_fingerprint {
+    my ($server, $port, $fingerprint) = @_;
+    my $hostkey = "$server:$port";
+
+    my $old = $known_fingerprints{$hostkey};
+    return 1 if $old && $old eq $fingerprint;   # unchanged & trusted
+
+    # New or changed certificate
+    if (! -t STDIN) {
+        log_error("Certificate unknown or changed for $hostkey — run the script interactively once to approve");
+        return 0;
+    }
+
+    print STDERR "\n";
+    if ($old) {
+        print STDERR "WARNING: Certificate CHANGED for $hostkey!\n";
+        print STDERR "  Old: $old\n";
+        print STDERR "  New: $fingerprint\n\n";
+    } else {
+        print STDERR "New SSL certificate for $hostkey\n";
+        print STDERR "Fingerprint: $fingerprint\n\n";
+    }
+
+    print STDERR "Accept this certificate? (y/N) ";
+    my $ans = <STDIN>;
+    chomp $ans;
+
+    if ($ans =~ /^y/i) {
+        $known_fingerprints{$hostkey} = $fingerprint;
+        save_known_hosts();
+        log_info("Certificate accepted for $hostkey");
+        return 1;
+    }
+    log_error("Certificate rejected for $hostkey");
+    return 0;
+}
+
+# ================== CONFIG & DEBOUNCE ==================
+sub load_config {
+    my $cfg = Config::IniFiles->new(-file => $CONFIG_FILE)
+        or die "Cannot read $CONFIG_FILE: $Config::IniFiles::errstr\n";
+
+    %accounts = ();
+    for my $section ($cfg->Sections) {
+        my $c = {
+            server         => $cfg->val($section, 'server')   or die "[$section] missing server",
+            port           => $cfg->val($section, 'port', 993),
+            user           => $cfg->val($section, 'user')     or die "[$section] missing user",
+            password       => $cfg->val($section, 'password') or die "[$section] missing password",
+            folder         => $cfg->val($section, 'folder', 'INBOX'),
+            priority       => $cfg->val($section, 'priority', 5) + 0,
+            mbsync_channel => $cfg->val($section, 'mbsync_channel')
+                or die "[$section] missing mbsync_channel (add it to your config)",
+        };
+        $accounts{$section} = $c;
+        log_info("Loaded [$section] → mbsync $c->{mbsync_channel} (priority $c->{priority})");
+    }
+}
+
+sub calculate_debounce {
+    my $p = shift;
+    return 8      if $p <= 2;
+    return 3600   if $p >= 9;
+    return 180 + ($p - 3) * 120;
+}
+
+# ================== CONNECTION ==================
+sub connect_account {
+    my ($name) = @_;
+    my $c = $accounts{$name} or return;
+
+    eval {
+        my $hostkey = "$c->{server}:$c->{port}";
+
+        my $socket = IO::Socket::SSL->new(
+            PeerAddr        => $c->{server},
+            PeerPort        => $c->{port},
+            SSL_verify_mode => SSL_VERIFY_NONE,
+            SSL_hostname    => $c->{server},
+        ) or die "SSL socket: $! $@";
+
+        my $fingerprint = $socket->get_fingerprint('SHA256');
+        approve_fingerprint($c->{server}, $c->{port}, $fingerprint)
+            or die "Certificate not approved";
+
+        my $imap = Mail::IMAPClient->new(
+            Socket   => $socket,
+            User     => $c->{user},
+            Password => $c->{password},
+        ) or die "IMAP login: $@";
+
+        $imap->select($c->{folder}) or die "SELECT: " . $imap->LastError;
+
+        my $tag = $imap->idle() or die "IDLE: " . $imap->LastError;
+
+        my $conn = {
+            name       => $name,
+            imap       => $imap,
+            tag        => $tag,
+            debounce   => calculate_debounce($c->{priority}),
+            last_event => 0,
+            socket     => $socket,
+            channel    => $c->{mbsync_channel},
+        };
+
+        $conns{$name} = $conn;
+        $sock_to_name{$socket} = $name;
+        $select->add($socket);
+
+        log_info("IDLE active [$name] $c->{user}/$c->{folder} (channel: $c->{mbsync_channel})");
+        return 1;
+    };
+    if ($@) {
+        log_error("Connect failed [$name]: $@");
+        return undef;
+    }
+}
+
+sub restart_idle {
+    my ($conn) = @_;
+    eval {
+        $conn->{imap}->done($conn->{tag}) if $conn->{tag};
+        $conn->{tag} = $conn->{imap}->idle() or die $conn->{imap}->LastError;
+    };
+    if ($@) { log_warn("restart_idle failed [$conn->{name}]: $@"); }
+}
+
+# ================== MBSYNC (forked, parallel) ==================
+sub trigger_mbsync {
+    my ($channel) = @_;
+    my $pid = fork();
+    if ($pid == 0) {                    # child
+        open STDIN,  '<', '/dev/null';
+        open STDOUT, '>', '/dev/null';
+        open STDERR, '>', '/dev/null';
+        exec('/usr/local/bin/mbsync', $channel) or exit 1;
+    } elsif ($pid > 0) {
+        log_info("Forked mbsync '$channel' (pid $pid)");
+    } else {
+        log_error("fork mbsync '$channel' failed: $!");
+    }
+}
+
+sub reap_children { 1 while waitpid(-1, WNOHANG) > 0; }
+
+sub process_notification {
+    my ($conn) = @_;
+    my $now = time();
+
+    eval {
+        my @data = $conn->{imap}->idle_data(0);
+        if (@data) {
+            for my $line (@data) {
+                chomp $line;
+                log_info("[$conn->{name}] IDLE: $line");
+            }
+
+            if ($now - $conn->{last_event} > $conn->{debounce}) {
+                log_info("[$conn->{name}] debounce clear → triggering mbsync $conn->{channel}");
+                trigger_mbsync($conn->{channel});
+            } else {
+                log_info("[$conn->{name}] notification grouped (debounce active)");
+            }
+            $conn->{last_event} = $now;
+            restart_idle($conn);
+        }
+    };
+    if ($@) { log_warn("process_notification error [$conn->{name}]: $@"); }
+}
+
+# ================== DAEMONIZE ==================
+sub daemonize {
+    log_info("Daemonizing (double-fork + setsid)...");
+
+    chdir '/' or die "chdir /: $!";
+    umask 0;
+
+    my $pid = fork(); exit if $pid;      # parent exits
+    die "first fork failed: $!" unless defined $pid;
+
+    setsid() or die "setsid: $!";
+
+    $pid = fork(); exit if $pid;         # second parent exits
+    die "second fork failed: $!" unless defined $pid;
+
+    close STDIN;  close STDOUT;  close STDERR;
+    open STDIN,  '<', '/dev/null';
+    open STDOUT, '>', '/dev/null';
+    open STDERR, '>', '/dev/null';
+
+    log_info("Daemonized successfully (pid $$)");
+}
+
+# ================== MAIN LOOP ==================
+sub main_loop {
+    log_info("Entering main IO::Select loop (" . scalar(keys %conns) . " connections)");
+
+    while (1) {
+        my @ready = $select->can_read(60);
+
+        if (@ready) {
+            for my $sock (@ready) {
+                my $name = $sock_to_name{$sock};
+                process_notification($conns{$name}) if $name && $conns{$name};
+            }
+        }
+
+        # housekeeping: reconnect dead connections
+        for my $name (keys %accounts) {
+            next if $conns{$name} && $conns{$name}{imap}->IsConnected;
+            log_info("Reconnecting [$name]...");
+            if (exists $conns{$name}) {
+                $select->remove($conns{$name}{socket});
+                delete $sock_to_name{$conns{$name}{socket}};
+                delete $conns{$name};
+            }
+            connect_account($name);
+        }
+    }
+}
+
+# ================== STARTUP ==================
+$SIG{CHLD} = \&reap_children;
+
+load_known_hosts();
+load_config();
+
+# Initial connections + interactive certificate approval (before daemonizing)
+for my $name (keys %accounts) {
+    connect_account($name) or die "Aborting — could not connect to [$name]";
+}
+
+daemonize();          # becomes a proper daemon now
+main_loop();          # never returns
+
+closelog();
