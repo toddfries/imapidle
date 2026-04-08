@@ -16,6 +16,7 @@
 
 use strict;
 use warnings;
+
 use Config::Tiny;
 use Mail::IMAPClient;
 use IO::Socket::SSL;
@@ -38,7 +39,6 @@ my %accounts;
 my %conns;
 my $select = IO::Select->new();
 my %sock_to_name;
-my %known_fingerprints;
 
 # ================== LOGGING (syslog only) ==================
 sub log_info  { syslog(LOG_INFO,  "%s", $_[0]); }
@@ -47,8 +47,8 @@ sub log_error { syslog(LOG_ERR,     "%s", $_[0]); }
 
 # ================== CERTIFICATE TOFU (SSH-like) ==================
 sub load_known_hosts {
-    %known_fingerprints = ();
-    return unless -f $KNOWN_HOSTS;
+    my %known_fingerprints;
+    return %known_fingerprints unless -f $KNOWN_HOSTS;
     open my $fh, '<', $KNOWN_HOSTS or return;
     while (<$fh>) {
         chomp;
@@ -57,9 +57,11 @@ sub load_known_hosts {
         $known_fingerprints{$hostkey} = $fp if $hostkey && $fp;
     }
     close $fh;
+    return %known_fingerprints;
 }
 
 sub save_known_hosts {
+    my %known_fingerprints = @_;
     open my $fh, '>', $KNOWN_HOSTS or do { log_error("Cannot write $KNOWN_HOSTS: $!"); return; };
     print $fh "# imap-idle-notify known_hosts (TOFU)\n";
     print $fh "# format: server:port\tSHA256:fingerprint\n\n";
@@ -72,8 +74,9 @@ sub save_known_hosts {
 sub approve_fingerprint {
     my ($server, $port, $fingerprint) = @_;
     my $hostkey = "$server:$port";
+    my %known = load_known_hosts();
 
-    my $old = $known_fingerprints{$hostkey};
+    my $old = $known{$hostkey};
     return 1 if $old && $old eq $fingerprint;   # unchanged & trusted
 
     # New or changed certificate
@@ -97,8 +100,8 @@ sub approve_fingerprint {
     chomp $ans;
 
     if ($ans =~ /^y/i) {
-        $known_fingerprints{$hostkey} = $fingerprint;
-        save_known_hosts();
+        $known{$hostkey} = $fingerprint;
+        save_known_hosts(%known);
         log_info("Certificate accepted for $hostkey");
         return 1;
     }
@@ -113,12 +116,16 @@ sub load_config {
 
     %accounts = ();
     for my $section (keys %{$cfg}) {
-	$cfg->{$section}->{port} //= 993;
-	$cfg->{$section}->{folder} //= 'INBOX';
-	$cfg->{$section}->{priority} //= 5;
-	for my $var (('server','user','password','mbsync_channel')) {
-		die "[$section] missing $var" unless defined $cfg->{$section}->{$var};
-	}
+        $cfg->{$section}->{port}          //= 993;
+        $cfg->{$section}->{folder}        //= 'INBOX';
+        $cfg->{$section}->{priority}      //= 5;
+        $cfg->{$section}->{wait}          //= 0;          # seconds to wait after event before mbsync (goimapnotify style)
+        $cfg->{$section}->{idle_refresh}  //= 1380;       # seconds before proactive IDLE restart (~23 min, goimapnotify style)
+
+        for my $var (('server','user','password','mbsync_channel')) {
+            die "[$section] missing $var" unless defined $cfg->{$section}->{$var};
+        }
+
         my $c = {
             server         => $cfg->{$section}->{'server'},
             port           => $cfg->{$section}->{'port'},
@@ -127,9 +134,12 @@ sub load_config {
             folder         => $cfg->{$section}->{'folder'},
             priority       => $cfg->{$section}->{'priority'},
             mbsync_channel => $cfg->{$section}->{'mbsync_channel'},
+            wait           => $cfg->{$section}->{'wait'},
+            idle_refresh   => $cfg->{$section}->{'idle_refresh'},
         };
+
         $accounts{$section} = $c;
-        log_info("Loaded [$section] → mbsync $c->{mbsync_channel} (priority $c->{priority})");
+        log_info("Loaded [$section] → mbsync $c->{mbsync_channel} (priority $c->{priority}, wait $c->{wait}s, refresh $c->{idle_refresh}s)");
     }
 }
 
@@ -170,13 +180,16 @@ sub connect_account {
         my $tag = $imap->idle() or die "IDLE: " . $imap->LastError;
 
         my $conn = {
-            name       => $name,
-            imap       => $imap,
-            tag        => $tag,
-            debounce   => calculate_debounce($c->{priority}),
-            last_event => 0,
-            socket     => $socket,
-            channel    => $c->{mbsync_channel},
+            name           => $name,
+            imap           => $imap,
+            tag            => $tag,
+            debounce       => calculate_debounce($c->{priority}),
+            last_event     => 0,
+            last_idle_start=> time(),
+            socket         => $socket,
+            channel        => $c->{mbsync_channel},
+            wait           => $c->{wait},
+            idle_refresh   => $c->{idle_refresh},
         };
 
         $conns{$name} = $conn;
@@ -197,6 +210,8 @@ sub restart_idle {
     eval {
         $conn->{imap}->done($conn->{tag}) if $conn->{tag};
         $conn->{tag} = $conn->{imap}->idle() or die $conn->{imap}->LastError;
+        $conn->{last_idle_start} = time();
+        log_info("[$conn->{name}] IDLE restarted (goimapnotify-style refresh)");
     };
     if ($@) { log_warn("restart_idle failed [$conn->{name}]: $@"); }
 }
@@ -219,29 +234,42 @@ sub trigger_mbsync {
 
 sub reap_children { 1 while waitpid(-1, WNOHANG) > 0; }
 
+# ================== NOTIFICATION (battle-tested goimapnotify style) ==================
 sub process_notification {
     my ($conn) = @_;
     my $now = time();
 
     eval {
-        my @data = $conn->{imap}->idle_data(0);
+        # Short timeout to cleanly drain any pending IDLE lines (goimapnotify behavior)
+        my @data = $conn->{imap}->idle_data(5);
+
         if (@data) {
             for my $line (@data) {
                 chomp $line;
-                log_info("[$conn->{name}] IDLE: $line");
+                log_info("[$conn->{name}] IDLE notification: $line");
             }
 
+            # Priority-based debounce (your excellent feature)
             if ($now - $conn->{last_event} > $conn->{debounce}) {
-                log_info("[$conn->{name}] debounce clear → triggering mbsync $conn->{channel}");
+                # Optional short wait before mbsync (goimapnotify 'wait' feature)
+                if ($conn->{wait} > 0) {
+                    log_info("[$conn->{name}] waiting $conn->{wait}s before mbsync...");
+                    sleep $conn->{wait};
+                }
+                log_info("[$conn->{name}] debounce passed → triggering mbsync $conn->{channel}");
                 trigger_mbsync($conn->{channel});
             } else {
                 log_info("[$conn->{name}] notification grouped (debounce active)");
             }
             $conn->{last_event} = $now;
-            restart_idle($conn);
         }
+
+        # Always restart IDLE after data or timeout (core goimapnotify reliability)
+        restart_idle($conn);
     };
-    if ($@) { log_warn("process_notification error [$conn->{name}]: $@"); }
+    if ($@) {
+        log_warn("process_notification error [$conn->{name}]: $@");
+    }
 }
 
 # ================== DAEMONIZE ==================
@@ -267,12 +295,27 @@ sub daemonize {
     log_info("Daemonized successfully (pid $$)");
 }
 
-# ================== MAIN LOOP ==================
+# ================== GRACEFUL SHUTDOWN ==================
+sub graceful_shutdown {
+    log_info("Received SIGTERM/INT — shutting down gracefully...");
+    for my $name (keys %conns) {
+        my $conn = $conns{$name};
+        next unless $conn && $conn->{tag};
+        eval { $conn->{imap}->done($conn->{tag}); };
+    }
+    closelog();
+    exit 0;
+}
+
+# ================== MAIN LOOP (goimapnotify-style reliability) ==================
 sub main_loop {
     log_info("Entering main IO::Select loop (" . scalar(keys %conns) . " connections)");
 
     while (1) {
-        my @ready = $select->can_read(60);
+        my $timeout = 30;                     # seconds — responsive yet low CPU
+        my @ready = $select->can_read($timeout);
+
+        my $now = time();
 
         if (@ready) {
             for my $sock (@ready) {
@@ -281,13 +324,25 @@ sub main_loop {
             }
         }
 
-        # housekeeping: reconnect dead connections
+        # === Periodic IDLE refresh (the key goimapnotify feature) ===
+        for my $name (keys %conns) {
+            my $conn = $conns{$name};
+            next unless $conn;
+            if ($now - $conn->{last_idle_start} > $conn->{idle_refresh}) {
+                log_info("[$name] Proactive IDLE refresh (approaching server 30min limit)");
+                restart_idle($conn);
+            }
+        }
+
+        # === Housekeeping: reconnect dead connections ===
         for my $name (keys %accounts) {
-            next if $conns{$name} && $conns{$name}{imap}->IsConnected;
+            my $conn = $conns{$name};
+            next if $conn && $conn->{imap}->IsConnected;
+
             log_info("Reconnecting [$name]...");
-            if (exists $conns{$name}) {
-                $select->remove($conns{$name}{socket});
-                delete $sock_to_name{$conns{$name}{socket}};
+            if ($conn) {
+                $select->remove($conn->{socket});
+                delete $sock_to_name{$conn->{socket}};
                 delete $conns{$name};
             }
             connect_account($name);
@@ -297,8 +352,10 @@ sub main_loop {
 
 # ================== STARTUP ==================
 $SIG{CHLD} = \&reap_children;
+$SIG{TERM} = \&graceful_shutdown;
+$SIG{INT}  = \&graceful_shutdown;
 
-load_known_hosts();
+my %known_fingerprints = load_known_hosts();  # initial load for approve_fingerprint
 load_config();
 
 # Initial connections + interactive certificate approval (before daemonizing)
@@ -309,4 +366,5 @@ for my $name (keys %accounts) {
 daemonize();          # becomes a proper daemon now
 main_loop();          # never returns
 
+# unreachable
 closelog();
