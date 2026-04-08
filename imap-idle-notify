@@ -16,7 +16,6 @@
 
 use strict;
 use warnings;
-
 use Config::Tiny;
 use Mail::IMAPClient;
 use IO::Socket::SSL;
@@ -119,8 +118,8 @@ sub load_config {
         $cfg->{$section}->{port}          //= 993;
         $cfg->{$section}->{folder}        //= 'INBOX';
         $cfg->{$section}->{priority}      //= 5;
-        $cfg->{$section}->{wait}          //= 0;          # seconds to wait after event before mbsync (goimapnotify style)
-        $cfg->{$section}->{idle_refresh}  //= 1380;       # seconds before proactive IDLE restart (~23 min, goimapnotify style)
+        $cfg->{$section}->{wait}          //= 0;
+        $cfg->{$section}->{idle_refresh}  //= 1380;
 
         for my $var (('server','user','password','mbsync_channel')) {
             die "[$section] missing $var" unless defined $cfg->{$section}->{$var};
@@ -150,34 +149,61 @@ sub calculate_debounce {
     return 180 + ($p - 3) * 120;
 }
 
-# ================== CONNECTION ==================
+# ================== CONNECTION (HEAVILY DEBUGGED) ==================
 sub connect_account {
     my ($name) = @_;
     my $c = $accounts{$name} or return;
 
+    print STDERR "=== DEBUG: Attempting full connection to account [$name] ===\n";
+    log_info("DEBUG: Starting connection to [$name]");
+
     eval {
         my $hostkey = "$c->{server}:$c->{port}";
+
+        print STDERR "[$name] → Creating SSL socket to $c->{server}:$c->{port} ...\n";
+        log_info("[$name] Creating SSL socket");
 
         my $socket = IO::Socket::SSL->new(
             PeerAddr        => $c->{server},
             PeerPort        => $c->{port},
             SSL_verify_mode => SSL_VERIFY_NONE,
             SSL_hostname    => $c->{server},
-        ) or die "SSL socket: $! $@";
+        ) or die "SSL socket creation failed: $! $@";
+
+        print STDERR "[$name] → SSL socket created successfully\n";
+        log_info("[$name] SSL socket OK");
 
         my $fingerprint = $socket->get_fingerprint('SHA256');
-        approve_fingerprint($c->{server}, $c->{port}, $fingerprint)
-            or die "Certificate not approved";
+        print STDERR "[$name] → SSL fingerprint: $fingerprint\n";
 
+        print STDERR "[$name] → Approving certificate (TOFU)...\n";
+        approve_fingerprint($c->{server}, $c->{port}, $fingerprint)
+            or die "Certificate not approved by user";
+
+        print STDERR "[$name] → Certificate approved\n";
+        log_info("[$name] Certificate approved");
+
+        print STDERR "[$name] → Logging in to IMAP as $c->{user}...\n";
         my $imap = Mail::IMAPClient->new(
             Socket   => $socket,
             User     => $c->{user},
             Password => $c->{password},
-        ) or die "IMAP login: $@";
+        ) or die "IMAP login failed: $@";
 
-        $imap->select($c->{folder}) or die "SELECT: " . $imap->LastError;
+        print STDERR "[$name] → IMAP login successful\n";
+        log_info("[$name] IMAP login OK");
 
-        my $tag = $imap->idle() or die "IDLE: " . $imap->LastError;
+        print STDERR "[$name] → Selecting folder '$c->{folder}'...\n";
+        $imap->select($c->{folder}) or die "SELECT $c->{folder} failed: " . $imap->LastError;
+
+        print STDERR "[$name] → Folder selected\n";
+        log_info("[$name] Folder SELECT OK");
+
+        print STDERR "[$name] → Starting IDLE command...\n";
+        my $tag = $imap->idle() or die "IDLE command failed: " . $imap->LastError;
+
+        print STDERR "[$name] → IDLE started (tag=$tag)\n";
+        log_info("[$name] IDLE active");
 
         my $conn = {
             name           => $name,
@@ -196,11 +222,16 @@ sub connect_account {
         $sock_to_name{$socket} = $name;
         $select->add($socket);
 
+        print STDERR "[$name] → Fully connected and IDLE active!\n";
         log_info("IDLE active [$name] $c->{user}/$c->{folder} (channel: $c->{mbsync_channel})");
         return 1;
     };
+
     if ($@) {
-        log_error("Connect failed [$name]: $@");
+        my $err = $@;
+        chomp $err;
+        print STDERR "[$name] → CONNECTION FAILED: $err\n";
+        log_error("Connect failed [$name]: $err");
         return undef;
     }
 }
@@ -220,7 +251,7 @@ sub restart_idle {
 sub trigger_mbsync {
     my ($channel) = @_;
     my $pid = fork();
-    if ($pid == 0) {                    # child
+    if ($pid == 0) {
         open STDIN,  '<', '/dev/null';
         open STDOUT, '>', '/dev/null';
         open STDERR, '>', '/dev/null';
@@ -234,13 +265,12 @@ sub trigger_mbsync {
 
 sub reap_children { 1 while waitpid(-1, WNOHANG) > 0; }
 
-# ================== NOTIFICATION (battle-tested goimapnotify style) ==================
+# ================== NOTIFICATION ==================
 sub process_notification {
     my ($conn) = @_;
     my $now = time();
 
     eval {
-        # Short timeout to cleanly drain any pending IDLE lines (goimapnotify behavior)
         my @data = $conn->{imap}->idle_data(5);
 
         if (@data) {
@@ -249,9 +279,7 @@ sub process_notification {
                 log_info("[$conn->{name}] IDLE notification: $line");
             }
 
-            # Priority-based debounce (your excellent feature)
             if ($now - $conn->{last_event} > $conn->{debounce}) {
-                # Optional short wait before mbsync (goimapnotify 'wait' feature)
                 if ($conn->{wait} > 0) {
                     log_info("[$conn->{name}] waiting $conn->{wait}s before mbsync...");
                     sleep $conn->{wait};
@@ -264,7 +292,6 @@ sub process_notification {
             $conn->{last_event} = $now;
         }
 
-        # Always restart IDLE after data or timeout (core goimapnotify reliability)
         restart_idle($conn);
     };
     if ($@) {
@@ -279,12 +306,12 @@ sub daemonize {
     chdir '/' or die "chdir /: $!";
     umask 0;
 
-    my $pid = fork(); exit if $pid;      # parent exits
+    my $pid = fork(); exit if $pid;
     die "first fork failed: $!" unless defined $pid;
 
     setsid() or die "setsid: $!";
 
-    $pid = fork(); exit if $pid;         # second parent exits
+    $pid = fork(); exit if $pid;
     die "second fork failed: $!" unless defined $pid;
 
     close STDIN;  close STDOUT;  close STDERR;
@@ -307,12 +334,12 @@ sub graceful_shutdown {
     exit 0;
 }
 
-# ================== MAIN LOOP (goimapnotify-style reliability) ==================
+# ================== MAIN LOOP ==================
 sub main_loop {
     log_info("Entering main IO::Select loop (" . scalar(keys %conns) . " connections)");
 
     while (1) {
-        my $timeout = 30;                     # seconds — responsive yet low CPU
+        my $timeout = 30;
         my @ready = $select->can_read($timeout);
 
         my $now = time();
@@ -324,7 +351,6 @@ sub main_loop {
             }
         }
 
-        # === Periodic IDLE refresh (the key goimapnotify feature) ===
         for my $name (keys %conns) {
             my $conn = $conns{$name};
             next unless $conn;
@@ -334,7 +360,6 @@ sub main_loop {
             }
         }
 
-        # === Housekeeping: reconnect dead connections ===
         for my $name (keys %accounts) {
             my $conn = $conns{$name};
             next if $conn && $conn->{imap}->IsConnected;
@@ -355,16 +380,18 @@ $SIG{CHLD} = \&reap_children;
 $SIG{TERM} = \&graceful_shutdown;
 $SIG{INT}  = \&graceful_shutdown;
 
-my %known_fingerprints = load_known_hosts();  # initial load for approve_fingerprint
+my %known_fingerprints = load_known_hosts();
 load_config();
 
 # Initial connections + interactive certificate approval (before daemonizing)
+print STDERR "\n=== INITIAL CONNECTION PHASE (with full debug) ===\n";
 for my $name (keys %accounts) {
+    print STDERR "Connecting to [$name]...\n";
     connect_account($name) or die "Aborting — could not connect to [$name]";
 }
+print STDERR "=== All accounts connected successfully ===\n\n";
 
-daemonize();          # becomes a proper daemon now
-main_loop();          # never returns
+daemonize();
+main_loop();
 
-# unreachable
 closelog();
