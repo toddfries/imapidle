@@ -16,7 +16,7 @@
 
 use strict;
 use warnings;
-use Config::IniFiles;
+use Config::Tiny;
 use Mail::IMAPClient;
 use IO::Socket::SSL;
 use IO::Select;
@@ -108,20 +108,25 @@ sub approve_fingerprint {
 
 # ================== CONFIG & DEBOUNCE ==================
 sub load_config {
-    my $cfg = Config::IniFiles->new(-file => $CONFIG_FILE)
-        or die "Cannot read $CONFIG_FILE: $Config::IniFiles::errstr\n";
+    my $cfg = Config::Tiny->read( $CONFIG_FILE )
+        or die "Cannot read $CONFIG_FILE: ". Config::Tiny->errstr;
 
     %accounts = ();
-    for my $section ($cfg->Sections) {
+    for my $section (keys %{$cfg}) {
+	$cfg->{$section}->{port} //= 993;
+	$cfg->{$section}->{folder} //= 'INBOX';
+	$cfg->{$section}->{priority} //= 5;
+	for my $var (('server','user','password','mbsync_channel')) {
+		die "[$section] missing $var" unless defined $cfg->{$section}->{$var};
+	}
         my $c = {
-            server         => $cfg->val($section, 'server')   or die "[$section] missing server",
-            port           => $cfg->val($section, 'port', 993),
-            user           => $cfg->val($section, 'user')     or die "[$section] missing user",
-            password       => $cfg->val($section, 'password') or die "[$section] missing password",
-            folder         => $cfg->val($section, 'folder', 'INBOX'),
-            priority       => $cfg->val($section, 'priority', 5) + 0,
-            mbsync_channel => $cfg->val($section, 'mbsync_channel')
-                or die "[$section] missing mbsync_channel (add it to your config)",
+            server         => $cfg->{$section}->{'server'},
+            port           => $cfg->{$section}->{'port'},
+            user           => $cfg->{$section}->{'user'},
+            password       => $cfg->{$section}->{'password'},
+            folder         => $cfg->{$section}->{'folder'},
+            priority       => $cfg->{$section}->{'priority'},
+            mbsync_channel => $cfg->{$section}->{'mbsync_channel'},
         };
         $accounts{$section} = $c;
         log_info("Loaded [$section] → mbsync $c->{mbsync_channel} (priority $c->{priority})");
