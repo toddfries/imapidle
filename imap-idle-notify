@@ -178,11 +178,15 @@ sub setup_notification {
 
     if ($use_notify) {
         my $folders_str = join ' ', map { $_->{name} } @$folder_list;
-        my $cmd = "NOTIFY SET ($folders_str) (MessageNew MessageExpunge MessageFlags)";
+	my $events = "MessageNew MessageExpunge MessageFlags";
+	$events = "MessageNew";
+        my $cmd = "NOTIFY SET ($folders_str) ($events)";
         print STDERR "[$name] → NOTIFY command: $cmd\n";
 
         my @resp = $imap->tag_and_run($cmd);
 	my $last = $resp[-1] // '';
+	print STDERR "[$name] → NOTIFY raw response: [" . join(" | ", @resp) . "]\n" if defined $resp[-1];
+
         if ($last =~ /OK/i) {
             print STDERR "[$name] → NOTIFY activated (single connection for all folders)\n";
             return (1, undef);   # using NOTIFY, no tag
@@ -245,15 +249,31 @@ sub connect_account {
         } else {
             # IDLE fallback → one connection per folder
             for my $f (@{$acc->{folders}}) {
-                $imap->select($f->{name}) or die "SELECT $f->{name}: " . $imap->LastError;
-                my $tag = $imap->idle() or die "IDLE on $f->{name}: " . $imap->LastError;
+		print STDERR "[$name] → Creating separate connection for folder $f->{name}\n";
+
+		# New socket + new IMAP object per folder
+		my $socket2 = IO::Socket::SSL->new(
+			PeerAddr	=> $acc->{server},
+			PeerPort	=> $acc->{port},
+			SSL_verify_mode	=> SSL_VERIFY_NONE,
+			SSL_hostname	=> $acc->{server},
+		) or die "SSL socket for $f->{name}: $! $@";
+
+		my $imap2 = Mail::IMAPClient->new(
+			Socket	=> $socket2,
+			User	=> $acc->{user},
+			Password => $acc->{password},
+		) or die "IMAP login for $f->{name}: $@";
+
+                $imap2->select($f->{name}) or die "SELECT $f->{name}: " . $imap2->LastError;
+                my $tag = $imap2->idle() or die "IDLE on $f->{name}: " . $imap2->LastError;
 
                 my $key = "$name:$f->{name}";
                 my $conn = {
                     key            => $key,
                     name           => $name,
                     folder         => $f->{name},
-                    imap           => $imap,          # note: each folder gets its own socket/imap in real use
+                    imap           => $imap2,          # note: each folder gets its own socket/imap in real use
                     tag            => $tag,
                     mode           => 'IDLE',
                     debounce       => $f->{debounce},
@@ -285,14 +305,17 @@ sub connect_account {
 # ================== RESTART (only for IDLE) ==================
 sub restart_idle {
     my ($conn) = @_;
-    return if $conn->{mode} eq 'NOTIFY';
+    return if $conn->{mode} eq 'NOTIFY';   # NOTIFY does not need re-arming
 
     eval {
         $conn->{imap}->done($conn->{tag}) if $conn->{tag};
         $conn->{tag} = $conn->{imap}->idle() or die $conn->{imap}->LastError;
-        log_info("[$conn->{name}] IDLE restarted for $conn->{folder}");
+        log_info("[$conn->{name}] IDLE successfully re-armed");
     };
-    if ($@) { log_warn("restart_idle failed: $@"); }
+    if ($@) {
+        log_warn("restart_idle failed [$conn->{name}]: $@");
+        # force reconnect on next housekeeping cycle
+    }
 }
 
 # ================== MBSYNC ==================
@@ -319,23 +342,42 @@ sub process_notification {
     my $now = time();
 
     eval {
-        my @data = $conn->{imap}->idle_data(5);
+        my $any_data = 0;
 
-        for my $line (@data) {
-            chomp $line;
-            log_info("[$conn->{name}] $line");
+        # Drain ALL pending IDLE/NOTIFY lines (critical fix)
+        while (1) {
+            my @data = $conn->{imap}->idle_data(2);   # short timeout per call
+            last unless @data;                        # nothing left
 
-            # Simple trigger on any relevant notification
-            if ($now - $conn->{last_event} > ($conn->{debounce} // 180)) {
-                if ($conn->{wait} > 0) { sleep $conn->{wait}; }
-                trigger_mbsync($conn->{channel});
-                $conn->{last_event} = $now;
+            $any_data = 1;
+            for my $line (@data) {
+                chomp $line;
+                log_info("[$conn->{name}] $line");
             }
         }
 
+        if ($any_data) {
+            # Your existing debounce + mbsync logic
+            if ($now - $conn->{last_event} > ($conn->{debounce} // 180)) {
+                if ($conn->{wait} > 0) {
+                    log_info("[$conn->{name}] waiting $conn->{wait}s before mbsync");
+                    sleep $conn->{wait};
+                }
+                log_info("[$conn->{name}] debounce passed → triggering mbsync $conn->{channel}");
+                trigger_mbsync($conn->{channel});
+                $conn->{last_event} = $now;
+            } else {
+                log_info("[$conn->{name}] notification grouped (debounce active)");
+            }
+        }
+
+        # Re-arm IDLE (only needed for classic IDLE mode)
         restart_idle($conn) if $conn->{mode} eq 'IDLE';
     };
-    if ($@) { log_warn("process_notification error: $@"); }
+
+    if ($@) {
+        log_warn("process_notification error [$conn->{name}]: $@");
+    }
 }
 
 # ================== DAEMONIZE & SHUTDOWN ==================
@@ -350,6 +392,7 @@ sub graceful_shutdown {
 # ================== MAIN LOOP ==================
 sub main_loop {
     while (1) {
+	print STDERR "[main_loop]: select->can_read(30)\n";
         my @ready = $select->can_read(30);
         my $now = time();
 
@@ -373,5 +416,5 @@ for my $name (keys %accounts) {
     connect_account($name) or die "Aborting — could not connect to [$name]";
 }
 
-daemonize();
+#daemonize();
 main_loop();
