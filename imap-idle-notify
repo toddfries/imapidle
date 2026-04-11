@@ -115,13 +115,24 @@ sub load_config {
         my $i = 0;
         while (exists $cfg->{$section}{"folder$i"}) {
             my $val = $cfg->{$section}{"folder$i"};
-            my ($name, $pri) = split /;/, $val, 2;
-            $pri = defined $pri ? int($pri) : 5;
-            push @folders, { name => $name, priority => $pri, debounce => calculate_debounce($pri) };
-            $i++;
-        }
+            my ($name, $fvars) = split /;/, $val, 2;
 
-        # backward compatibility with old single-folder config
+	    my $priority = 5; # default
+	    if (defined $fvars) {
+	    	my ($v2,$v3)= split(/\s*=\s*/,$fvars,2);
+		$priority = $v3 if $v2 && $v2 eq "priority" && defined $v3;
+	    }
+
+	    push @folders, {
+		name	=> $name,
+		priority => $priority,
+		debounce => calculate_debounce($priority)
+	    };
+
+	    $i++;
+	}
+
+	# backward compatibility with old single-folder config
         if (@folders == 0) {
             my $f = $cfg->{$section}->{folder} // 'INBOX';
             my $p = $cfg->{$section}->{priority} // 5;
@@ -170,8 +181,9 @@ sub setup_notification {
         my $cmd = "NOTIFY SET ($folders_str) (MessageNew MessageExpunge MessageFlags)";
         print STDERR "[$name] → NOTIFY command: $cmd\n";
 
-        my $resp = $imap->RawCommand($cmd);
-        if ($resp && $resp =~ /OK/i) {
+        my @resp = $imap->tag_and_run($cmd);
+	my $last = $resp[-1] // '';
+        if ($last =~ /OK/i) {
             print STDERR "[$name] → NOTIFY activated (single connection for all folders)\n";
             return (1, undef);   # using NOTIFY, no tag
         }
