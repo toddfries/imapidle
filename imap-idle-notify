@@ -34,10 +34,10 @@ make_path($CONFIG_DIR) unless -d $CONFIG_DIR;
 openlog('imap-idle-notify', 'cons,pid', 'mail');
 
 # Global structures
-my %accounts;      # account name => { server, user, password, mbsync_channel, folders => [ {name, priority, debounce}, ... ] }
-my %conns;         # unique key => connection hash (key = "account:folder" or "account:NOTIFY")
+my %accounts;
+my %conns;           # key => conn hash
 my $select = IO::Select->new();
-my %sock_to_key;   # socket => unique key used in %conns
+my %sock_to_key;
 
 # ================== LOGGING ==================
 sub log_info  { syslog(LOG_INFO,  "%s", $_[0]); }
@@ -62,8 +62,7 @@ sub load_known_hosts {
 sub save_known_hosts {
     my %known_fingerprints = @_;
     open my $fh, '>', $KNOWN_HOSTS or do { log_error("Cannot write $KNOWN_HOSTS: $!"); return; };
-    print $fh "# imap-idle-notify known_hosts (TOFU)\n";
-    print $fh "# format: server:port\tSHA256:fingerprint\n\n";
+    print $fh "# imap-idle-notify known_hosts (TOFU)\n# format: server:port\tSHA256:fingerprint\n\n";
     for my $k (sort keys %known_fingerprints) {
         print $fh "$k\t$known_fingerprints{$k}\n";
     }
@@ -117,22 +116,22 @@ sub load_config {
             my $val = $cfg->{$section}{"folder$i"};
             my ($name, $fvars) = split /;/, $val, 2;
 
-	    my $priority = 5; # default
-	    if (defined $fvars) {
-	    	my ($v2,$v3)= split(/\s*=\s*/,$fvars,2);
-		$priority = $v3 if $v2 && $v2 eq "priority" && defined $v3;
-	    }
+           my $priority = 5; # default
+           if (defined $fvars) {
+               my ($v2,$v3)= split(/\s*=\s*/,$fvars,2);
+               $priority = $v3 if $v2 && $v2 eq "priority" && defined $v3;
+           }
 
-	    push @folders, {
-		name	=> $name,
-		priority => $priority,
-		debounce => calculate_debounce($priority)
-	    };
+           push @folders, {
+               name    => $name,
+               priority => $priority,
+               debounce => calculate_debounce($priority)
+           };
 
-	    $i++;
-	}
+           $i++;
+       }
 
-	# backward compatibility with old single-folder config
+       # backward compatibility with old single-folder config
         if (@folders == 0) {
             my $f = $cfg->{$section}->{folder} // 'INBOX';
             my $p = $cfg->{$section}->{priority} // 5;
@@ -155,16 +154,42 @@ sub load_config {
             wait           => $cfg->{$section}->{wait} // 0,
         };
 
-        log_info("Loaded [$section] → $cfg->{$section}->{mbsync_channel} (" .
-                 scalar(@folders) . " folders)");
+        log_info("OK [$section] - mbsync://$cfg->{$section}->{mbsync_channel}?listen=" .
+                 scalar(@folders));
     }
 }
-
 sub calculate_debounce {
     my $p = shift;
     return 8    if $p <= 2;
     return 3600 if $p >= 9;
     return 180 + ($p - 3) * 120;
+}
+
+
+# ================== CONNECTION HELPER (removes all duplication) ==================
+sub create_imap_connection {
+    my ($acc, $folder) = @_;
+
+    my $socket = IO::Socket::SSL->new(
+        PeerAddr        => $acc->{server},
+        PeerPort        => $acc->{port},
+        SSL_verify_mode => SSL_VERIFY_NONE,
+        SSL_hostname    => $acc->{server},
+    ) or die "SSL socket: $! $@";
+
+    my $fingerprint = $socket->get_fingerprint('SHA256');
+    approve_fingerprint($acc->{server}, $acc->{port}, $fingerprint)
+        or die "Certificate not approved";
+
+    my $imap = Mail::IMAPClient->new(
+        Socket   => $socket,
+        User     => $acc->{user},
+        Password => $acc->{password},
+    ) or die "IMAP login: $@";
+
+    $imap->select($folder) or die "SELECT $folder: " . $imap->LastError;
+
+    return ($socket, $imap);
 }
 
 # ================== NOTIFY / IDLE SETUP ==================
@@ -174,63 +199,46 @@ sub setup_notification {
     my @caps = $imap->capability or return (0, undef);
     my $use_notify = grep { uc($_) eq 'NOTIFY' } @caps;
 
-    print STDERR "[$name] → Server supports NOTIFY? " . ($use_notify ? "YES" : "NO") . "\n";
+    log_info("[$name] Server supports NOTIFY? " . ($use_notify ? "YES" : "NO"));
 
     if ($use_notify) {
         my $folders_str = join ' ', map { $_->{name} } @$folder_list;
-	my $events = "MessageNew MessageExpunge MessageFlags";
-	$events = "MessageNew";
-        my $cmd = "NOTIFY SET ($folders_str) ($events)";
-        print STDERR "[$name] → NOTIFY command: $cmd\n";
+        my $cmd = "NOTIFY SET ($folders_str) (MessageNew MessageExpunge MessageFlags)";
+        log_info("[$name] → NOTIFY command: $cmd");
 
         my @resp = $imap->tag_and_run($cmd);
-	my $last = $resp[-1] // '';
-	print STDERR "[$name] → NOTIFY raw response: [" . join(" | ", @resp) . "]\n" if defined $resp[-1];
+        my $last = $resp[-1] // '';
+
+        log_info("[$name] → NOTIFY raw response: [" . join(" | ", @resp) . "]");
 
         if ($last =~ /OK/i) {
-            print STDERR "[$name] → NOTIFY activated (single connection for all folders)\n";
-            return (1, undef);   # using NOTIFY, no tag
+            log_info("[$name] → NOTIFY activated (single connection for all folders)");
+            return (1, undef);
         }
-        print STDERR "[$name] → NOTIFY failed, falling back to per-folder IDLE\n";
+        log_warn("[$name] → NOTIFY rejected by server, falling back to IDLE");
     }
-
-    # Classic IDLE – caller will handle one per folder
     return (0, undef);
 }
 
-# ================== CONNECTION (multi-folder) ==================
+# ================== CONNECTION (multi-folder with backoff) ==================
 sub connect_account {
     my ($name) = @_;
     my $acc = $accounts{$name} or return;
 
-    print STDERR "=== DEBUG: Connecting account [$name] ===\n";
+    log_info("=== Connecting account [$name] ===");
 
     my $success = eval {
-        my $hostkey = "$acc->{server}:$acc->{port}";
+	# temp connection just to check capabilities
+	my ($tmp_socket, $tmp_imap) = create_imap_connection($acc, $acc->{folders}[0]{name});
+        my ($using_notify) = setup_notification($name, $tmp_imap, $acc->{folders});
 
-        my $socket = IO::Socket::SSL->new(
-            PeerAddr        => $acc->{server},
-            PeerPort        => $acc->{port},
-            SSL_verify_mode => SSL_VERIFY_NONE,
-            SSL_hostname    => $acc->{server},
-        ) or die "SSL socket: $! $@";
-
-        my $fingerprint = $socket->get_fingerprint('SHA256');
-        approve_fingerprint($acc->{server}, $acc->{port}, $fingerprint)
-            or die "Certificate not approved";
-
-        my $imap = Mail::IMAPClient->new(
-            Socket   => $socket,
-            User     => $acc->{user},
-            Password => $acc->{password},
-        ) or die "IMAP login: $@";
-
-        # Decide NOTIFY vs IDLE
-        my ($using_notify) = setup_notification($name, $imap, $acc->{folders});
+	# Close the temporary objects (we will create fresh ones below)
+	$tmp_imap->logout if $tmp_imap;
+	$select->remove($tmp_socket) if $tmp_socket; # just in case
 
         if ($using_notify) {
-            # SINGLE connection for all folders
             my $key = "$name:NOTIFY";
+            my ($socket, $imap) = create_imap_connection($acc, $acc->{folders}[0]{name});  # dummy select just to get objects
             my $conn = {
                 key            => $key,
                 name           => $name,
@@ -239,53 +247,41 @@ sub connect_account {
                 socket         => $socket,
                 channel        => $acc->{mbsync_channel},
                 wait           => $acc->{wait},
-                last_event     => 0,                 # shared debounce for NOTIFY (or we could make it per-folder)
-                folders        => $acc->{folders},   # reference to folder list
+                last_event     => 0,
+                folders        => $acc->{folders},
+                backoff        => 5,          # seconds
+                last_success   => time(),
             };
             $conns{$key} = $conn;
             $sock_to_key{$socket} = $key;
             $select->add($socket);
-            print STDERR "[$name] → NOTIFY mode (1 connection, " . scalar(@{$acc->{folders}}) . " folders)\n";
+            log_info("[$name] → NOTIFY mode (1 connection, " . scalar(@{$acc->{folders}}) . " folders)");
         } else {
-            # IDLE fallback → one connection per folder
+            # IDLE fallback – one independent connection per folder
             for my $f (@{$acc->{folders}}) {
-		print STDERR "[$name] → Creating separate connection for folder $f->{name}\n";
-
-		# New socket + new IMAP object per folder
-		my $socket2 = IO::Socket::SSL->new(
-			PeerAddr	=> $acc->{server},
-			PeerPort	=> $acc->{port},
-			SSL_verify_mode	=> SSL_VERIFY_NONE,
-			SSL_hostname	=> $acc->{server},
-		) or die "SSL socket for $f->{name}: $! $@";
-
-		my $imap2 = Mail::IMAPClient->new(
-			Socket	=> $socket2,
-			User	=> $acc->{user},
-			Password => $acc->{password},
-		) or die "IMAP login for $f->{name}: $@";
-
-                $imap2->select($f->{name}) or die "SELECT $f->{name}: " . $imap2->LastError;
-                my $tag = $imap2->idle() or die "IDLE on $f->{name}: " . $imap2->LastError;
+                my ($socket, $imap) = create_imap_connection($acc, $f->{name});
+                my $tag = $imap->idle() or die "IDLE on $f->{name}: " . $imap->LastError;
 
                 my $key = "$name:$f->{name}";
                 my $conn = {
                     key            => $key,
                     name           => $name,
                     folder         => $f->{name},
-                    imap           => $imap2,          # note: each folder gets its own socket/imap in real use
+                    imap           => $imap,
                     tag            => $tag,
                     mode           => 'IDLE',
                     debounce       => $f->{debounce},
                     last_event     => 0,
-                    socket         => $socket,        # simplified – in production each would have its own socket
+                    socket         => $socket,
                     channel        => $acc->{mbsync_channel},
                     wait           => $acc->{wait},
+                    backoff        => 5,
+                    last_success   => time(),
                 };
                 $conns{$key} = $conn;
-                $sock_to_key{$socket} = $key;   # note: this is simplified; real multi-IDLE would need separate sockets
+                $sock_to_key{$socket} = $key;
                 $select->add($socket);
-                print STDERR "[$name] → IDLE mode for folder $f->{name} (priority $f->{priority})\n";
+                log_info("[$name] → IDLE mode for folder $f->{name} (priority $f->{priority})");
             }
         }
         return 1;
@@ -293,7 +289,6 @@ sub connect_account {
 
     if ($@) {
         my $err = $@; chomp $err;
-        print STDERR "[$name] → CONNECTION FAILED: $err\n";
         log_error("Connect failed [$name]: $err");
         return undef;
     }
@@ -301,6 +296,8 @@ sub connect_account {
     log_info("Monitoring active [$name] ($acc->{mbsync_channel})");
     return 1;
 }
+
+# ================== RESTART & PROCESS NOTIFICATION (already robust) ==================
 
 # ================== RESTART (only for IDLE) ==================
 sub restart_idle {
@@ -318,6 +315,8 @@ sub restart_idle {
     }
 }
 
+sub reap_children { 1 while waitpid(-1, WNOHANG) > 0; }
+
 # ================== MBSYNC ==================
 sub trigger_mbsync {
     my ($channel) = @_;
@@ -334,9 +333,8 @@ sub trigger_mbsync {
     }
 }
 
-sub reap_children { 1 while waitpid(-1, WNOHANG) > 0; }
 
-# ================== PROCESS NOTIFICATION ==================
+
 sub process_notification {
     my ($conn) = @_;
     my $now = time();
@@ -378,30 +376,85 @@ sub process_notification {
     if ($@) {
         log_warn("process_notification error [$conn->{name}]: $@");
     }
+ }
+
+
+# ================== DAEMONIZE ==================
+sub daemonize {
+    log_info("Daemonizing (double-fork + setsid)...");
+    chdir '/' or die "chdir /: $!";
+    umask 0;
+
+    my $pid = fork(); exit if $pid;
+    die "first fork failed: $!" unless defined $pid;
+
+    setsid() or die "setsid: $!";
+
+    $pid = fork(); exit if $pid;
+    die "second fork failed: $!" unless defined $pid;
+
+    close STDIN; close STDOUT; close STDERR;
+    open STDIN,  '<', '/dev/null';
+    open STDOUT, '>', '/dev/null';
+    open STDERR, '>', '/dev/null';
+
+    log_info("Daemonized successfully (pid $$)");
 }
 
-# ================== DAEMONIZE & SHUTDOWN ==================
-sub daemonize { ... }   # (unchanged from previous version – omitted for brevity)
-
+# ================== GRACEFUL SHUTDOWN ==================
 sub graceful_shutdown {
-    log_info("SIGTERM/INT received – shutting down...");
+    log_info("SIGTERM/INT received – shutting down gracefully...");
+    for my $key (keys %conns) {
+        my $conn = $conns{$key};
+        next unless $conn && $conn->{tag};
+        eval { $conn->{imap}->done($conn->{tag}); };
+    }
     closelog();
     exit 0;
 }
 
+# ================== HOUSEKEEPING (with exponential backoff) ==================
+sub housekeeping {
+    my $now = time();
+    for my $key (keys %conns) {
+        my $conn = $conns{$key};
+        next unless $conn;
+
+        # detect dead connection
+        if (!$conn->{imap}->IsConnected || !$conn->{imap}->noop) {
+            log_warn("[$conn->{name}] connection lost – reconnecting in $conn->{backoff}s");
+            $select->remove($conn->{socket});
+            delete $sock_to_key{$conn->{socket}};
+            delete $conns{$key};
+
+            sleep $conn->{backoff};
+            $conn->{backoff} = int($conn->{backoff} * 1.5 + 0.5);  # exponential backoff
+            connect_account($conn->{name});   # will recreate with fresh backoff on success
+            next;
+        }
+
+        # reset backoff on healthy connection
+        if ($now - $conn->{last_success} > 300) {   # every 5 min
+            $conn->{backoff} = 5;
+            $conn->{last_success} = $now;
+        }
+
+        # periodic IDLE refresh for classic mode
+        restart_idle($conn) if $conn->{mode} eq 'IDLE';
+    }
+}
+
 # ================== MAIN LOOP ==================
 sub main_loop {
+    log_info("Entering main IO::Select loop");
     while (1) {
-	print STDERR "[main_loop]: select->can_read(30)\n";
         my @ready = $select->can_read(30);
-        my $now = time();
+        housekeeping();   # every 30 s
 
         for my $sock (@ready) {
             my $key = $sock_to_key{$sock};
             process_notification($conns{$key}) if $key;
         }
-
-        # housekeeping (reconnect logic omitted for brevity – same as before)
     }
 }
 
@@ -416,5 +469,5 @@ for my $name (keys %accounts) {
     connect_account($name) or die "Aborting — could not connect to [$name]";
 }
 
-#daemonize();
+daemonize();          # ← now enabled
 main_loop();
