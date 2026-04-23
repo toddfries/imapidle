@@ -168,7 +168,7 @@ sub calculate_debounce {
 
 # ================== CONNECTION HELPER (removes all duplication) ==================
 sub create_imap_connection {
-    my ($acc, $folder) = @_;
+    my ($name, $acc, $folder) = @_;
 
     my $socket = IO::Socket::SSL->new(
         PeerAddr        => $acc->{server},
@@ -177,7 +177,10 @@ sub create_imap_connection {
         SSL_hostname    => $acc->{server},
     ) or die "SSL socket: $! $@";
 
+
     my $fingerprint = $socket->get_fingerprint('SHA256');
+    syslog(LOG_INFO, "[%s] -> SSL Connect %s port %s", $name, $acc->{server}, $acc->{port});
+    syslog(LOG_INFO, "[%s] fingerprint %s", $name, $fingerprint);
     approve_fingerprint($acc->{server}, $acc->{port}, $fingerprint)
         or die "Certificate not approved";
 
@@ -197,29 +200,65 @@ sub setup_notification {
     my ($name, $imap, $folder_list) = @_;
 
     my @caps = $imap->capability or return (0, undef);
-    my $use_notify = grep { uc($_) eq 'NOTIFY' } @caps;
+    my $has_notify = grep { uc($_) eq 'NOTIFY' } @caps;
 
-    log_info("[$name] Server supports NOTIFY? " . ($use_notify ? "YES" : "NO"));
-
-    if ($use_notify) {
-        my $folders_str = join ' ', map { $_->{name} } @$folder_list;
-        my $cmd = "NOTIFY SET ($folders_str) (MessageNew MessageExpunge MessageFlags)";
-        log_info("[$name] → NOTIFY command: $cmd");
-
-        my @resp = $imap->tag_and_run($cmd);
-        my $last = $resp[-1] // '';
-
-        log_info("[$name] → NOTIFY raw response: [" . join(" | ", @resp) . "]");
-
-        if ($last =~ /OK/i) {
-            log_info("[$name] → NOTIFY activated (single connection for all folders)");
-            return (1, undef);
-        }
-        log_warn("[$name] → NOTIFY rejected by server, falling back to IDLE");
+    if (!$has_notify) {
+        log_info("[$name] Server does not advertise NOTIFY -> using IDLE");
+        return (0, undef);
     }
+
+    my $server_id = detect_server_version($imap);
+    log_info("[$name] Server identified as: $server_id");
+
+    # Known broken implementation: Dovecot 2.2.x series
+    #if ($server_id =~ /dovecot-2\.2\./) {
+    #    log_info("[$name] Dovecot 2.2.x detected -> NOTIFY is broken, using stable IDLE mode");
+    #    return (0, undef);
+    #}
+
+    my $folders_str = join ' ', map { $_->{name} } @$folder_list;
+    my $cmd = "NOTIFY SET (personal (MessageNew MessageExpunge MessageFlags))";
+    log_info("[$name] -> Trying NOTIFY: $cmd");
+
+    log_info("[$name] -> NOTIFY command: $cmd");
+
+    my @resp = $imap->tag_and_run($cmd);
+    my $last = $resp[-1] // '';
+
+    my $res = "";
+    $res = join(" | ", @resp) if defined $resp[0];
+    log_info("[$name] --> NOTIFY raw response: [" . $res . "]");
+    log_info("[$name] --> LastError: " . ($imap->LastError || "none"));
+
+
+    if ($last =~ /OK/i) {
+        log_info("[$name] -> NOTIFY activated (single connection for all folders)");
+        return (1, undef);
+    }
+    log_warn("[$name] -> NOTIFY rejected by server, falling back to IDLE");
     return (0, undef);
 }
 
+# ================== SERVER VERSION DETECTION ==================
+sub detect_server_version {
+    my ($imap) = @_;
+
+    # Ask the server for identification (RFC 2971)
+    my @resp = $imap->tag_and_run("ID NIL");
+    return "unknown" unless @resp;
+
+    my $line = join(" ", @resp);
+    # Look for Dovecot version string
+    if ($line =~ /dovecot/i) {
+        if ($line =~ /dovecot.*?(\d+\.\d+)/i) {
+            return "dovecot-$1";
+        }
+        return "dovecot-unknown";
+    }
+
+    # Generic fallback
+    return $line =~ /cyrus/i ? "cyrus" : "other";
+}
 # ================== CONNECTION (multi-folder with backoff) ==================
 sub connect_account {
     my ($name) = @_;
@@ -229,7 +268,7 @@ sub connect_account {
 
     my $success = eval {
 	# temp connection just to check capabilities
-	my ($tmp_socket, $tmp_imap) = create_imap_connection($acc, $acc->{folders}[0]{name});
+	my ($tmp_socket, $tmp_imap) = create_imap_connection($name, $acc, $acc->{folders}[0]{name});
         my ($using_notify) = setup_notification($name, $tmp_imap, $acc->{folders});
 
 	# Close the temporary objects (we will create fresh ones below)
@@ -238,7 +277,7 @@ sub connect_account {
 
         if ($using_notify) {
             my $key = "$name:NOTIFY";
-            my ($socket, $imap) = create_imap_connection($acc, $acc->{folders}[0]{name});  # dummy select just to get objects
+            my ($socket, $imap) = create_imap_connection($name, $acc, $acc->{folders}[0]{name});  # dummy select just to get objects
             my $conn = {
                 key            => $key,
                 name           => $name,
@@ -255,11 +294,11 @@ sub connect_account {
             $conns{$key} = $conn;
             $sock_to_key{$socket} = $key;
             $select->add($socket);
-            log_info("[$name] → NOTIFY mode (1 connection, " . scalar(@{$acc->{folders}}) . " folders)");
+            log_info("[$name] -> NOTIFY mode (1 connection, " . scalar(@{$acc->{folders}}) . " folders)");
         } else {
-            # IDLE fallback – one independent connection per folder
+            # IDLE fallback -> one independent connection per folder
             for my $f (@{$acc->{folders}}) {
-                my ($socket, $imap) = create_imap_connection($acc, $f->{name});
+                my ($socket, $imap) = create_imap_connection($name, $acc, $f->{name});
                 my $tag = $imap->idle() or die "IDLE on $f->{name}: " . $imap->LastError;
 
                 my $key = "$name:$f->{name}";
@@ -281,7 +320,7 @@ sub connect_account {
                 $conns{$key} = $conn;
                 $sock_to_key{$socket} = $key;
                 $select->add($socket);
-                log_info("[$name] → IDLE mode for folder $f->{name} (priority $f->{priority})");
+                log_info("[$name] -> IDLE mode for folder $f->{name} (priority $f->{priority})");
             }
         }
         return 1;
