@@ -383,6 +383,8 @@ sub process_notification {
 
         # Drain ALL pending IDLE/NOTIFY lines (critical fix)
         while (1) {
+		exit(1); # XXX idle_data not defined
+		# Apr 23 04:43:35 MacAir0 imap-idle-notify[75267]: process_notification error []: Can't call method "idle_data" on an undefined value at /home/todd/bin/imap-idle-notify line 386.
             my @data = $conn->{imap}->idle_data(2);   # short timeout per call
             last unless @data;                        # nothing left
 
