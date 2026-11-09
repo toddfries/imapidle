@@ -1,0 +1,168 @@
+.\" $OpenBSD$
+.\"
+.\" Copyright (c) 2026 Todd T. Fries <todd@fries.net>
+.\"
+.\" Permission to use, copy, modify, and distribute this software for any
+.\" purpose with or without fee is hereby granted, provided that the above
+.\" copyright notice and this permission notice appear in all copies.
+.\"
+.\" THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+.\" WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+.\" MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+.\" ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+.\" WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+.\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+.\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+.\"
+.Dd $Mdocdate: November 9 2026 $
+.Dt IMAPIDLE 1
+.Os
+.Sh NAME
+.Nm imapidle
+.Nd watch IMAP mailboxes and run mbsync
+.Sh SYNOPSIS
+.Nm imapidle
+.Op Fl d
+.Op Fl c Ar file
+.Sh DESCRIPTION
+.Nm
+logs into one or more IMAP accounts, waits for mailbox changes, and runs
+.Sy mbsync
+for the matching channel.
+.Sy mbsync
+itself runs once and exits.
+.Nm
+is the long-running side of that pair.
+.Pp
+Each account is independent.
+A bad password, a refused certificate, a dead server, a failed
+.Sy mbsync ,
+or a broken mailbox connection is logged and retried later.
+It does not stop the other accounts, and it does not exit the process.
+The process leaves the main loop only on
+.Dv SIGTERM
+or
+.Dv SIGINT .
+.Pp
+The options are as follows:
+.Bl -tag -width Ds
+.It Fl c Ar file
+Read
+.Ar file
+instead of the default configuration.
+The certificate store is
+.Pa known_hosts
+in the same directory as
+.Ar file .
+.It Fl d
+Stay in the foreground.
+Do not double-fork.
+Copy each log line to standard error as well as
+.Xr syslog 3 .
+Use this to accept a certificate and to watch a run.
+.El
+.Pp
+With or without
+.Fl d ,
+the first connection attempts happen before a daemon would fork, so a
+terminal can still answer a certificate prompt.
+Later reconnects are not interactive.
+A changed or unknown certificate is refused unless standard input is a
+terminal.
+Run
+.Nm Fl d
+once to accept it.
+.Pp
+Operational messages use
+.Xr syslog 3
+with ident
+.Cm imapidle ,
+options
+.Cm cons,pid ,
+and facility
+.Cm mail .
+.Pp
+.Sy mbsync
+is executed as
+.Pa /usr/local/bin/mbsync
+with the account's channel name as its only argument.
+The child waits for that account's
+.Va wait
+seconds, then replaces itself with
+.Sy mbsync .
+A non-zero exit is logged.
+The IMAP loop does not wait for
+.Sy mbsync
+to finish.
+.Sh IDLE AND NOTIFY
+If the server advertises
+.Cm NOTIFY ,
+.Nm
+sends
+.Dl NOTIFY SET (personal (MessageNew MessageExpunge MessageFlags))
+on the connection it keeps.
+One event on that connection runs the account's
+.Sy mbsync
+channel.
+The debounce interval is the smallest interval among that account's folders.
+.Pp
+Otherwise
+.Nm
+opens one
+.Cm IDLE
+connection per folder
+.Pq RFC 2177 .
+While a connection is in
+.Cm IDLE ,
+.Nm
+sends no other commands on it.
+About every 30 seconds it sends
+.Cm DONE
+and issues
+.Cm IDLE
+again, which also discovers a dead server.
+On
+.Cm NOTIFY
+connections the same timer sends
+.Cm NOOP .
+.Pp
+The first matching event for a connection starts
+.Sy mbsync .
+Further events on that connection are logged and ignored until the
+debounce interval has passed since that start.
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa ~/.config/imapidle/imapidle.conf
+Default configuration.
+See
+.Sy imapidle.conf(5) .
+.It Pa ~/.config/imapidle/known_hosts
+SHA256 certificate fingerprints accepted for the default configuration.
+The file mode is 0600 when
+.Nm
+creates it.
+.El
+.Sh EXIT STATUS
+.Ex -std imapidle
+Startup failures, including a missing configuration or a file with no
+usable account, exit 1 before the main loop.
+After the main loop has started, the process exits 0 on
+.Dv SIGTERM
+or
+.Dv SIGINT
+and otherwise keeps running.
+.Sh EXAMPLES
+Accept certificates and watch the log on the terminal:
+.Bd -literal -offset indent
+imapidle -d
+.Ed
+.Pp
+Use a configuration outside the default path:
+.Bd -literal -offset indent
+imapidle -c /home/user/.config/imapidle/imapidle.conf
+.Ed
+.Sh SEE ALSO
+.Xr syslog 3 ,
+.Sy imapidle.conf(5)
+.Sh AUTHORS
+.An Todd T. Fries Aq Mt todd@fries.net

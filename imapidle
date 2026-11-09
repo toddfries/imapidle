@@ -1,0 +1,948 @@
+#!/usr/bin/env perl
+
+# Copyright (c) 2026 Todd T. Fries <todd@fries.net>
+#
+# Permission to use, copy, modify, and distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+use strict;
+use warnings;
+use Config::Tiny;
+use Fcntl;
+use File::Basename qw(dirname);
+use File::Path qw(make_path);
+use Getopt::Std;
+use IO::Select;
+use IO::Socket::SSL;
+use Mail::IMAPClient;
+use POSIX qw(:sys_wait_h _exit setsid);
+use Sys::Syslog qw(:standard :macros);
+use Time::HiRes qw(time);
+
+my $CONFIG_DIR;
+my $CONFIG_FILE;
+my $KNOWN_HOSTS;
+my $FOREGROUND = 0;
+my $LOG_OPEN   = 0;
+
+my %accounts;
+my %conns;
+my %sock_to_key;
+my %children;
+my $select = IO::Select->new();
+
+sub log_line {
+    my ($pri, $msg) = @_;
+    $msg =~ s/[\r\n]+/ /g;
+    $msg = substr($msg, 0, 500);
+    syslog($pri, '%s', $msg) if $LOG_OPEN;
+    print STDERR "imapidle: $msg\n" if $FOREGROUND;
+}
+
+sub log_info  { log_line(LOG_INFO,    $_[0]); }
+sub log_warn  { log_line(LOG_WARNING, $_[0]); }
+sub log_error { log_line(LOG_ERR,     $_[0]); }
+
+sub usage {
+    print STDERR "usage: imapidle [-d] [-c file]\n";
+    exit 1;
+}
+
+sub scrub {
+    my ($err, $secret) = @_;
+    $err //= '';
+    chomp $err;
+    if (defined $secret && length $secret) {
+        $err =~ s/\Q$secret\E/***/g;
+    }
+    return $err;
+}
+
+sub close_extra_fds {
+    my ($keep) = @_;
+    for my $fd (3 .. 255) {
+        next if defined $keep && $fd == $keep;
+        POSIX::close($fd);
+    }
+}
+
+sub cloexec {
+    my ($fh) = @_;
+    return unless $fh;
+    my $fd = fileno($fh);
+    return unless defined $fd;
+    my $flags = fcntl($fh, F_GETFD, 0);
+    return unless defined $flags;
+    fcntl($fh, F_SETFD, $flags | FD_CLOEXEC);
+}
+
+sub load_known_hosts {
+    my %known;
+    return %known unless defined $KNOWN_HOSTS && -f $KNOWN_HOSTS;
+    open my $fh, '<', $KNOWN_HOSTS or return %known;
+    while (<$fh>) {
+        chomp;
+        next if /^\s*#/ || /^\s*$/;
+        my ($hostkey, $fp) = split /\s+/, $_, 2;
+        $known{$hostkey} = $fp if $hostkey && $fp;
+    }
+    close $fh;
+    return %known;
+}
+
+sub save_known_hosts {
+    my %known = @_;
+    return unless defined $KNOWN_HOSTS;
+    my $old = umask 077;
+    open my $fh, '>', $KNOWN_HOSTS or do {
+        umask $old;
+        log_error("Cannot write $KNOWN_HOSTS: $!");
+        return;
+    };
+    print $fh "# imapidle known_hosts (TOFU)\n";
+    print $fh "# format: server:port\tSHA256:fingerprint\n\n";
+    for my $k (sort keys %known) {
+        print $fh "$k\t$known{$k}\n";
+    }
+    close $fh;
+    umask $old;
+}
+
+sub approve_fingerprint {
+    my ($server, $port, $fingerprint) = @_;
+    my $hostkey = "$server:$port";
+    my %known   = load_known_hosts();
+    my $old     = $known{$hostkey};
+    return 1 if $old && $old eq $fingerprint;
+
+    if (!-t STDIN) {
+        log_error("Certificate unknown or changed for $hostkey — run imapidle -d to approve");
+        return 0;
+    }
+
+    print STDERR "\n";
+    if ($old) {
+        print STDERR "WARNING: Certificate CHANGED for $hostkey!\n  Old: $old\n  New: $fingerprint\n\n";
+    } else {
+        print STDERR "New SSL certificate for $hostkey\nFingerprint: $fingerprint\n\n";
+    }
+    print STDERR "Accept this certificate? (y/N) ";
+    my $ans = <STDIN>;
+    $ans = '' unless defined $ans;
+    chomp $ans;
+    if ($ans =~ /^y/i) {
+        $known{$hostkey} = $fingerprint;
+        save_known_hosts(%known);
+        log_info("Certificate accepted for $hostkey");
+        return 1;
+    }
+    log_error("Certificate rejected for $hostkey");
+    return 0;
+}
+
+sub calculate_debounce {
+    my $p = shift;
+    return 8    if $p <= 2;
+    return 3600 if $p >= 9;
+    return 180 + ($p - 3) * 120;
+}
+
+sub parse_folder_spec {
+    my ($val) = @_;
+    return unless defined $val;
+    my ($name, $fvars) = split /;/, $val, 2;
+    return unless defined $name && $name ne '';
+    my $priority = 5;
+    if (defined $fvars) {
+        my ($key, $v) = split /\s*=\s*/, $fvars, 2;
+        $priority = $v if $key && $key eq 'priority' && defined $v && $v =~ /^-?\d+$/;
+    }
+    $priority += 0;
+    return {
+        name     => $name,
+        priority => $priority,
+        debounce => calculate_debounce($priority),
+    };
+}
+
+# Returns an error string, or the empty string and fills %accounts.
+sub load_config {
+    my ($file) = @_;
+    %accounts = ();
+    my $cfg = Config::Tiny->read($file)
+      or return "Cannot read $file: " . (Config::Tiny->errstr // $!);
+
+    for my $section (sort keys %{$cfg}) {
+        next if $section eq '_';
+        my $row = $cfg->{$section};
+        next unless ref $row eq 'HASH';
+
+        my $err = sub {
+            log_error("[$section] $_[0] — skipping this account");
+        };
+
+        unless (defined $row->{server} && $row->{server} ne ''
+            && defined $row->{user} && $row->{user} ne ''
+            && defined $row->{mbsync_channel} && $row->{mbsync_channel} ne '')
+        {
+            $err->('missing server, user, or mbsync_channel');
+            next;
+        }
+
+        my $has_pw  = defined $row->{password}     && $row->{password} ne '';
+        my $has_cmd = defined $row->{password_cmd} && $row->{password_cmd} ne '';
+        if ($has_pw && $has_cmd) {
+            $err->('set only one of password or password_cmd');
+            next;
+        }
+        if (!$has_pw && !$has_cmd) {
+            $err->('missing password or password_cmd');
+            next;
+        }
+
+        my $port = $row->{port} // 993;
+        if ($port !~ /^\d+$/ || $port < 1 || $port > 65535) {
+            $err->('bad port');
+            next;
+        }
+
+        my @folders;
+        my $i          = 0;
+        my $bad_folder = 0;
+        while (exists $row->{"folder$i"}) {
+            my $folder = parse_folder_spec($row->{"folder$i"});
+            unless ($folder) {
+                $err->("empty folder$i");
+                $bad_folder = 1;
+                last;
+            }
+            push @folders, $folder;
+            $i++;
+        }
+        next if $bad_folder;
+
+        if (!@folders) {
+            my $spec = $row->{folder};
+            $spec = 'INBOX' unless defined $spec && $spec ne '';
+            my $folder = parse_folder_spec($spec);
+            unless ($folder) {
+                $err->('bad folder');
+                next;
+            }
+            my $priority = $row->{priority} // $folder->{priority};
+            $priority = 5 unless $priority =~ /^-?\d+$/;
+            $folder->{priority} = $priority + 0;
+            $folder->{debounce} = calculate_debounce($folder->{priority});
+            push @folders, $folder;
+        }
+
+        my $wait = $row->{wait} // 0;
+        $wait = 0 unless $wait =~ /^\d+$/;
+
+        $accounts{$section} = {
+            server         => $row->{server},
+            port           => $port + 0,
+            user           => $row->{user},
+            password       => $has_pw ? $row->{password} : undef,
+            password_cmd   => $has_cmd ? $row->{password_cmd} : undef,
+            mbsync_channel => $row->{mbsync_channel},
+            folders        => \@folders,
+            wait           => $wait + 0,
+            backoff        => 5,
+            next_try       => 0,
+        };
+        my $how = $has_cmd ? 'password_cmd' : 'password';
+        log_info("[$section] $how, mbsync $row->{mbsync_channel}, "
+              . scalar(@folders) . ' folder(s)');
+    }
+
+    return 'no usable accounts in ' . $file unless %accounts;
+    return '';
+}
+
+# First line of stdout from sh -c. Empty, timeout, and non-zero exit are undef.
+# The command text and its output are not logged.
+sub capture_password_cmd {
+    my ($cmd, $timeout) = @_;
+    $timeout //= 30;
+    return unless defined $cmd && $cmd ne '';
+
+    pipe my $rd, my $wr or return;
+    my $pid = fork();
+    if (!defined $pid) {
+        close $rd;
+        close $wr;
+        return;
+    }
+    if ($pid == 0) {
+        my $keep = fileno($wr);
+        close_extra_fds($keep);
+        open STDIN, '<', '/dev/null';
+        open STDOUT, '>&', $wr or _exit(127);
+        open STDERR, '>', '/dev/null';
+        close $wr;
+        exec '/bin/sh', '-c', $cmd
+            or _exit(127);
+    }
+    close $wr;
+    cloexec($rd);
+
+    my $buf      = '';
+    my $saw_eof  = 0;
+    my $deadline = time() + $timeout;
+    while (time() < $deadline) {
+        my $left = $deadline - time();
+        last if $left <= 0;
+        my $rin = '';
+        vec($rin, fileno($rd), 1) = 1;
+        my $nready = select($rin, undef, undef, $left);
+        last if !defined $nready || $nready < 0;
+        next if $nready == 0;
+        my $n = sysread($rd, my $chunk, 1024);
+        if (!defined $n) {
+            next if $!{EINTR};
+            last;
+        }
+        if ($n == 0) {
+            $saw_eof = 1;
+            last;
+        }
+        $buf .= $chunk;
+        last if length($buf) > 8192;
+    }
+    close $rd;
+
+    # Reap first. TERM/KILL only if it is still our child, so a finished
+    # helper cannot lose its pid to an unrelated process.
+    my $reaped = waitpid($pid, WNOHANG);
+    if ($reaped == 0 && $saw_eof) {
+        my $grace = time() + 2;
+        while (time() < $grace) {
+            $reaped = waitpid($pid, WNOHANG);
+            last if $reaped != 0;
+            select(undef, undef, undef, 0.05);
+        }
+    }
+    if ($reaped == 0) {
+        kill 'TERM', $pid;
+        my $grace = time() + 1;
+        while (time() < $grace) {
+            $reaped = waitpid($pid, WNOHANG);
+            last if $reaped != 0;
+            select(undef, undef, undef, 0.05);
+        }
+    }
+    if ($reaped == 0) {
+        kill 'KILL', $pid;
+        $reaped = waitpid($pid, 0);
+    }
+    return if $reaped <= 0 || $? != 0;
+
+    my ($line) = split /\r?\n/, $buf, 2;
+    return unless defined $line && $line ne '';
+    return if length($line) > 4096;
+    return $line;
+}
+
+sub account_password {
+    my ($name) = @_;
+    my $acc = $accounts{$name} or return;
+    if (defined $acc->{password_cmd}) {
+        my $pw = capture_password_cmd($acc->{password_cmd});
+        log_error("[$name] password_cmd failed") unless defined $pw;
+        return $pw;
+    }
+    return $acc->{password};
+}
+
+sub create_imap_connection {
+    my ($name, $acc, $folder, $password) = @_;
+    my $socket = IO::Socket::SSL->new(
+        PeerAddr        => $acc->{server},
+        PeerPort        => $acc->{port},
+        SSL_verify_mode => SSL_VERIFY_NONE,
+        SSL_hostname    => $acc->{server},
+    ) or die "SSL socket: $! $@";
+    cloexec($socket);
+
+    my $fingerprint = $socket->get_fingerprint('SHA256');
+    log_info("[$name] SSL $acc->{server} port $acc->{port}");
+    log_info("[$name] fingerprint $fingerprint");
+    if (!approve_fingerprint($acc->{server}, $acc->{port}, $fingerprint)) {
+        $socket->close;
+        die 'Certificate not approved';
+    }
+
+    my $imap = Mail::IMAPClient->new(
+        Socket   => $socket,
+        User     => $acc->{user},
+        Password => $password,
+    );
+    unless ($imap) {
+        my $err = scrub($@, $password);
+        $socket->close;
+        die "IMAP login: $err";
+    }
+    cloexec($imap->Socket) if $imap->Socket;
+
+    unless ($imap->select($folder)) {
+        my $err = scrub($imap->LastError, $password);
+        eval { $imap->logout };
+        $socket->close;
+        die "SELECT $folder: $err";
+    }
+    return ($socket, $imap);
+}
+
+sub detect_server_version {
+    my ($imap) = @_;
+    my @resp = $imap->tag_and_run('ID NIL');
+    return 'unknown' unless @resp;
+    my $line = join ' ', @resp;
+    if ($line =~ /dovecot/i) {
+        return "dovecot-$1" if $line =~ /dovecot.*?(\d+\.\d+)/i;
+        return 'dovecot-unknown';
+    }
+    return $line =~ /cyrus/i ? 'cyrus' : 'other';
+}
+
+sub setup_notification {
+    my ($name, $imap, $folder_list) = @_;
+    my @caps = $imap->capability or return 0;
+    my $has_notify = grep { uc($_) eq 'NOTIFY' } @caps;
+    if (!$has_notify) {
+        log_info("[$name] server does not advertise NOTIFY, using IDLE");
+        return 0;
+    }
+
+    my $server_id = detect_server_version($imap);
+    log_info("[$name] server identified as $server_id");
+
+    my $cmd = 'NOTIFY SET (personal (MessageNew MessageExpunge MessageFlags))';
+    log_info("[$name] NOTIFY $cmd");
+    my @resp = $imap->tag_and_run($cmd);
+    my $last = $resp[-1] // '';
+    my $res  = @resp ? join(' | ', @resp) : '';
+    log_info("[$name] NOTIFY response [$res]");
+    if ($last =~ /OK/i) {
+        my $n = $folder_list ? scalar(@$folder_list) : 0;
+        log_info("[$name] NOTIFY active ($n folder(s) in the personal namespace)");
+        return 1;
+    }
+    log_warn("[$name] NOTIFY rejected, falling back to IDLE");
+    return 0;
+}
+
+sub min_debounce {
+    my ($folders) = @_;
+    my $min;
+    for my $f (@$folders) {
+        $min = $f->{debounce} if !defined $min || $f->{debounce} < $min;
+    }
+    return $min // 180;
+}
+
+sub register_conn {
+    my ($conn) = @_;
+    $conns{ $conn->{key} } = $conn;
+    $sock_to_key{ $conn->{socket} } = $conn->{key};
+    $select->add($conn->{socket});
+}
+
+sub close_session {
+    my ($imap, $socket) = @_;
+    eval { $imap->logout if $imap };
+    eval { $socket->close if $socket };
+}
+
+sub arm_idle {
+    my ($name, $acc, $folder, $socket, $imap) = @_;
+    my $tag = $imap->idle();
+    unless ($tag) {
+        my $err = $imap->LastError // 'IDLE failed';
+        close_session($imap, $socket);
+        die "IDLE on $folder->{name}: $err";
+    }
+    register_conn({
+        key          => "$name:$folder->{name}",
+        name         => $name,
+        folder       => $folder->{name},
+        imap         => $imap,
+        tag          => $tag,
+        mode         => 'IDLE',
+        debounce     => $folder->{debounce},
+        last_event   => 0,
+        socket       => $socket,
+        channel      => $acc->{mbsync_channel},
+        wait         => $acc->{wait},
+        last_success => time(),
+    });
+    log_info("[$name] IDLE $folder->{name} (priority $folder->{priority})");
+}
+
+sub adopt_notify {
+    my ($name, $acc, $socket, $imap) = @_;
+    register_conn({
+        key          => "$name:NOTIFY",
+        name         => $name,
+        imap         => $imap,
+        mode         => 'NOTIFY',
+        socket       => $socket,
+        channel      => $acc->{mbsync_channel},
+        wait         => $acc->{wait},
+        debounce     => min_debounce($acc->{folders}),
+        last_event   => 0,
+        folders      => $acc->{folders},
+        last_success => time(),
+    });
+    log_info("[$name] NOTIFY mode, " . scalar(@{ $acc->{folders} }) . ' folder(s)');
+}
+
+sub account_covered {
+    my ($name) = @_;
+    return 1 if $conns{"$name:NOTIFY"};
+    my $acc = $accounts{$name} or return 0;
+    for my $f (@{ $acc->{folders} }) {
+        return 0 unless $conns{"$name:$f->{name}"};
+    }
+    return 1;
+}
+
+sub mark_retry {
+    my ($name) = @_;
+    my $acc = $accounts{$name} or return;
+    my $b = $acc->{backoff} // 5;
+    $b = 5 if $b < 5;
+    $acc->{next_try} = time() + $b;
+    my $n = int($b * 1.5 + 0.5);
+    $n = 900 if $n > 900;
+    $acc->{backoff} = $n;
+    log_info("[$name] retry in ${b}s");
+}
+
+sub note_success {
+    my ($name) = @_;
+    my $acc = $accounts{$name} or return;
+    $acc->{backoff}  = 5;
+    $acc->{next_try} = 0;
+}
+
+sub drop_socket {
+    my ($sock) = @_;
+    return unless $sock;
+    eval { $select->remove($sock) };
+    delete $sock_to_key{$sock};
+}
+
+sub drop_conn {
+    my ($key, $why) = @_;
+    return unless defined $key && exists $conns{$key};
+    my $conn = delete $conns{$key};
+    drop_socket($conn->{socket});
+    my $name = $conn->{name} // '?';
+    $why = scrub($why);
+    log_warn("[$name] dropping $key: $why");
+    eval {
+        if ($conn->{imap} && $conn->{mode} && $conn->{mode} eq 'IDLE' && $conn->{tag}) {
+            $conn->{imap}->done($conn->{tag});
+        }
+    };
+    close_session($conn->{imap}, $conn->{socket});
+    mark_retry($name);
+}
+
+sub connect_idle_folders {
+    my ($name, $folders, $password) = @_;
+    my $acc = $accounts{$name} or return 0;
+    my $failed = 0;
+    for my $folder (@$folders) {
+        my $ok = eval {
+            my ($socket, $imap) = create_imap_connection($name, $acc, $folder->{name}, $password);
+            arm_idle($name, $acc, $folder, $socket, $imap);
+            1;
+        };
+        next if $ok;
+        $failed = 1;
+        log_error("[$name] $folder->{name}: " . scrub($@, $password));
+    }
+    return $failed ? 0 : 1;
+}
+
+sub connect_account {
+    my ($name) = @_;
+    my $acc = $accounts{$name} or return 0;
+    return 1 if account_covered($name);
+
+    my @need = grep { !$conns{"$name:$_->{name}"} } @{ $acc->{folders} };
+    return 1 unless @need;
+
+    my $password = account_password($name);
+    if (!defined $password) {
+        mark_retry($name);
+        return 0;
+    }
+
+    my $partial = grep { index($_, "$name:") == 0 } keys %conns;
+    if ($partial) {
+        my $ok = connect_idle_folders($name, \@need, $password);
+        $ok && account_covered($name) ? note_success($name) : mark_retry($name);
+        return $ok;
+    }
+
+    my $ok = eval {
+        my ($socket, $imap) = create_imap_connection($name, $acc, $need[0]{name}, $password);
+        my $notify = setup_notification($name, $imap, $acc->{folders});
+        if ($notify) {
+            adopt_notify($name, $acc, $socket, $imap);
+        } else {
+            close_session($imap, $socket);
+            connect_idle_folders($name, \@need, $password) or die 'IDLE failed';
+        }
+        1;
+    };
+    if (!$ok) {
+        log_error("[$name] connect failed: " . scrub($@, $password));
+        mark_retry($name);
+        return 0;
+    }
+    if (account_covered($name)) {
+        note_success($name);
+        log_info("[$name] monitoring $acc->{mbsync_channel}");
+        return 1;
+    }
+    mark_retry($name);
+    return 0;
+}
+
+sub restart_idle {
+    my ($conn) = @_;
+    return 1 if !$conn || ($conn->{mode} // '') eq 'NOTIFY';
+    return 0 unless $conn->{imap};
+    my $ok = eval {
+        $conn->{imap}->done($conn->{tag}) if $conn->{tag};
+        $conn->{tag} = $conn->{imap}->idle() or die($conn->{imap}->LastError // 'IDLE failed');
+        1;
+    };
+    if (!$ok) {
+        log_warn("[$conn->{name}] idle re-arm failed: " . scrub($@));
+        return 0;
+    }
+    log_info("[$conn->{name}] IDLE re-armed");
+    return 1;
+}
+
+sub reap_children {
+    while ((my $pid = waitpid(-1, WNOHANG)) > 0) {
+        my $status = $?;
+        my $what   = delete $children{$pid} // 'child';
+        if ($status == 0) {
+            log_info("$what pid $pid exited 0");
+        } elsif ($status & 127) {
+            log_warn("$what pid $pid signal " . ($status & 127));
+        } else {
+            log_warn("$what pid $pid exit " . ($status >> 8));
+        }
+    }
+}
+
+sub trigger_mbsync {
+    my ($channel, $wait) = @_;
+    $wait //= 0;
+    my $pid = fork();
+    if (!defined $pid) {
+        log_error("fork mbsync '$channel' failed: $!");
+        return;
+    }
+    if ($pid == 0) {
+        $SIG{PIPE} = 'IGNORE';
+        $SIG{TERM} = 'DEFAULT';
+        $SIG{INT}  = 'DEFAULT';
+        close_extra_fds();
+        open STDIN,  '<', '/dev/null';
+        open STDOUT, '>', '/dev/null';
+        open STDERR, '>', '/dev/null';
+        sleep $wait if $wait > 0;
+        exec '/usr/local/bin/mbsync', $channel
+            or _exit(1);
+    }
+    $children{$pid} = "mbsync $channel";
+    log_info("forked mbsync '$channel' (pid $pid)");
+}
+
+sub process_notification {
+    my ($conn) = @_;
+    die "missing IMAP session\n" unless $conn && $conn->{imap};
+
+    my $ok = eval {
+        my $any  = 0;
+        my $spins = 0;
+        while ($spins++ < 100) {
+            my @data = $conn->{imap}->idle_data(0);
+            if (@data == 1 && !defined $data[0]) {
+                die(($conn->{imap}->LastError // 'idle_data failed') . "\n");
+            }
+            @data = grep { defined && $_ ne '' } @data;
+            last unless @data;
+            $any = 1;
+            for my $line (@data) {
+                chomp $line;
+                log_info("[$conn->{name}] $line");
+            }
+        }
+        if ($any) {
+            my $now = time();
+            my $debounce = $conn->{debounce} // 180;
+            if ($now - $conn->{last_event} > $debounce) {
+                my $wait = $conn->{wait} // 0;
+                log_info("[$conn->{name}] debounce passed, mbsync $conn->{channel}");
+                trigger_mbsync($conn->{channel}, $wait);
+                $conn->{last_event} = $now;
+            } else {
+                log_info("[$conn->{name}] notification grouped (debounce active)");
+            }
+        }
+        1;
+    };
+    if (!$ok) {
+        drop_conn($conn->{key}, scrub($@));
+        return;
+    }
+    if (($conn->{mode} // '') eq 'IDLE' && exists $conns{ $conn->{key} }) {
+        drop_conn($conn->{key}, 'idle re-arm failed') unless restart_idle($conn);
+    }
+}
+
+sub handle_ready {
+    my ($sock) = @_;
+    my $key  = $sock_to_key{$sock};
+    my $conn = defined $key ? $conns{$key} : undef;
+    unless ($conn && $conn->{imap}) {
+        if (defined $key && exists $conns{$key}) {
+            drop_conn($key, 'ready socket has no IMAP session');
+        } else {
+            drop_socket($sock);
+            log_warn('dropping ready socket with no session');
+        }
+        return;
+    }
+    process_notification($conn);
+}
+
+sub housekeeping {
+    my $now = time();
+    for my $key (keys %conns) {
+        my $conn = $conns{$key} or next;
+        my $dead = 0;
+        my $mode = $conn->{mode} // '';
+        my $ok = eval {
+            $dead = 1 if !$conn->{imap} || !$conn->{imap}->IsConnected;
+            # IDLE forbids any command except DONE. NOOP would break the session.
+            if (!$dead && $mode ne 'IDLE') {
+                $conn->{imap}->noop or $dead = 1;
+            }
+            1;
+        };
+        $dead = 1 if !$ok;
+        if ($dead) {
+            drop_conn($key, scrub($@) || 'connection lost');
+            next;
+        }
+        if ($now - ($conn->{last_success} // 0) > 300) {
+            $accounts{ $conn->{name} }{backoff} = 5 if $accounts{ $conn->{name} };
+            $conn->{last_success} = $now;
+        }
+        if (($conn->{mode} // '') eq 'IDLE') {
+            drop_conn($key, 'idle refresh failed') unless restart_idle($conn);
+        }
+    }
+
+    for my $name (keys %accounts) {
+        next if account_covered($name);
+        next if ($accounts{$name}{next_try} // 0) > $now;
+        eval { connect_account($name) };
+        if ($@) {
+            log_error("[$name] reconnect: " . scrub($@));
+            mark_retry($name);
+        }
+    }
+}
+
+sub loop_timeout {
+    my $now  = time();
+    my $wait = 30;
+    for my $name (keys %accounts) {
+        next if account_covered($name);
+        my $due = $accounts{$name}{next_try} // $now;
+        my $d   = $due - $now;
+        $d = 0 if $d < 0;
+        $wait = $d if $d < $wait;
+    }
+    return $wait;
+}
+
+sub one_iteration {
+    reap_children();
+    my @ready = $select->can_read(loop_timeout());
+    # Drain ready sockets before housekeeping sends DONE or NOOP.
+    for my $sock (@ready) {
+        eval { handle_ready($sock) };
+        next unless $@;
+        log_warn('socket handler: ' . scrub($@));
+        my $key = $sock_to_key{$sock};
+        if (defined $key && exists $conns{$key}) {
+            drop_conn($key, 'handler error');
+        } else {
+            drop_socket($sock);
+        }
+    }
+    housekeeping();
+}
+
+sub daemonize {
+    log_info('daemonizing');
+    chdir '/' or die "chdir /: $!";
+    my $pid = fork();
+    die "first fork failed: $!" unless defined $pid;
+    exit 0 if $pid;
+    setsid() or die "setsid: $!";
+    $pid = fork();
+    die "second fork failed: $!" unless defined $pid;
+    exit 0 if $pid;
+    umask 077;
+    open STDIN,  '<', '/dev/null';
+    open STDOUT, '>', '/dev/null';
+    open STDERR, '>', '/dev/null';
+    $FOREGROUND = 0;
+    log_info("daemon pid $$");
+}
+
+sub graceful_shutdown {
+    my ($sig) = @_;
+    log_info("signal $sig, shutting down");
+    for my $key (keys %conns) {
+        my $conn = $conns{$key} or next;
+        eval { $conn->{imap}->done($conn->{tag}) if $conn->{imap} && $conn->{tag}; };
+        close_session($conn->{imap}, $conn->{socket});
+    }
+    closelog() if $LOG_OPEN;
+    exit 0;
+}
+
+sub main_loop {
+    log_info('entering main loop (' . scalar(keys %conns) . ' connection(s))');
+    my $failures = 0;
+    while (1) {
+        my $ok = eval { one_iteration(); 1 };
+        if ($ok) {
+            $failures = 0;
+            next;
+        }
+        $failures++;
+        log_error('loop error: ' . scrub($@));
+        sleep 1;
+        log_error("loop error persisted $failures times") if $failures == 10 || $failures % 100 == 0;
+    }
+}
+
+sub startup_fail {
+    my ($msg) = @_;
+    log_error($msg);
+    print STDERR "imapidle: $msg\n";
+    exit 1;
+}
+
+sub run {
+    my (@argv) = @_;
+    local @ARGV = @argv;
+    my %opt;
+    getopts('dc:', \%opt) or usage();
+    usage() if @ARGV;
+
+    $FOREGROUND = $opt{d} ? 1 : 0;
+    if (defined $opt{c}) {
+        $CONFIG_FILE = $opt{c};
+    } else {
+        startup_fail('HOME is not set') unless defined $ENV{HOME} && $ENV{HOME} ne '';
+        $CONFIG_FILE = "$ENV{HOME}/.config/imapidle/imapidle.conf";
+    }
+    $CONFIG_DIR  = dirname($CONFIG_FILE);
+    $KNOWN_HOSTS = "$CONFIG_DIR/known_hosts";
+
+    openlog('imapidle', 'cons,pid', 'mail');
+    $LOG_OPEN = 1;
+    $SIG{PIPE} = 'IGNORE';
+    $SIG{TERM} = \&graceful_shutdown;
+    $SIG{INT}  = \&graceful_shutdown;
+
+    make_path($CONFIG_DIR, { mode => 0700 }) unless -d $CONFIG_DIR;
+    my $err = load_config($CONFIG_FILE);
+    startup_fail($err) if $err;
+
+    for my $name (sort keys %accounts) {
+        eval { connect_account($name) };
+        log_error("[$name] startup: " . scrub($@)) if $@;
+    }
+
+    daemonize() unless $FOREGROUND;
+    main_loop();
+}
+
+sub account_names { sort keys %accounts }
+
+sub loaded_account {
+    my ($name) = @_;
+    return unless exists $accounts{$name};
+    my %copy = %{ $accounts{$name} };
+    $copy{folders} = [ map { +{%$_} } @{ $accounts{$name}{folders} } ];
+    return \%copy;
+}
+
+sub conn_count { scalar keys %conns }
+
+sub account_next_try {
+    my ($name) = @_;
+    return $accounts{$name}{next_try} // 0;
+}
+
+# Test helper: a selected socket whose IMAP object is already gone.
+sub install_broken_conn_for_test {
+    my ($name, $sock) = @_;
+    my $key = "$name:INBOX";
+    $accounts{$name} = {
+        server         => 'imap.example',
+        port           => 993,
+        user           => 'u',
+        password       => 'x',
+        mbsync_channel => 'ch',
+        folders        => [ { name => 'INBOX', priority => 1, debounce => 8 } ],
+        wait           => 0,
+        backoff        => 5,
+        next_try       => 0,
+    };
+    $conns{$key} = {
+        key      => $key,
+        name     => $name,
+        folder   => 'INBOX',
+        imap     => undef,
+        mode     => 'IDLE',
+        socket   => $sock,
+        channel  => 'ch',
+        wait     => 0,
+        debounce => 8,
+    };
+    $sock_to_key{$sock} = $key;
+    $select->add($sock);
+    return $key;
+}
+
+run(@ARGV) unless caller;
+1;

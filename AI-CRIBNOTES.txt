@@ -11,31 +11,34 @@ Local rules
 - Threads convention adopted 2026-11-09. No tag tree until the first tag or "threads on".
 
 Five fields (this repo's agent)
-- Owns: imap-idle-notify in this repo, and these notes.
+- Owns: imapidle in this repo, and these notes.
 - Inputs: the script, imap-idle-notify-session-extraction.md, and at runtime ~/.config/imapidle/.
-- May: read, record, and propose a small verified edit after a decision.
-- Must ask before: changing daemon behavior, replacing ~/bin/imap-idle-notify, push, rc or syslog changes, reading or copying a live password.
-- Done when: Todd has not set a product goal. An ingest is done when this file and .agent/session-state.md match the handbook hash and the script at the named commit.
+- May: read, record, and change the daemon when Todd has asked.
+- Must ask before: replacing ~/bin/imap-idle-notify, push, rc or syslog.conf changes, reading or copying a live password.
+- Done when: Todd has not set a product goal past "set it up, then monitor and test".
 
-Project facts (sourced 20261109, script e48344f)
-- One program: imap-idle-notify. Perl, ISC header, Copyright (c) 2026 Todd T. Fries.
-- Purpose: watch IMAP folders and fork /usr/local/bin/mbsync <channel> when the server reports a change. OpenBSD isync is one-shot; this is the IDLE/NOTIFY side.
+Project facts (sourced 20261109, updated the same day)
+- Program file: imapidle. Perl, ISC header, Copyright (c) 2026 Todd T. Fries. Renamed from imap-idle-notify. ~/bin/imap-idle-notify is still the old copy and has not been replaced.
+- Invocation: imapidle [-d] [-c file]. Default file ~/.config/imapidle/imapidle.conf. -d stays in the foreground and copies logs to stderr.
+- Manuals: man/imapidle.1 and man/imapidle.conf.5. mandoc -Tlint is silent. Sibling pages are named with Sy because they are not in /usr/share/man yet.
+- Test command: make test (prove t). t/00-syntax.t, t/01-mandoc.t, t/02-config.t, t/03-isolate.t.
+- Purpose: watch IMAP folders and fork /usr/local/bin/mbsync <channel> when the server reports a change. OpenBSD isync is one-shot.
 - History came from ~/bin (11 commits, 2026-04-07 through 2026-06-07). Hashes here differ because those commits used to sit inside the bin repo.
-- Config: ~/.config/imapidle/imapidle.conf via Config::Tiny (p5-Config-Tiny). Installed here: 2.14. Not Config::IniFiles.
-- known_hosts: ~/.config/imapidle/known_hosts. SHA256 fingerprint, accept on a tty, refuse when not a tty.
+- Config: Config::Tiny (p5-Config-Tiny 2.14). Not Config::IniFiles. One bad section is skipped. A missing file or zero usable accounts exits 1 before the loop.
+- Password: exactly one of password or password_cmd. password_cmd is /bin/sh -c, first stdout line, exit 0, 30s budget, rerun on each connect. Output is not logged. OAuth is not implemented; the command prints the secret.
+- known_hosts sits next to the config file. SHA256 fingerprint, accept on a tty, refuse otherwise. New files use mode 0600. Directory created mode 0700.
 - TLS: IO::Socket::SSL with SSL_VERIFY_NONE, then that TOFU check. IO::Socket::SSL 2.099 is installed.
-- IMAP: Mail::IMAPClient 3.43. idle, idle_data, and done all exist on this host.
-- mbsync: /usr/local/bin/mbsync. isync-1.5.1p0 is installed. One fork per trigger. No concurrency cap. Stdio in the child is /dev/null.
-- Syslog: ident imap-idle-notify, options cons,pid, facility mail.
-- Startup order: load_config, connect every account, double-fork daemonize, main_loop. No pidfile. SIGTERM and SIGINT call done on IDLE tags and exit 0.
-- Select timeout is 30s. housekeeping runs every wake.
-- Debounce from priority: <=2 → 8s; >=9 → 3600s; else 180+(priority-3)*120. Priority 3 is 180, 5 is 420, 8 is 780.
-- Section key wait (seconds, default 0) sleeps inside the process after debounce clears, before the fork.
-- No tests, Makefile, or manual in this repo. perl -c exits 0 (2026-11-09).
+- IMAP: Mail::IMAPClient 3.43. idle, idle_data, and done exist. NOTIFY is sent on the socket that stays in the select set. Otherwise one IDLE connection per folder.
+- mbsync: /usr/local/bin/mbsync. isync-1.5.1p0 is installed. wait seconds happen in the child. No concurrency cap. Child closes inherited descriptors.
+- Syslog: ident imapidle, options cons,pid, facility mail.
+- A failed account, socket, password command, or mbsync does not exit the process. The loop exits only on SIGTERM or SIGINT (exit 0). Backoff is remembered on the account (5s, x1.5, cap 900) and does not sleep the other accounts.
+- IDLE is refreshed about every 30s with DONE then IDLE. NOOP is not sent during IDLE. NOTIFY connections get NOOP on that timer.
+- Debounce from priority: <=2 → 8s; >=9 → 3600s; else 180+(priority-3)*120. Priority 3 is 180, 5 is 420, 8 is 780. The first event starts mbsync. Later events on that connection are ignored until the interval has passed.
+- wait (seconds, default 0) sleeps in the mbsync child, not in the IMAP loop.
 
 Config shape the script reads
-- One INI section per account. Required: server, user, password, mbsync_channel. port defaults to 993.
-- folder0, folder1, ... value is NAME or NAME;priority=N. Only the priority suffix is read. Missing suffix → priority 5.
+- One INI section per account. Required: server, user, mbsync_channel, and exactly one of password or password_cmd. port defaults to 993.
+- folder0, folder1, ... value is NAME or NAME;priority=N. Numbers start at 0 and have no gaps. Only the priority suffix is read. Missing suffix → priority 5.
 - If no folderN keys: folder (default INBOX) and priority (default 5).
 - Every folder in a section shares that section's mbsync_channel.
 
@@ -44,13 +47,11 @@ What the 2026-11-09 handoff still matches
 - The priority bands, TOFU known_hosts, syslog mail facility, fork/exec of mbsync, and double-fork daemon match the idea. The file on master is the later script.
 - Packages named in the handoff (p5-Mail-IMAPClient, p5-IO-Socket-SSL, isync) are installed. The config module in the script is p5-Config-Tiny.
 
-Live behavior at e48344f
-- connect_account opens a temporary IMAP session, and setup_notification sends `NOTIFY SET (personal (MessageNew MessageExpunge MessageFlags))` when the server advertises NOTIFY. The folder list is built and never sent. The temp session is logged out. A new session is opened and does not send NOTIFY again. NOTIFY mode stores that second socket and never calls idle on it.
-- Without NOTIFY, one IDLE connection per folder. Key is section:folder.
-- process_notification's drain loop hits `exit(1)` before idle_data. That is the whole 2026-06-07 commit "avoid fast loop fail on missing function". The comment says idle_data is missing. Mail::IMAPClient 3.43 has the method. The syslog line in the comment is "Can't call method idle_data on an undefined value" with an empty name, which is a missing object, and the socket would stay readable. The exit stops that spin by killing the process on the first ready socket.
-- housekeeping's raised backoff is stored on the conn it then deletes. connect_account starts the new conn at backoff 5.
-- housekeeping's reconnect sleep runs inside the shared loop.
-- Dovecot 2.2 NOTIFY refusal is commented out. detect_server_version sends `ID NIL`.
+Removed from the imported script (2026-11-09)
+- The 2026-06-07 `exit(1)` before idle_data is gone. A ready socket with no IMAP object is dropped and that account is retried. Mail::IMAPClient 3.43 does have idle_data. The old syslog line was an undefined object, which left the socket readable and spun.
+- NOTIFY is armed on the connection that is kept. A rejected NOTIFY falls back to IDLE on fresh sockets.
+- Dovecot 2.2 NOTIFY refusal is still commented out. detect_server_version still sends `ID NIL`.
 
-Still open (behavior, not the parked list)
-- The exit(1) tripwire is the first thing to decide. Do not treat the handoff's embedded script as a drop-in replacement.
+Still open
+- No live IMAP trial yet. Todd will set up a config, then monitor and test.
+- ~/bin/imap-idle-notify is untouched.

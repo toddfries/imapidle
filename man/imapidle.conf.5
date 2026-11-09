@@ -1,0 +1,188 @@
+.\" $OpenBSD$
+.\"
+.\" Copyright (c) 2026 Todd T. Fries <todd@fries.net>
+.\"
+.\" Permission to use, copy, modify, and distribute this software for any
+.\" purpose with or without fee is hereby granted, provided that the above
+.\" copyright notice and this permission notice appear in all copies.
+.\"
+.\" THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+.\" WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+.\" MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+.\" ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+.\" WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+.\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+.\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+.\"
+.Dd $Mdocdate: November 9 2026 $
+.Dt IMAPIDLE.CONF 5
+.Os
+.Sh NAME
+.Nm imapidle.conf
+.Nd imapidle configuration file
+.Sh SYNOPSIS
+.Pa ~/.config/imapidle/imapidle.conf
+.Sh DESCRIPTION
+.Nm
+tells
+.Sy imapidle(1)
+which IMAP accounts to watch and which
+.Sy mbsync
+channel to run when mail changes.
+The file is INI.
+One section is one account.
+The section name is a label used in log lines.
+.Pp
+The directory should be mode 0700 and the file mode 0600.
+A
+.Va password
+value is stored in the file.
+A
+.Va password_cmd
+value is not a place to hide a secret: anyone who can read the file can
+read the command.
+.Pp
+Lines that start with
+.Ql #
+or
+.Ql ;
+are comments.
+Text after a value is not a comment.
+.Pp
+A section that is missing a required key, sets both password forms, or
+names a bad port is logged and skipped.
+Other sections are still used.
+If every section is skipped, or the file cannot be read,
+.Nm imapidle
+exits 1 at startup.
+.Sh KEYS
+.Bl -tag -width "mbsync_channel"
+.It Va server
+IMAP host name.
+Required.
+.It Va port
+TCP port.
+The default is 993.
+.It Va user
+IMAP login name.
+Required.
+.It Va password
+The IMAP password, used as-is.
+Set this or
+.Va password_cmd ,
+not both.
+The value is not written to the log.
+.It Va password_cmd
+A command passed to
+.Pa /bin/sh
+with
+.Fl c .
+The first line of its standard output, without the trailing newline, is
+the IMAP password.
+The command must exit 0.
+Empty output, a non-zero exit, or no exit within 30 seconds fails that
+account only.
+The command is run again on each connection, so a helper that prints a
+fresh access token can be dropped in here.
+OAuth itself is not implemented;
+.Nm imapidle
+only reads the password the command prints.
+The command text and the password are not written to the log.
+Standard error from the command is discarded.
+.It Va mbsync_channel
+Channel name passed to
+.Sy mbsync .
+Required.
+It must match a channel in the
+.Sy mbsync
+configuration.
+.Nm imapidle
+does not read that file.
+.It Va wait
+Seconds to sleep inside the
+.Sy mbsync
+child before exec.
+The default is 0.
+This does not stall the IMAP loop.
+.It Va folder0 , folder1 , ...
+Mailbox names, starting at
+.Va folder0
+with no gaps.
+A value is either
+.Ar name
+or
+.Ar name;priority=N .
+Any other suffix is ignored.
+A missing priority is 5.
+.It Va folder
+Used only when no
+.Va folderN
+key is present.
+The default mailbox is
+.Cm INBOX .
+.It Va priority
+Used only with
+.Va folder ,
+not with
+.Va folderN .
+The default is 5.
+.El
+.Pp
+Every folder in a section shares that section's
+.Va mbsync_channel ,
+.Va user ,
+and password.
+.Sh DEBOUNCE
+Priority selects how long
+.Nm imapidle
+ignores later events after it has started
+.Sy mbsync
+for that connection:
+.Bl -column "priority" "seconds" -offset indent
+.It Sy priority Ta Sy seconds
+.It 2 or less Ta 8
+.It 3 Ta 180
+.It 4 Ta 300
+.It 5 Ta 420
+.It 6 Ta 540
+.It 7 Ta 660
+.It 8 Ta 780
+.It 9 or more Ta 3600
+.El
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa ~/.config/imapidle/imapidle.conf
+Default path.
+.It Pa ~/.config/imapidle/known_hosts
+Certificates accepted while using the default path.
+.El
+.Sh EXAMPLES
+A password stored in the file, with a hot inbox and a lazy archive:
+.Bd -literal -offset indent
+[personal]
+server = imap.example.com
+port = 993
+user = you@example.com
+password = secret
+mbsync_channel = personal
+folder0 = INBOX;priority=1
+folder1 = Archive;priority=9
+.Ed
+.Pp
+The same shape when a command prints the password.
+.Sy pizauth show personal
+is only an example of such a command:
+.Bd -literal -offset indent
+[work]
+server = imap.example.com
+user = you@work.example
+password_cmd = pizauth show work
+mbsync_channel = work
+folder = INBOX
+priority = 3
+.Ed
+.Sh SEE ALSO
+.Xr syslog 3 ,
+.Sy imapidle(1)
+.Sh AUTHORS
+.An Todd T. Fries Aq Mt todd@fries.net
