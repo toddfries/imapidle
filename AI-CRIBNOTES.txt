@@ -1,0 +1,56 @@
+imapidle AI knowledge base (project-specific layer).
+Common rules live in agent-core. sourced 20261029.
+Read this session: index.md (Last: 2026-10-29), load-protocol.md, behavior.md, values.md, doctrine.md, frugality.md, data.md, autonomy.md, coordination.md, threads.md, pointer/AGENTS.md, AI-CRIBNOTES-seed.txt.
+sha256(index.md) = 997d8684b2c6a8db3dca535f0e2f9ba2bc8e0aa01bc44ab02024b2eff01164be
+On this host the checkout is /home/todd/git/sw/agent-core (commit 0025d44).
+si/AGENTS.md names /home/box/git/sw/agent-core. That path is absent here.
+
+Local rules
+- si/AGENTS.md: none yet. Local rules override agent-core only where agent-core says they decide.
+- Learning mode: not opted in. Default stands (normal proactivity). autonomy.md.
+- Threads convention adopted 2026-11-09. No tag tree until the first tag or "threads on".
+
+Five fields (this repo's agent)
+- Owns: imap-idle-notify in this repo, and these notes.
+- Inputs: the script, imap-idle-notify-session-extraction.md, and at runtime ~/.config/imapidle/.
+- May: read, record, and propose a small verified edit after a decision.
+- Must ask before: changing daemon behavior, replacing ~/bin/imap-idle-notify, push, rc or syslog changes, reading or copying a live password.
+- Done when: Todd has not set a product goal. An ingest is done when this file and .agent/session-state.md match the handbook hash and the script at the named commit.
+
+Project facts (sourced 20261109, script e48344f)
+- One program: imap-idle-notify. Perl, ISC header, Copyright (c) 2026 Todd T. Fries.
+- Purpose: watch IMAP folders and fork /usr/local/bin/mbsync <channel> when the server reports a change. OpenBSD isync is one-shot; this is the IDLE/NOTIFY side.
+- History came from ~/bin (11 commits, 2026-04-07 through 2026-06-07). Hashes here differ because those commits used to sit inside the bin repo.
+- Config: ~/.config/imapidle/imapidle.conf via Config::Tiny (p5-Config-Tiny). Installed here: 2.14. Not Config::IniFiles.
+- known_hosts: ~/.config/imapidle/known_hosts. SHA256 fingerprint, accept on a tty, refuse when not a tty.
+- TLS: IO::Socket::SSL with SSL_VERIFY_NONE, then that TOFU check. IO::Socket::SSL 2.099 is installed.
+- IMAP: Mail::IMAPClient 3.43. idle, idle_data, and done all exist on this host.
+- mbsync: /usr/local/bin/mbsync. isync-1.5.1p0 is installed. One fork per trigger. No concurrency cap. Stdio in the child is /dev/null.
+- Syslog: ident imap-idle-notify, options cons,pid, facility mail.
+- Startup order: load_config, connect every account, double-fork daemonize, main_loop. No pidfile. SIGTERM and SIGINT call done on IDLE tags and exit 0.
+- Select timeout is 30s. housekeeping runs every wake.
+- Debounce from priority: <=2 → 8s; >=9 → 3600s; else 180+(priority-3)*120. Priority 3 is 180, 5 is 420, 8 is 780.
+- Section key wait (seconds, default 0) sleeps inside the process after debounce clears, before the fork.
+- No tests, Makefile, or manual in this repo. perl -c exits 0 (2026-11-09).
+
+Config shape the script reads
+- One INI section per account. Required: server, user, password, mbsync_channel. port defaults to 993.
+- folder0, folder1, ... value is NAME or NAME;priority=N. Only the priority suffix is read. Missing suffix → priority 5.
+- If no folderN keys: folder (default INBOX) and priority (default 5).
+- Every folder in a section shares that section's mbsync_channel.
+
+What the 2026-11-09 handoff still matches
+- imap-idle-notify-session-extraction.md is the session handoff. Its embedded script is an earlier single-folder design: Config::IniFiles, one folder= per section, priority on the section, no NOTIFY, no wait, no backoff, no signals.
+- The priority bands, TOFU known_hosts, syslog mail facility, fork/exec of mbsync, and double-fork daemon match the idea. The file on master is the later script.
+- Packages named in the handoff (p5-Mail-IMAPClient, p5-IO-Socket-SSL, isync) are installed. The config module in the script is p5-Config-Tiny.
+
+Live behavior at e48344f
+- connect_account opens a temporary IMAP session, and setup_notification sends `NOTIFY SET (personal (MessageNew MessageExpunge MessageFlags))` when the server advertises NOTIFY. The folder list is built and never sent. The temp session is logged out. A new session is opened and does not send NOTIFY again. NOTIFY mode stores that second socket and never calls idle on it.
+- Without NOTIFY, one IDLE connection per folder. Key is section:folder.
+- process_notification's drain loop hits `exit(1)` before idle_data. That is the whole 2026-06-07 commit "avoid fast loop fail on missing function". The comment says idle_data is missing. Mail::IMAPClient 3.43 has the method. The syslog line in the comment is "Can't call method idle_data on an undefined value" with an empty name, which is a missing object, and the socket would stay readable. The exit stops that spin by killing the process on the first ready socket.
+- housekeeping's raised backoff is stored on the conn it then deletes. connect_account starts the new conn at backoff 5.
+- housekeeping's reconnect sleep runs inside the shared loop.
+- Dovecot 2.2 NOTIFY refusal is commented out. detect_server_version sends `ID NIL`.
+
+Still open (behavior, not the parked list)
+- The exit(1) tripwire is the first thing to decide. Do not treat the handoff's embedded script as a drop-in replacement.
