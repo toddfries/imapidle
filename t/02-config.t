@@ -31,7 +31,7 @@ print $fh <<'EOF';
 [good]
 server = imap.example.com
 user = a@example.com
-password = secret
+pass = secret
 mbsync_channel = personal
 folder0 = INBOX;priority=1
 folder1 = Archive
@@ -39,38 +39,20 @@ folder1 = Archive
 [cmd]
 server = imap.example.com
 user = b@example.com
-password_cmd = printf '%s\n' tok
+pass_cmd = printf '%s\n' tok
 mbsync_channel = work
 folder = INBOX
 priority = 9
-
-[both]
-server = imap.example.com
-user = c@example.com
-password = x
-password_cmd = true
-mbsync_channel = no
-folder = INBOX
-
-[incomplete]
-server = imap.example.com
-
-[emptybox]
-server = imap.example.com
-user = d@example.com
-password = x
-mbsync_channel = d
-folder0 =
 EOF
 close $fh;
 
 my $err = load_config($path);
-is($err, '', 'mixed file still loads') or diag($err);
-is_deeply([account_names()], [qw(cmd good)], 'bad sections are skipped');
+is($err, '', 'valid file loads') or diag($err);
+is_deeply([account_names()], [qw(cmd good)], 'both accounts load');
 
 my $good = loaded_account('good');
-is($good->{password}, 'secret', 'password kept');
-ok(!defined $good->{password_cmd}, 'password account has no command');
+is($good->{pass}, 'secret', 'pass kept');
+ok(!defined $good->{pass_cmd}, 'pass account has no command');
 is($good->{folders}[0]{name}, 'INBOX', 'folder0 name');
 is($good->{folders}[0]{debounce}, 8, 'folder0 debounce');
 is($good->{folders}[1]{name}, 'Archive', 'folder1 name');
@@ -78,15 +60,65 @@ is($good->{folders}[1]{priority}, 5, 'folder1 default priority');
 is($good->{folders}[1]{debounce}, 420, 'folder1 debounce');
 
 my $cmd = loaded_account('cmd');
-is($cmd->{password_cmd}, "printf '%s\\n' tok", 'password_cmd kept');
-ok(!defined $cmd->{password}, 'command account has no stored password');
-is($cmd->{folders}[0]{debounce}, 3600, 'legacy priority 9');
+is($cmd->{pass_cmd}, "printf '%s\\n' tok", 'pass_cmd kept');
+ok(!defined $cmd->{pass}, 'command account has no stored password');
+is($cmd->{folders}[0]{debounce}, 3600, 'priority 9');
 
-my $tok = capture_password_cmd($cmd->{password_cmd});
-is($tok, 'tok', 'password_cmd stdout is the password');
-ok(!defined capture_password_cmd('exit 1'), 'failing command yields no password');
-ok(!defined capture_password_cmd('true'), 'empty stdout yields no password');
-ok(!defined capture_password_cmd('sleep 3', 1), 'hung command yields no password');
-
+my $tok = capture_pass_cmd($cmd->{pass_cmd});
+is($tok, 'tok', 'pass_cmd stdout is the password');
+ok(!defined capture_pass_cmd('exit 1'), 'failing command yields no password');
+ok(!defined capture_pass_cmd('true'), 'empty stdout yields no password');
+ok(!defined capture_pass_cmd('sleep 3', 1), 'hung command yields no password');
 unlink $path;
+
+sub write_conf {
+    my ($body) = @_;
+    my ($out, $file) = tempfile('imapidle-XXXX', SUFFIX => '.conf', TMPDIR => 1);
+    print $out $body;
+    close $out;
+    return $file;
+}
+
+my $old = write_conf(<<'EOF');
+[old]
+server = imap.example.com
+user = a@example.com
+password = secret
+mbsync_channel = personal
+EOF
+$err = load_config($old);
+like($err, qr/\[old\] missing pass or pass_cmd/, 'password is not accepted');
+is_deeply([account_names()], [], 'failed file loads no accounts');
+unlink $old;
+
+my $bad = write_conf(<<'EOF');
+[good]
+server = imap.example.com
+user = a@example.com
+pass = secret
+mbsync_channel = personal
+
+[broken]
+server = imap.example.com
+user = b@example.com
+pass = x
+pass_cmd = true
+mbsync_channel = no
+
+[short]
+server = imap.example.com
+EOF
+$err = load_config($bad);
+like($err, qr/\[broken\] set only one of pass or pass_cmd/, 'both forms are an error');
+like($err, qr/\[short\] missing user, mbsync_channel/, 'missing keys are named');
+like($err, qr/\[short\] missing pass or pass_cmd/, 'missing secret is named');
+is_deeply([account_names()], [], 'one bad account rejects the file');
+
+my $run = `perl imapidle -c $bad 2>&1`;
+my $rc = $? >> 8;
+is($rc, 1, 'missing required keys exit 1') or diag($run);
+like($run, qr/^imapidle: \[broken\]/m, 'stderr names the bad account');
+unlike($run, qr/entering main loop/, 'daemon does not start');
+unlink $bad;
+
 done_testing;

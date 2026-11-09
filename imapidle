@@ -181,38 +181,35 @@ sub load_config {
     my $cfg = Config::Tiny->read($file)
       or return "Cannot read $file: " . (Config::Tiny->errstr // $!);
 
+    my @problems;
     for my $section (sort keys %{$cfg}) {
         next if $section eq '_';
         my $row = $cfg->{$section};
         next unless ref $row eq 'HASH';
 
-        my $err = sub {
-            log_error("[$section] $_[0] — skipping this account");
+        my $bad = sub {
+            push @problems, "[$section] $_[0]";
         };
 
-        unless (defined $row->{server} && $row->{server} ne ''
-            && defined $row->{user} && $row->{user} ne ''
-            && defined $row->{mbsync_channel} && $row->{mbsync_channel} ne '')
-        {
-            $err->('missing server, user, or mbsync_channel');
-            next;
+        my @missing;
+        push @missing, 'server'         unless defined $row->{server} && $row->{server} ne '';
+        push @missing, 'user'           unless defined $row->{user} && $row->{user} ne '';
+        push @missing, 'mbsync_channel' unless defined $row->{mbsync_channel} && $row->{mbsync_channel} ne '';
+        if (@missing) {
+            $bad->('missing ' . join(', ', @missing));
         }
 
-        my $has_pw  = defined $row->{password}     && $row->{password} ne '';
-        my $has_cmd = defined $row->{password_cmd} && $row->{password_cmd} ne '';
+        my $has_pw  = defined $row->{pass}     && $row->{pass} ne '';
+        my $has_cmd = defined $row->{pass_cmd} && $row->{pass_cmd} ne '';
         if ($has_pw && $has_cmd) {
-            $err->('set only one of password or password_cmd');
-            next;
-        }
-        if (!$has_pw && !$has_cmd) {
-            $err->('missing password or password_cmd');
-            next;
+            $bad->('set only one of pass or pass_cmd');
+        } elsif (!$has_pw && !$has_cmd) {
+            $bad->('missing pass or pass_cmd');
         }
 
         my $port = $row->{port} // 993;
         if ($port !~ /^\d+$/ || $port < 1 || $port > 65535) {
-            $err->('bad port');
-            next;
+            $bad->('bad port');
         }
 
         my @folders;
@@ -221,21 +218,23 @@ sub load_config {
         while (exists $row->{"folder$i"}) {
             my $folder = parse_folder_spec($row->{"folder$i"});
             unless ($folder) {
-                $err->("empty folder$i");
+                $bad->("empty folder$i");
                 $bad_folder = 1;
                 last;
             }
             push @folders, $folder;
             $i++;
         }
-        next if $bad_folder;
+        if ($bad_folder) {
+            next;
+        }
 
-        if (!@folders) {
+        if (!@folders && !@missing) {
             my $spec = $row->{folder};
             $spec = 'INBOX' unless defined $spec && $spec ne '';
             my $folder = parse_folder_spec($spec);
             unless ($folder) {
-                $err->('bad folder');
+                $bad->('bad folder');
                 next;
             }
             my $priority = $row->{priority} // $folder->{priority};
@@ -248,30 +247,36 @@ sub load_config {
         my $wait = $row->{wait} // 0;
         $wait = 0 unless $wait =~ /^\d+$/;
 
+        next if grep { index($_, "[$section]") == 0 } @problems;
+
         $accounts{$section} = {
             server         => $row->{server},
             port           => $port + 0,
             user           => $row->{user},
-            password       => $has_pw ? $row->{password} : undef,
-            password_cmd   => $has_cmd ? $row->{password_cmd} : undef,
+            pass           => $has_pw ? $row->{pass} : undef,
+            pass_cmd       => $has_cmd ? $row->{pass_cmd} : undef,
             mbsync_channel => $row->{mbsync_channel},
             folders        => \@folders,
             wait           => $wait + 0,
             backoff        => 5,
             next_try       => 0,
         };
-        my $how = $has_cmd ? 'password_cmd' : 'password';
+        my $how = $has_cmd ? 'pass_cmd' : 'pass';
         log_info("[$section] $how, mbsync $row->{mbsync_channel}, "
               . scalar(@folders) . ' folder(s)');
     }
 
+    if (@problems) {
+        %accounts = ();
+        return join("\n", @problems);
+    }
     return 'no usable accounts in ' . $file unless %accounts;
     return '';
 }
 
 # First line of stdout from sh -c. Empty, timeout, and non-zero exit are undef.
 # The command text and its output are not logged.
-sub capture_password_cmd {
+sub capture_pass_cmd {
     my ($cmd, $timeout) = @_;
     $timeout //= 30;
     return unless defined $cmd && $cmd ne '';
@@ -353,15 +358,15 @@ sub capture_password_cmd {
     return $line;
 }
 
-sub account_password {
+sub account_pass {
     my ($name) = @_;
     my $acc = $accounts{$name} or return;
-    if (defined $acc->{password_cmd}) {
-        my $pw = capture_password_cmd($acc->{password_cmd});
-        log_error("[$name] password_cmd failed") unless defined $pw;
+    if (defined $acc->{pass_cmd}) {
+        my $pw = capture_pass_cmd($acc->{pass_cmd});
+        log_error("[$name] pass_cmd failed") unless defined $pw;
         return $pw;
     }
-    return $acc->{password};
+    return $acc->{pass};
 }
 
 sub create_imap_connection {
@@ -585,7 +590,7 @@ sub connect_account {
     my @need = grep { !$conns{"$name:$_->{name}"} } @{ $acc->{folders} };
     return 1 unless @need;
 
-    my $password = account_password($name);
+    my $password = account_pass($name);
     if (!defined $password) {
         mark_retry($name);
         return 0;
@@ -921,7 +926,7 @@ sub install_broken_conn_for_test {
         server         => 'imap.example',
         port           => 993,
         user           => 'u',
-        password       => 'x',
+        pass           => 'x',
         mbsync_channel => 'ch',
         folders        => [ { name => 'INBOX', priority => 1, debounce => 8 } ],
         wait           => 0,

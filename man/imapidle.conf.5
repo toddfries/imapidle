@@ -35,10 +35,10 @@ The section name is a label used in log lines.
 .Pp
 The directory should be mode 0700 and the file mode 0600.
 A
-.Va password
+.Va pass
 value is stored in the file.
 A
-.Va password_cmd
+.Va pass_cmd
 value is not a place to hide a secret: anyone who can read the file can
 read the command.
 .Pp
@@ -49,12 +49,28 @@ or
 are comments.
 Text after a value is not a comment.
 .Pp
-A section that is missing a required key, sets both password forms, or
-names a bad port is logged and skipped.
-Other sections are still used.
-If every section is skipped, or the file cannot be read,
+Each account requires
+.Va server ,
+.Va user ,
+.Va mbsync_channel ,
+and exactly one of
+.Va pass
+or
+.Va pass_cmd .
+A missing required key, both
+.Va pass
+and
+.Va pass_cmd ,
+a bad port, or an empty
+.Va folderN
+is written to standard error.
 .Nm imapidle
-exits 1 at startup.
+then exits 1 and does not become a daemon.
+The old names
+.Va password
+and
+.Va password_cmd
+are not accepted.
 .Sh KEYS
 .Bl -tag -width "mbsync_channel"
 .It Va server
@@ -66,13 +82,16 @@ The default is 993.
 .It Va user
 IMAP login name.
 Required.
-.It Va password
+.It Va pass
 The IMAP password, used as-is.
 Set this or
-.Va password_cmd ,
+.Va pass_cmd ,
 not both.
 The value is not written to the log.
-.It Va password_cmd
+Required unless
+.Va pass_cmd
+is set.
+.It Va pass_cmd
 A command passed to
 .Pa /bin/sh
 with
@@ -82,6 +101,9 @@ the IMAP password.
 The command must exit 0.
 Empty output, a non-zero exit, or no exit within 30 seconds fails that
 account only.
+Required unless
+.Va pass
+is set.
 The command is run again on each connection, so a helper that prints a
 fresh access token can be dropped in here.
 OAuth itself is not implemented;
@@ -131,7 +153,8 @@ The default is 5.
 Every folder in a section shares that section's
 .Va mbsync_channel ,
 .Va user ,
-and password.
+and
+.Va pass .
 .Sh DEBOUNCE
 Priority selects how long
 .Nm imapidle
@@ -163,7 +186,7 @@ A password stored in the file, with a hot inbox and a lazy archive:
 server = imap.example.com
 port = 993
 user = you@example.com
-password = secret
+pass = secret
 mbsync_channel = personal
 folder0 = INBOX;priority=1
 folder1 = Archive;priority=9
@@ -176,7 +199,7 @@ is only an example of such a command:
 [work]
 server = imap.example.com
 user = you@work.example
-password_cmd = pizauth show work
+pass_cmd = pizauth show work
 mbsync_channel = work
 folder = INBOX
 priority = 3

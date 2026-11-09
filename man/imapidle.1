@@ -144,8 +144,18 @@ creates it.
 .El
 .Sh EXIT STATUS
 .Ex -std imapidle
-Startup failures, including a missing configuration or a file with no
-usable account, exit 1 before the main loop.
+Startup failures exit 1 before the main loop.
+That includes a missing configuration, a file with no usable account,
+and any account that lacks
+.Va server ,
+.Va user ,
+.Va mbsync_channel ,
+or exactly one of
+.Va pass
+and
+.Va pass_cmd .
+The message is written to standard error.
+The process does not fork.
 After the main loop has started, the process exits 0 on
 .Dv SIGTERM
 or

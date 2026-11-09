@@ -24,20 +24,20 @@ Project facts (sourced 20261109, updated the same day)
 - Test command: make test (prove t). t/00-syntax.t, t/01-mandoc.t, t/02-config.t, t/03-isolate.t.
 - Purpose: watch IMAP folders and fork /usr/local/bin/mbsync <channel> when the server reports a change. OpenBSD isync is one-shot.
 - History came from ~/bin (11 commits, 2026-04-07 through 2026-06-07). Hashes here differ because those commits used to sit inside the bin repo.
-- Config: Config::Tiny (p5-Config-Tiny 2.14). Not Config::IniFiles. One bad section is skipped. A missing file or zero usable accounts exits 1 before the loop.
-- Password: exactly one of password or password_cmd. password_cmd is /bin/sh -c, first stdout line, exit 0, 30s budget, rerun on each connect. Output is not logged. OAuth is not implemented; the command prints the secret.
+- Config: Config::Tiny (p5-Config-Tiny 2.14). Not Config::IniFiles. Any account missing server, user, mbsync_channel, or exactly one of pass or pass_cmd exits 1 before the loop. The reason is printed to stderr. No accounts from that file are kept.
+- Secret: exactly one of pass or pass_cmd. The names password and password_cmd are not read. pass_cmd is /bin/sh -c, first stdout line, exit 0, 30s budget, rerun on each connect. Output is not logged. OAuth is not implemented; the command prints the secret. A missing required key exits 1 before the daemon starts and loads no accounts.
 - known_hosts sits next to the config file. SHA256 fingerprint, accept on a tty, refuse otherwise. New files use mode 0600. Directory created mode 0700.
 - TLS: IO::Socket::SSL with SSL_VERIFY_NONE, then that TOFU check. IO::Socket::SSL 2.099 is installed.
 - IMAP: Mail::IMAPClient 3.43. idle, idle_data, and done exist. NOTIFY is sent on the socket that stays in the select set. Otherwise one IDLE connection per folder.
 - mbsync: /usr/local/bin/mbsync. isync-1.5.1p0 is installed. wait seconds happen in the child. No concurrency cap. Child closes inherited descriptors.
 - Syslog: ident imapidle, options cons,pid, facility mail.
-- A failed account, socket, password command, or mbsync does not exit the process. The loop exits only on SIGTERM or SIGINT (exit 0). Backoff is remembered on the account (5s, x1.5, cap 900) and does not sleep the other accounts.
+- After startup, a failed account, socket, pass_cmd, or mbsync does not exit the process. The loop exits only on SIGTERM or SIGINT (exit 0). Backoff is remembered on the account (5s, x1.5, cap 900) and does not sleep the other accounts.
 - IDLE is refreshed about every 30s with DONE then IDLE. NOOP is not sent during IDLE. NOTIFY connections get NOOP on that timer.
 - Debounce from priority: <=2 → 8s; >=9 → 3600s; else 180+(priority-3)*120. Priority 3 is 180, 5 is 420, 8 is 780. The first event starts mbsync. Later events on that connection are ignored until the interval has passed.
 - wait (seconds, default 0) sleeps in the mbsync child, not in the IMAP loop.
 
 Config shape the script reads
-- One INI section per account. Required: server, user, mbsync_channel, and exactly one of password or password_cmd. port defaults to 993.
+- One INI section per account. Required: server, user, mbsync_channel, and exactly one of pass or pass_cmd. port defaults to 993. Missing required keys exit 1.
 - folder0, folder1, ... value is NAME or NAME;priority=N. Numbers start at 0 and have no gaps. Only the priority suffix is read. Missing suffix → priority 5.
 - If no folderN keys: folder (default INBOX) and priority (default 5).
 - Every folder in a section shares that section's mbsync_channel.
