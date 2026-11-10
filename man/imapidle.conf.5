@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 9 2026 $
+.Dd $Mdocdate: November 10 2026 $
 .Dt IMAPIDLE.CONF 5
 .Os
 .Sh NAME
@@ -161,9 +161,10 @@ Priority is the minimum time between
 runs for that folder:
 .Bl -column "priority" "seconds" -offset indent
 .It Sy priority Ta Sy seconds
-.It 2 or less Ta 8
-.It 3 Ta 180
-.It 4 Ta 300
+.It 1 or less Ta 7
+.It 2 Ta 42
+.It 3 Ta 128
+.It 4 Ta 256
 .It 5 Ta 420
 .It 6 Ta 540
 .It 7 Ta 660

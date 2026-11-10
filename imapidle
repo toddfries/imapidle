@@ -165,7 +165,10 @@ sub approve_fingerprint {
 
 sub calculate_debounce {
     my $p = shift;
-    return 8    if $p <= 2;
+    return 7    if $p <= 1;
+    return 42   if $p == 2;
+    return 128  if $p == 3;
+    return 256  if $p == 4;
     return 3600 if $p >= 9;
     return 180 + ($p - 3) * 120;
 }

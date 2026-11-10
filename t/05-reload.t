@@ -57,11 +57,11 @@ is(reload_config_now($more), '', 'reload accepts another folder');
 my $acct = loaded_account('acct');
 is($acct->{folders}[0]{name}, 'INBOX', 'INBOX stays first');
 is($acct->{folders}[0]{priority}, 3, 'INBOX priority changed');
-is($acct->{folders}[0]{debounce}, 180, 'INBOX gap follows the new priority');
+is($acct->{folders}[0]{debounce}, 128, 'INBOX gap follows the new priority');
 is($acct->{folders}[1]{name}, 'Archive', 'Archive was added');
 is($acct->{folders}[1]{debounce}, 3600, 'Archive keeps its own gap');
 ok(conn_exists_for_test('acct:INBOX'), 'the open IDLE connection stays');
-is(conn_debounce_for_test('acct:INBOX'), 180, 'the open connection uses the new gap');
+is(conn_debounce_for_test('acct:INBOX'), 128, 'the open connection uses the new gap');
 is(account_next_try('acct'), 0, 'a new IDLE folder is due to connect');
 
 my $bad = write_conf(<<'EOF');

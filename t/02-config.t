@@ -19,10 +19,13 @@ use Test::More;
 
 require './imapidle';
 
-is(calculate_debounce(1), 8,    'priority 1 is 8s');
-is(calculate_debounce(2), 8,    'priority 2 is 8s');
-is(calculate_debounce(3), 180,  'priority 3 is 180s');
+is(calculate_debounce(0), 7,    'priority 0 uses the priority 1 gap');
+is(calculate_debounce(1), 7,    'priority 1 is 7s');
+is(calculate_debounce(2), 42,   'priority 2 is 42s');
+is(calculate_debounce(3), 128,  'priority 3 is 128s');
+is(calculate_debounce(4), 256,  'priority 4 is 256s');
 is(calculate_debounce(5), 420,  'priority 5 is 420s');
+is(calculate_debounce(6), 540,  'priority 6 is 540s');
 is(calculate_debounce(8), 780,  'priority 8 is 780s');
 is(calculate_debounce(9), 3600, 'priority 9 is 3600s');
 
@@ -54,7 +57,7 @@ my $good = loaded_account('good');
 is($good->{pass}, 'secret', 'pass kept');
 ok(!defined $good->{pass_cmd}, 'pass account has no command');
 is($good->{folders}[0]{name}, 'INBOX', 'folder0 name');
-is($good->{folders}[0]{debounce}, 8, 'folder0 debounce');
+is($good->{folders}[0]{debounce}, 7, 'folder0 debounce');
 is($good->{folders}[1]{name}, 'Archive', 'folder1 name');
 is($good->{folders}[1]{priority}, 5, 'folder1 default priority');
 is($good->{folders}[1]{debounce}, 420, 'folder1 debounce');
