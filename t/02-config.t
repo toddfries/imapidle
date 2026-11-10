@@ -124,4 +124,47 @@ like($run, qr/^imapidle: \[broken\]/m, 'stderr names the bad account');
 unlike($run, qr/entering main loop/, 'daemon does not start');
 unlink $bad;
 
+my $held = write_conf(<<'EOF');
+[live]
+server = imap.example.com
+user = a@example.com
+pass = secret
+mbsync_channel = personal
+folder = INBOX
+
+[park]
+disabled = yes
+
+[off]
+disabled = Yes
+server = imap.example.com
+user = b@example.com
+pass = secret
+mbsync_channel = other
+EOF
+is(load_config($held), '', 'a disabled section does not have to be complete');
+is_deeply([account_names()], [qw(live off park)], 'disabled sections stay loaded');
+ok(!loaded_account('live')->{disabled}, 'a section without the flag stays active');
+ok(loaded_account('park')->{config_disabled}, 'yes holds the section');
+ok(loaded_account('off')->{config_disabled}, 'Yes holds the section');
+is(connect_account('park'), 0, 'a held section is not connected');
+is(connect_account('off'), 0, 'a held section with keys is not connected');
+my @held_lines = grep { /\] disabled/ } info_lines(time());
+is_deeply(
+    \@held_lines,
+    [
+        '[off] disabled server imap.example.com channel other',
+        '[park] disabled',
+    ],
+    'state names a config-disabled section',
+);
+unlink $held;
+
+my $no = write_conf(<<'EOF');
+[nope]
+disabled = no
+EOF
+like(load_config($no), qr/\[nope\] missing server, user, mbsync_channel/, 'no does not skip required keys');
+unlink $no;
+
 done_testing;

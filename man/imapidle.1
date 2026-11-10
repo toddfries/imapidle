@@ -45,6 +45,13 @@ disable it.
 The log records that once, and the account is not tried again.
 .Dv SIGHUP
 enables it on the next wake.
+A section that sets
+.Va disabled
+to
+.Cm yes
+is not connected.
+It stays disabled until that value is removed and the file is
+reloaded.
 An account that has monitored a mailbox keeps retrying after a later
 failure, with the wait growing by half each time up to 900 seconds.
 It does not stop the other accounts, and it does not exit the process.

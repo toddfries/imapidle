@@ -66,6 +66,13 @@ a bad port, or an empty
 is written to standard error.
 .Nm imapidle
 then exits 1 and does not become a daemon.
+A section with
+.Va disabled
+set to
+.Cm yes
+is kept and is not connected.
+Required keys are not checked for that section.
+Any other value leaves the section active.
 The old names
 .Va password
 and
@@ -73,6 +80,11 @@ and
 are not accepted.
 .Sh KEYS
 .Bl -tag -width "mbsync_channel"
+.It Va disabled
+Set to
+.Cm yes
+to keep the section without connecting to it.
+The comparison ignores case.
 .It Va server
 IMAP host name.
 Required.

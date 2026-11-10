@@ -197,6 +197,11 @@ sub parse_config_file {
             push @problems, "[$section] $_[0]";
         };
 
+        if (_config_disabled($row->{disabled})) {
+            $fresh{$section} = _held_account($row);
+            next;
+        }
+
         my @missing;
         push @missing, 'server'         unless defined $row->{server} && $row->{server} ne '';
         push @missing, 'user'           unless defined $row->{user} && $row->{user} ne '';
@@ -279,6 +284,35 @@ sub parse_config_file {
     return (\%fresh, '');
 }
 
+sub _config_disabled {
+    my ($val) = @_;
+    return defined $val && $val =~ /^yes$/i;
+}
+
+sub _held_account {
+    my ($row) = @_;
+    my $port = $row->{port} // 993;
+    $port = 993 unless $port =~ /^\d+$/ && $port >= 1 && $port <= 65535;
+    my $has_pw  = defined $row->{pass}     && $row->{pass} ne '';
+    my $has_cmd = defined $row->{pass_cmd} && $row->{pass_cmd} ne '';
+    return {
+        server          => $row->{server} // '',
+        port            => $port + 0,
+        user            => $row->{user} // '',
+        pass            => $has_pw ? $row->{pass} : undef,
+        pass_cmd        => $has_cmd ? $row->{pass_cmd} : undef,
+        mbsync_channel  => $row->{mbsync_channel} // '',
+        folders         => [],
+        wait            => 0,
+        backoff         => 5,
+        next_try        => 0,
+        fails           => 0,
+        up              => 0,
+        disabled        => 1,
+        config_disabled => 1,
+    };
+}
+
 # Returns an error string, or the empty string and fills %accounts.
 sub load_config {
     my ($file) = @_;
@@ -293,6 +327,10 @@ sub load_config {
 sub _log_loaded_account {
     my ($section) = @_;
     my $acc = $accounts{$section} or return;
+    if ($acc->{config_disabled}) {
+        log_info("[$section] disabled");
+        return;
+    }
     my $how = defined $acc->{pass_cmd} && $acc->{pass_cmd} ne '' ? 'pass_cmd' : 'pass';
     log_info("[$section] $how, mbsync $acc->{mbsync_channel}, "
           . scalar(@{ $acc->{folders} }) . ' folder(s)');
@@ -614,6 +652,7 @@ sub connect_idle_folders {
 sub connect_account {
     my ($name) = @_;
     my $acc = $accounts{$name} or return 0;
+    return 0 if $acc->{disabled};
     return 1 if account_covered($name);
 
     my @need = grep { !$conns{"$name:$_->{name}"} } @{ $acc->{folders} };
@@ -1129,7 +1168,21 @@ sub reload_config_now {
         my $old = $accounts{$name};
         if (!$old) {
             $accounts{$name} = $new;
-            log_info("[$name] added");
+            log_info($new->{config_disabled} ? "[$name] disabled" : "[$name] added");
+            next;
+        }
+        if ($new->{config_disabled}) {
+            unless ($old->{config_disabled}) {
+                _drop_account_conns($name, 'disabled');
+                _forget_account_schedule($old);
+                log_info("[$name] disabled");
+            }
+            $accounts{$name} = $new;
+            next;
+        }
+        if ($old->{config_disabled}) {
+            $accounts{$name} = $new;
+            log_info("[$name] enabled");
             next;
         }
         if (_session_key($old) ne _session_key($new)) {
@@ -1218,6 +1271,14 @@ sub info_lines {
     );
     for my $name (sort keys %accounts) {
         my $acc = $accounts{$name};
+        if ($acc->{config_disabled}) {
+            my $line = "[$name] disabled";
+            $line .= " server $acc->{server}" if ($acc->{server} // '') ne '';
+            $line .= " channel $acc->{mbsync_channel}"
+                if ($acc->{mbsync_channel} // '') ne '';
+            push @lines, $line;
+            next;
+        }
         my @modes;
         push @modes, 'NOTIFY' if $conns{"$name:NOTIFY"};
         for my $folder (@{ $acc->{folders} }) {
