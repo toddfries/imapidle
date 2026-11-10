@@ -1,8 +1,7 @@
 # future-todo
 
-Parked from imap-idle-notify-session-extraction.md. Todd asked for a password command and for one failure to stay inside that account. Those two are in imapidle, as pass_cmd and per-account retry. A missing required config key exits 1 before the daemon starts. The rest stays parked until he asks. A live monitor and test wait until he has a config.
+Parked from imap-idle-notify-session-extraction.md. Todd asked for a password command and for one failure to stay inside that account. Those two are in imapidle, as pass_cmd and per-account retry. A missing required config key exits 1 before the daemon starts. SIGHUP re-reads the config. The rest stays parked until he asks.
 
-- SIGHUP config reload. Why: a config change still needs a restart. TERM and INT already shut down. Saving: leave the signal map alone until a real config is in use.
 - Pidfile and an OpenBSD rc.d script. Why: no pidfile yet. Saving: skip rc integration until the foreground run looks right.
 - Max concurrent mbsync processes. Why: forks are unlimited. Saving: a semaphore is unused until more than one account is syncing.
 - After-sync hook (for example notmuch new). Why: the child only execs mbsync. Saving: one less process to supervise.

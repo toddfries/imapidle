@@ -174,14 +174,13 @@ sub parse_folder_spec {
     };
 }
 
-# Returns an error string, or the empty string and fills %accounts.
-sub load_config {
+# Returns (hashref, '') or (undef, error). Does not touch %accounts.
+sub parse_config_file {
     my ($file) = @_;
-    %accounts = ();
     my $cfg = Config::Tiny->read($file)
-      or return "Cannot read $file: " . (Config::Tiny->errstr // $!);
+      or return (undef, "Cannot read $file: " . (Config::Tiny->errstr // $!));
 
-    my @problems;
+    my (%fresh, @problems);
     for my $section (sort keys %{$cfg}) {
         next if $section eq '_';
         my $row = $cfg->{$section};
@@ -249,7 +248,7 @@ sub load_config {
 
         next if grep { index($_, "[$section]") == 0 } @problems;
 
-        $accounts{$section} = {
+        $fresh{$section} = {
             server         => $row->{server},
             port           => $port + 0,
             user           => $row->{user},
@@ -261,17 +260,32 @@ sub load_config {
             backoff        => 5,
             next_try       => 0,
         };
-        my $how = $has_cmd ? 'pass_cmd' : 'pass';
-        log_info("[$section] $how, mbsync $row->{mbsync_channel}, "
-              . scalar(@folders) . ' folder(s)');
     }
 
     if (@problems) {
-        %accounts = ();
-        return join("\n", @problems);
+        return (undef, join("\n", @problems));
     }
-    return 'no usable accounts in ' . $file unless %accounts;
+    return (undef, 'no usable accounts in ' . $file) unless %fresh;
+    return (\%fresh, '');
+}
+
+# Returns an error string, or the empty string and fills %accounts.
+sub load_config {
+    my ($file) = @_;
+    my ($fresh, $err) = parse_config_file($file);
+    %accounts = ();
+    return $err if $err || !$fresh;
+    %accounts = %$fresh;
+    _log_loaded_account($_) for sort keys %accounts;
     return '';
+}
+
+sub _log_loaded_account {
+    my ($section) = @_;
+    my $acc = $accounts{$section} or return;
+    my $how = defined $acc->{pass_cmd} && $acc->{pass_cmd} ne '' ? 'pass_cmd' : 'pass';
+    log_info("[$section] $how, mbsync $acc->{mbsync_channel}, "
+          . scalar(@{ $acc->{folders} }) . ' folder(s)');
 }
 
 # First line of stdout from sh -c. Empty, timeout, and non-zero exit are undef.
@@ -295,6 +309,7 @@ sub capture_pass_cmd {
         open STDOUT, '>&', $wr or _exit(127);
         open STDERR, '>', '/dev/null';
         close $wr;
+        $SIG{HUP} = 'DEFAULT';
         exec '/bin/sh', '-c', $cmd
             or _exit(127);
     }
@@ -539,7 +554,7 @@ sub drop_socket {
 }
 
 sub drop_conn {
-    my ($key, $why) = @_;
+    my ($key, $why, $no_retry) = @_;
     return unless defined $key && exists $conns{$key};
     my $conn = delete $conns{$key};
     drop_socket($conn->{socket});
@@ -552,7 +567,7 @@ sub drop_conn {
         }
     };
     close_session($conn->{imap}, $conn->{socket});
-    mark_retry($name);
+    mark_retry($name) unless $no_retry;
 }
 
 sub connect_idle_folders {
@@ -672,6 +687,20 @@ sub reset_schedule_for_test {
     %box_pending  = ();
     %box_wait     = ();
     %batch        = ();
+}
+
+sub forget_folder_schedule {
+    my ($channel, $folder) = @_;
+    return unless defined $channel && defined $folder;
+    my $id = _box_id($channel, $folder);
+    delete $box_gap{$id};
+    delete $box_last_run{$id};
+    delete $box_pending{$id};
+    delete $box_wait{$id};
+    return unless exists $batch{$channel};
+    my $boxes = $batch{$channel}{boxes};
+    delete $boxes->{$folder} if ref $boxes eq 'HASH';
+    delete $batch{$channel} if !$boxes || !keys %$boxes;
 }
 
 sub _in_batch {
@@ -798,6 +827,7 @@ sub trigger_mbsync {
     }
     if ($pid == 0) {
         $SIG{PIPE} = 'IGNORE';
+        $SIG{HUP}  = 'DEFAULT';
         $SIG{TERM} = 'DEFAULT';
         $SIG{INT}  = 'DEFAULT';
         close_extra_fds();
@@ -981,10 +1011,136 @@ sub loop_timeout {
     return $wait;
 }
 
+my $RELOAD_REQUESTED = 0;
+
+sub request_reload { $RELOAD_REQUESTED = 1 }
+
+sub _session_key {
+    my ($acc) = @_;
+    return join("\0",
+        $acc->{server}         // '',
+        $acc->{port}           // '',
+        $acc->{user}           // '',
+        $acc->{pass}           // '',
+        $acc->{pass_cmd}       // '',
+        $acc->{mbsync_channel} // '',
+    );
+}
+
+sub _folder_key {
+    my ($acc) = @_;
+    return join("\n", map { $_->{name} . "\t" . $_->{priority} } @{ $acc->{folders} });
+}
+
+sub _drop_account_conns {
+    my ($name, $why) = @_;
+    for my $key (grep { index($_, "$name:") == 0 } keys %conns) {
+        drop_conn($key, $why, 1);
+    }
+}
+
+sub _forget_account_schedule {
+    my ($acc) = @_;
+    return unless $acc;
+    forget_folder_schedule($acc->{mbsync_channel}, $_->{name}) for @{ $acc->{folders} };
+}
+
+sub _retarget_conns {
+    my ($name, $old, $new) = @_;
+    my %newf = map { $_->{name} => $_ } @{ $new->{folders} };
+    my $notify = $conns{"$name:NOTIFY"};
+    if ($notify) {
+        $notify->{folders} = $new->{folders};
+        $notify->{wait}    = $new->{wait};
+        $notify->{channel} = $new->{mbsync_channel};
+    }
+    for my $oldf (@{ $old->{folders} }) {
+        my $fname = $oldf->{name};
+        my $key   = "$name:$fname";
+        unless ($newf{$fname}) {
+            drop_conn($key, 'folder removed', 1) if exists $conns{$key};
+            forget_folder_schedule($old->{mbsync_channel}, $fname);
+            next;
+        }
+        my $conn = $conns{$key} or next;
+        $conn->{debounce} = $newf{$fname}{debounce};
+        $conn->{wait}     = $new->{wait};
+        $conn->{channel}  = $new->{mbsync_channel};
+        my $id = _box_id($new->{mbsync_channel}, $fname);
+        $box_gap{$id}  = $newf{$fname}{debounce} if exists $box_gap{$id};
+        $box_wait{$id} = $new->{wait}            if exists $box_wait{$id};
+    }
+}
+
+# Re-read the config. A bad file leaves the running accounts in place.
+# Returns '' on success, or the error string.
+sub reload_config_now {
+    my ($file) = @_;
+    $file //= $CONFIG_FILE;
+    if (!defined $file || $file eq '') {
+        log_error('reload kept the previous config: no config file');
+        return 'no config file';
+    }
+    my ($fresh, $err) = parse_config_file($file);
+    if ($err || !$fresh) {
+        $err //= 'empty config';
+        log_error("reload kept the previous config: $err");
+        return $err;
+    }
+
+    for my $name (sort keys %accounts) {
+        next if $fresh->{$name};
+        my $old = $accounts{$name};
+        _drop_account_conns($name, 'account removed');
+        _forget_account_schedule($old);
+        delete $accounts{$name};
+        log_info("[$name] removed");
+    }
+
+    for my $name (sort keys %$fresh) {
+        my $new = $fresh->{$name};
+        my $old = $accounts{$name};
+        if (!$old) {
+            $accounts{$name} = $new;
+            log_info("[$name] added");
+            next;
+        }
+        if (_session_key($old) ne _session_key($new)) {
+            _drop_account_conns($name, 'config changed');
+            _forget_account_schedule($old);
+            $accounts{$name} = $new;
+            log_info("[$name] reconnecting");
+            next;
+        }
+        $new->{backoff}  = $old->{backoff}  // 5;
+        $new->{next_try} = $old->{next_try} // 0;
+        my $folders_changed = _folder_key($old) ne _folder_key($new);
+        $accounts{$name} = $new;
+        _retarget_conns($name, $old, $new);
+        if ($folders_changed) {
+            my %had = map { $_->{name} => 1 } @{ $old->{folders} };
+            my $added = grep { !$had{ $_->{name} } } @{ $new->{folders} };
+            $new->{next_try} = 0 if $added && !$conns{"$name:NOTIFY"};
+            log_info("[$name] folders updated");
+        }
+    }
+    log_info('config reloaded');
+    return '';
+}
+
+sub apply_reload {
+    return unless $RELOAD_REQUESTED;
+    $RELOAD_REQUESTED = 0;
+    reload_config_now();
+}
+
 sub one_iteration {
     reap_children();
+    apply_reload();
     pump_schedule();
     my @ready = $select->can_read(loop_timeout());
+    # A HUP that arrived during select is delivered before this call.
+    apply_reload();
     # Drain ready sockets before housekeeping sends DONE or NOOP.
     for my $sock (@ready) {
         eval { handle_ready($sock) };
@@ -1074,6 +1230,7 @@ sub run {
     openlog('imapidle', 'cons,pid', 'mail');
     $LOG_OPEN = 1;
     $SIG{PIPE} = 'IGNORE';
+    $SIG{HUP}  = \&request_reload;
     $SIG{TERM} = \&graceful_shutdown;
     $SIG{INT}  = \&graceful_shutdown;
 
@@ -1136,6 +1293,45 @@ sub install_broken_conn_for_test {
     $sock_to_key{$sock} = $key;
     $select->add($sock);
     return $key;
+}
+
+sub clear_conns_for_test { %conns = (); %sock_to_key = (); }
+
+sub plant_idle_for_test {
+    my ($name, $folder, $debounce, $channel) = @_;
+    my $key = "$name:$folder";
+    $conns{$key} = {
+        key      => $key,
+        name     => $name,
+        folder   => $folder,
+        mode     => 'IDLE',
+        debounce => $debounce,
+        channel  => $channel,
+        wait     => 0,
+    };
+    return $key;
+}
+
+sub plant_notify_for_test {
+    my ($name) = @_;
+    my $acc = $accounts{$name} or return;
+    my $key = "$name:NOTIFY";
+    $conns{$key} = {
+        key     => $key,
+        name    => $name,
+        mode    => 'NOTIFY',
+        channel => $acc->{mbsync_channel},
+        wait    => $acc->{wait},
+        folders => $acc->{folders},
+    };
+    return $key;
+}
+
+sub conn_exists_for_test       { exists $conns{ $_[0] } }
+sub conn_debounce_for_test     { return unless $conns{ $_[0] }; $conns{ $_[0] }{debounce} }
+sub notify_folder_count_for_test {
+    my $conn = $conns{"$_[0]:NOTIFY"} or return 0;
+    return scalar @{ $conn->{folders} // [] };
 }
 
 run(@ARGV) unless caller;

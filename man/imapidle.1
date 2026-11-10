@@ -43,6 +43,17 @@ The process leaves the main loop only on
 .Dv SIGTERM
 or
 .Dv SIGINT .
+.Dv SIGHUP
+re-reads the configuration file on the next wake of the loop,
+within about 30 seconds, and does not exit.
+A file that would be rejected at startup is logged and the
+running accounts stay as they are.
+An account whose server, port, user, secret, or channel changed
+is disconnected and connected again.
+Folder names and priorities apply to the connection already open.
+A folder that is new, and not already covered by
+.Cm NOTIFY ,
+is connected on that wake.
 .Pp
 The options are as follows:
 .Bl -tag -width Ds
@@ -189,8 +200,9 @@ The process does not fork.
 After the main loop has started, the process exits 0 on
 .Dv SIGTERM
 or
-.Dv SIGINT
-and otherwise keeps running.
+.Dv SIGINT .
+.Dv SIGHUP
+reloads the configuration and does not exit.
 .Sh EXAMPLES
 Accept certificates and watch the log on the terminal:
 .Bd -literal -offset indent
