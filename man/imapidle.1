@@ -142,6 +142,10 @@ runs for one folder.
 A folder that has never been included in a run, or whose minimum time
 since that run has already passed, is ready: the next event starts the
 5 second channel wait described above.
+A server keepalive such as
+.Ql * OK Still here ,
+a continuation, or a tagged reply is logged and does not schedule a run.
+.Pp
 An event that arrives before the minimum time has passed is kept.
 When that time expires, the folder is scheduled on the next wake.
 That scheduling does not add another 5 seconds, unless the channel

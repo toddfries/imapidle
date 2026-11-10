@@ -98,4 +98,11 @@ is_deeply(
     'NOTIFY without a mailbox schedules every configured folder',
 );
 
+ok(mail_event_line('* 1 EXISTS'), 'EXISTS is mail');
+ok(mail_event_line('* 12 FETCH (FLAGS (\Seen))'), 'FETCH is mail');
+ok(mail_event_line('* STATUS INBOX (MESSAGES 2)'), 'STATUS is mail');
+ok(!mail_event_line('* OK Still here'), 'IDLE keepalive is not mail');
+ok(!mail_event_line('+ idling'), 'IDLE continuation is not mail');
+ok(!mail_event_line('a001 OK IDLE completed'), 'tagged reply is not mail');
+
 done_testing;

@@ -434,9 +434,10 @@ sub setup_notification {
 
     my $cmd = 'NOTIFY SET (personal (MessageNew MessageExpunge MessageFlags))';
     log_info("[$name] NOTIFY $cmd");
-    my @resp = $imap->tag_and_run($cmd);
+    # tag_and_run returns a single undef on failure, which is not a response line.
+    my @resp = grep { defined && $_ ne '' } $imap->tag_and_run($cmd);
     my $last = $resp[-1] // '';
-    my $res  = @resp ? join(' | ', @resp) : '';
+    my $res  = @resp ? join(' | ', @resp) : ($imap->LastError // 'empty');
     log_info("[$name] NOTIFY response [$res]");
     if ($last =~ /OK/i) {
         my $n = $folder_list ? scalar(@$folder_list) : 0;
@@ -480,6 +481,7 @@ sub arm_idle {
         channel      => $acc->{mbsync_channel},
         wait         => $acc->{wait},
         last_success => time(),
+        last_idle    => time(),
     });
     log_info("[$name] IDLE $folder->{name} (priority $folder->{priority})");
 }
@@ -629,6 +631,7 @@ sub restart_idle {
         log_warn("[$conn->{name}] idle re-arm failed: " . scrub($@));
         return 0;
     }
+    $conn->{last_idle} = time();
     log_info("[$conn->{name}] IDLE re-armed");
     return 1;
 }
@@ -817,6 +820,19 @@ sub pump_schedule {
     }
 }
 
+# Server keepalive and command replies are not mail. EXISTS, EXPUNGE,
+# FETCH, RECENT, VANISHED, and STATUS are.
+sub mail_event_line {
+    my ($line) = @_;
+    return 0 unless defined $line && $line ne '';
+    return 0 if $line =~ /^\*\s+(OK|NO|BAD|BYE)\b/i;
+    return 0 if $line =~ /^\+/;
+    return 0 if $line =~ /^[A-Za-z][A-Za-z0-9]*\s+(OK|NO|BAD|BYE)\b/;
+    return 1 if $line =~ /^\*\s+\d+\s+(EXISTS|EXPUNGE|FETCH|RECENT)\b/i;
+    return 1 if $line =~ /^\*\s+(VANISHED|STATUS)\b/i;
+    return 0;
+}
+
 sub mailbox_from_line {
     my ($line) = @_;
     return $1 if $line =~ /STATUS\s+"((?:\\.|[^"\\])*)"/i;
@@ -875,12 +891,15 @@ sub process_notification {
                 log_info("[$conn->{name}] $line");
             }
         }
-        for my $folder (folders_for_lines($conn, @lines)) {
-            note_mail_event(
-                $conn->{channel}, $folder,
-                gap_for_folder($conn, $folder),
-                $conn->{wait} // 0,
-            );
+        my @mail_lines = grep { mail_event_line($_) } @lines;
+        if (@mail_lines) {
+            for my $folder (folders_for_lines($conn, @mail_lines)) {
+                note_mail_event(
+                    $conn->{channel}, $folder,
+                    gap_for_folder($conn, $folder),
+                    $conn->{wait} // 0,
+                );
+            }
         }
         1;
     };
@@ -888,9 +907,7 @@ sub process_notification {
         drop_conn($conn->{key}, scrub($@));
         return;
     }
-    if (($conn->{mode} // '') eq 'IDLE' && exists $conns{ $conn->{key} }) {
-        drop_conn($conn->{key}, 'idle re-arm failed') unless restart_idle($conn);
-    }
+    # idle_data leaves the server in IDLE. Housekeeping sends DONE/IDLE.
 }
 
 sub handle_ready {
@@ -932,7 +949,8 @@ sub housekeeping {
             $accounts{ $conn->{name} }{backoff} = 5 if $accounts{ $conn->{name} };
             $conn->{last_success} = $now;
         }
-        if (($conn->{mode} // '') eq 'IDLE') {
+        if (($conn->{mode} // '') eq 'IDLE'
+            && $now - ($conn->{last_idle} // 0) >= 30) {
             drop_conn($key, 'idle refresh failed') unless restart_idle($conn);
         }
     }
