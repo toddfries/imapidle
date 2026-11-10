@@ -35,9 +35,18 @@ itself runs once and exits.
 is the long-running side of that pair.
 .Pp
 Each account is independent.
-A bad password, a refused certificate, a dead server, a failed
-.Sy mbsync ,
-or a broken mailbox connection is logged and retried later.
+A bad password, a refused certificate, a dead server, or a broken
+mailbox connection is logged and retried on that account.
+A failed
+.Sy mbsync
+is logged and does not disable the account.
+Five consecutive failures before the account has monitored a mailbox
+disable it.
+The log records that once, and the account is not tried again.
+.Dv SIGHUP
+enables it on the next wake.
+An account that has monitored a mailbox keeps retrying after a later
+failure, with the wait growing by half each time up to 900 seconds.
 It does not stop the other accounts, and it does not exit the process.
 The process leaves the main loop only on
 .Dv SIGTERM
@@ -66,6 +75,7 @@ The lines name each account and connection, each folder's priority,
 when that folder was last synced, and any
 .Sy mbsync
 child.
+A disabled account is named as disabled and has no retry time.
 On a terminal, Ctrl-T sends this signal.
 .Pp
 The options are as follows:

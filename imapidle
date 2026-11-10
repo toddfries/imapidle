@@ -266,6 +266,9 @@ sub parse_config_file {
             wait           => $wait + 0,
             backoff        => 5,
             next_try       => 0,
+            fails          => 0,
+            up             => 0,
+            disabled       => 0,
         };
     }
 
@@ -535,9 +538,19 @@ sub account_covered {
     return 1;
 }
 
+sub start_give_up { 5 }
+
 sub mark_retry {
     my ($name) = @_;
     my $acc = $accounts{$name} or return;
+    return if $acc->{disabled};
+    $acc->{fails} = ($acc->{fails} // 0) + 1;
+    if (!$acc->{up} && $acc->{fails} >= start_give_up()) {
+        $acc->{disabled} = 1;
+        $acc->{next_try} = 0;
+        log_error("[$name] disabled after $acc->{fails} failures");
+        return;
+    }
     my $b = $acc->{backoff} // 5;
     $b = 5 if $b < 5;
     $acc->{next_try} = time() + $b;
@@ -552,6 +565,9 @@ sub note_success {
     my $acc = $accounts{$name} or return;
     $acc->{backoff}  = 5;
     $acc->{next_try} = 0;
+    $acc->{fails}    = 0;
+    $acc->{up}       = 1;
+    $acc->{disabled} = 0;
 }
 
 sub drop_socket {
@@ -995,6 +1011,7 @@ sub housekeeping {
     }
 
     for my $name (keys %accounts) {
+        next if $accounts{$name}{disabled};
         next if account_covered($name);
         next if ($accounts{$name}{next_try} // 0) > $now;
         eval { connect_account($name) };
@@ -1009,6 +1026,7 @@ sub loop_timeout {
     my $now  = time();
     my $wait = 30;
     for my $name (keys %accounts) {
+        next if $accounts{$name}{disabled};
         next if account_covered($name);
         my $due = $accounts{$name}{next_try} // $now;
         my $d   = $due - $now;
@@ -1123,6 +1141,15 @@ sub reload_config_now {
         }
         $new->{backoff}  = $old->{backoff}  // 5;
         $new->{next_try} = $old->{next_try} // 0;
+        $new->{fails}    = $old->{fails}    // 0;
+        $new->{up}       = $old->{up}       // 0;
+        if ($old->{disabled}) {
+            $new->{disabled} = 0;
+            $new->{fails}    = 0;
+            $new->{backoff}  = 5;
+            $new->{next_try} = 0;
+            log_info("[$name] enabled");
+        }
         my $folders_changed = _folder_key($old) ne _folder_key($new);
         $accounts{$name} = $new;
         _retarget_conns($name, $old, $new);
@@ -1196,7 +1223,8 @@ sub info_lines {
         for my $folder (@{ $acc->{folders} }) {
             push @modes, 'IDLE ' . $folder->{name} if $conns{"$name:$folder->{name}"};
         }
-        my $mode = @modes ? join(', ', @modes) : 'down';
+        my $mode = @modes ? join(', ', @modes) : ($acc->{disabled} ? 'disabled' : 'down');
+        $mode .= ' disabled' if $acc->{disabled} && @modes;
         my $line = "[$name] $mode server $acc->{server} channel $acc->{mbsync_channel}";
         if ($mode eq 'down') {
             my $wait = int(($acc->{next_try} // 0) - $now);
