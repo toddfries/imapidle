@@ -16,6 +16,7 @@
 
 use strict;
 use warnings;
+use Config;
 use Config::Tiny;
 use Fcntl;
 use File::Basename qw(dirname);
@@ -24,7 +25,7 @@ use Getopt::Std;
 use IO::Select;
 use IO::Socket::SSL;
 use Mail::IMAPClient;
-use POSIX qw(:sys_wait_h _exit setsid);
+use POSIX qw(:sys_wait_h :signal_h _exit setsid);
 use Sys::Syslog qw(:standard :macros);
 use Time::HiRes qw(time);
 
@@ -39,6 +40,8 @@ my %conns;
 my %sock_to_key;
 my %children;
 my $select = IO::Select->new();
+my $INFO_R;
+my $INFO_W;
 
 sub log_line {
     my ($pri, $msg) = @_;
@@ -46,6 +49,17 @@ sub log_line {
     $msg = substr($msg, 0, 500);
     syslog($pri, '%s', $msg) if $LOG_OPEN;
     print STDERR "imapidle: $msg\n" if $FOREGROUND;
+}
+
+sub emit_state {
+    my ($msg) = @_;
+    $msg =~ s/[\r\n]+/ /g;
+    $msg = substr($msg, 0, 500);
+    if ($FOREGROUND) {
+        print STDERR "imapidle: $msg\n";
+        return;
+    }
+    syslog(LOG_INFO, '%s', $msg) if $LOG_OPEN;
 }
 
 sub log_info  { log_line(LOG_INFO,    $_[0]); }
@@ -309,7 +323,8 @@ sub capture_pass_cmd {
         open STDOUT, '>&', $wr or _exit(127);
         open STDERR, '>', '/dev/null';
         close $wr;
-        $SIG{HUP} = 'DEFAULT';
+        $SIG{HUP}  = 'DEFAULT';
+        $SIG{INFO} = 'DEFAULT';
         exec '/bin/sh', '-c', $cmd
             or _exit(127);
     }
@@ -828,6 +843,7 @@ sub trigger_mbsync {
     if ($pid == 0) {
         $SIG{PIPE} = 'IGNORE';
         $SIG{HUP}  = 'DEFAULT';
+        $SIG{INFO} = 'DEFAULT';
         $SIG{TERM} = 'DEFAULT';
         $SIG{INT}  = 'DEFAULT';
         close_extra_fds();
@@ -1134,6 +1150,116 @@ sub apply_reload {
     reload_config_now();
 }
 
+sub _signal_number {
+    my ($want) = @_;
+    my @name = split / /, $Config{sig_name};
+    my @num  = split / /, $Config{sig_num};
+    for my $i (0 .. $#name) {
+        return 0 + $num[$i] if $name[$i] eq $want;
+    }
+    return;
+}
+
+# Wake the loop. The report itself runs outside this handler.
+sub _poke_info {
+    return unless defined $INFO_W;
+    syswrite($INFO_W, 'x');
+}
+
+sub install_info_signal {
+    pipe($INFO_R, $INFO_W) or die "info pipe: $!";
+    cloexec($INFO_R);
+    cloexec($INFO_W);
+    for my $fh ($INFO_R, $INFO_W) {
+        my $flags = fcntl($fh, F_GETFL, 0);
+        fcntl($fh, F_SETFL, ($flags // 0) | O_NONBLOCK) if defined $flags;
+    }
+    $select->add($INFO_R);
+    my $sig = _signal_number('INFO');
+    die "SIGINFO is not available\n" unless defined $sig;
+    my $sa = POSIX::SigAction->new(\&_poke_info, POSIX::SigSet->new(), SA_RESTART);
+    POSIX::sigaction($sig, $sa) or die "sigaction INFO: $!";
+}
+
+sub _drain_info {
+    return unless defined $INFO_R;
+    while (1) {
+        my $n = sysread($INFO_R, my $buf, 64);
+        last if !defined $n || $n == 0;
+    }
+}
+
+sub info_lines {
+    my $now = int($_[0] // time());
+    my @kids = sort { $a <=> $b } keys %children;
+    my @lines = (
+        sprintf('info pid %d accounts %d connections %d mbsync %d',
+            $$, scalar keys %accounts, scalar keys %conns, scalar @kids),
+    );
+    for my $name (sort keys %accounts) {
+        my $acc = $accounts{$name};
+        my @modes;
+        push @modes, 'NOTIFY' if $conns{"$name:NOTIFY"};
+        for my $folder (@{ $acc->{folders} }) {
+            push @modes, 'IDLE ' . $folder->{name} if $conns{"$name:$folder->{name}"};
+        }
+        my $mode = @modes ? join(', ', @modes) : 'down';
+        my $line = "[$name] $mode server $acc->{server} channel $acc->{mbsync_channel}";
+        if ($mode eq 'down') {
+            my $wait = int(($acc->{next_try} // 0) - $now);
+            $wait = 0 if $wait < 0;
+            $line .= " retry ${wait}s";
+        }
+        push @lines, $line;
+        for my $folder (@{ $acc->{folders} }) {
+            push @lines, _folder_info_line($name, $acc, $folder, $now);
+        }
+    }
+    for my $pid (@kids) {
+        push @lines, "child pid $pid $children{$pid}";
+    }
+    return @lines;
+}
+
+sub _folder_info_line {
+    my ($name, $acc, $folder, $now) = @_;
+    my $channel = $acc->{mbsync_channel};
+    my $id      = _box_id($channel, $folder->{name});
+    my $bits    = "priority $folder->{priority} gap $folder->{debounce}s";
+    my $last    = $box_last_run{$id} // 0;
+    if ($last) {
+        my $ago = int($now - $last);
+        $ago = 0 if $ago < 0;
+        $bits .= " last ${ago}s ago";
+    } else {
+        $bits .= ' last never';
+    }
+    if ($box_pending{$id}) {
+        my $gap = $box_gap{$id} // $folder->{debounce};
+        if ($last && $now < $last + $gap) {
+            my $in = int($last + $gap - $now);
+            $in = 0 if $in < 0;
+            $bits .= " pending ${in}s";
+        } else {
+            $bits .= ' pending ready';
+        }
+    }
+    if (_in_batch($channel, $folder->{name})) {
+        my $deadline = $batch{$channel}{deadline};
+        if (defined $deadline) {
+            my $in = int($deadline - $now);
+            $in = 0 if $in < 0;
+            $bits .= " combine ${in}s";
+        }
+    }
+    return "[$name] $folder->{name} $bits";
+}
+
+sub report_info {
+    my ($now) = @_;
+    emit_state($_) for info_lines($now);
+}
+
 sub one_iteration {
     reap_children();
     apply_reload();
@@ -1142,7 +1268,12 @@ sub one_iteration {
     # A HUP that arrived during select is delivered before this call.
     apply_reload();
     # Drain ready sockets before housekeeping sends DONE or NOOP.
+    my $want_info = 0;
     for my $sock (@ready) {
+        if (defined $INFO_R && defined fileno($sock) && fileno($sock) == fileno($INFO_R)) {
+            $want_info = 1;
+            next;
+        }
         eval { handle_ready($sock) };
         next unless $@;
         log_warn('socket handler: ' . scrub($@));
@@ -1152,6 +1283,10 @@ sub one_iteration {
         } else {
             drop_socket($sock);
         }
+    }
+    if ($want_info) {
+        _drain_info();
+        report_info();
     }
     housekeeping();
     pump_schedule();
@@ -1233,6 +1368,7 @@ sub run {
     $SIG{HUP}  = \&request_reload;
     $SIG{TERM} = \&graceful_shutdown;
     $SIG{INT}  = \&graceful_shutdown;
+    install_info_signal();
 
     make_path($CONFIG_DIR, { mode => 0700 }) unless -d $CONFIG_DIR;
     my $err = load_config($CONFIG_FILE);
@@ -1296,6 +1432,14 @@ sub install_broken_conn_for_test {
 }
 
 sub clear_conns_for_test { %conns = (); %sock_to_key = (); }
+sub set_foreground_for_test { $FOREGROUND = $_[0] ? 1 : 0; }
+sub note_child_for_test { $children{ $_[0] } = $_[1]; }
+sub clear_children_for_test { %children = (); }
+sub set_next_try_for_test {
+    my ($name, $when) = @_;
+    return unless $accounts{$name};
+    $accounts{$name}{next_try} = $when;
+}
 
 sub plant_idle_for_test {
     my ($name, $folder, $debounce, $channel) = @_;

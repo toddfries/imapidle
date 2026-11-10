@@ -54,6 +54,19 @@ Folder names and priorities apply to the connection already open.
 A folder that is new, and not already covered by
 .Cm NOTIFY ,
 is connected on that wake.
+.Dv SIGINFO
+prints the running state and does not exit.
+With
+.Fl d
+each line goes to standard error.
+A daemonized process writes the same lines to
+.Xr syslog 3
+instead.
+The lines name each account and connection, each folder's priority,
+when that folder was last synced, and any
+.Sy mbsync
+child.
+On a terminal, Ctrl-T sends this signal.
 .Pp
 The options are as follows:
 .Bl -tag -width Ds
@@ -203,6 +216,8 @@ or
 .Dv SIGINT .
 .Dv SIGHUP
 reloads the configuration and does not exit.
+.Dv SIGINFO
+prints the running state and does not exit.
 .Sh EXAMPLES
 Accept certificates and watch the log on the terminal:
 .Bd -literal -offset indent
