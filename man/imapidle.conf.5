@@ -155,12 +155,10 @@ Every folder in a section shares that section's
 .Va user ,
 and
 .Va pass .
-.Sh DEBOUNCE
-Priority selects how long
-.Nm imapidle
-ignores later events after it has started
+.Sh PRIORITY
+Priority is the minimum time between
 .Sy mbsync
-for that connection:
+runs for that folder:
 .Bl -column "priority" "seconds" -offset indent
 .It Sy priority Ta Sy seconds
 .It 2 or less Ta 8
@@ -172,6 +170,41 @@ for that connection:
 .It 8 Ta 780
 .It 9 or more Ta 3600
 .El
+.Pp
+A folder is ready when it has never been included in a run, or when the
+minimum time since its last run has passed.
+An event for a ready folder starts a 5 second wait on that
+.Va mbsync_channel .
+Events for other folders of the same channel during those 5 seconds join
+one invocation, and do not start the 5 seconds over:
+.Bd -literal -offset indent
+mbsync channel:INBOX channel:Archive
+.Ed
+.Pp
+An event that arrives before the minimum time has passed is kept.
+When the minimum time expires,
+.Nm imapidle
+schedules
+.Sy mbsync
+for that folder on the next wake.
+That scheduling does not add another 5 seconds, unless the channel
+already has a combine window open, in which case the folder joins it.
+.Cm INBOX
+at priority 5 is included in a run.
+A further event for that mailbox during the next 420 seconds does not
+start another run immediately.
+At the end of those 420 seconds the folder is scheduled.
+If no event arrives during those 420 seconds, the folder stays ready,
+and the next event starts the 5 second wait.
+.Pp
+The
+.Va wait
+value is an extra delay inside the
+.Sy mbsync
+child, after the 5 second wait.
+A batch uses the largest
+.Va wait
+among its folders.
 .Sh FILES
 .Bl -tag -width Ds
 .It Pa ~/.config/imapidle/imapidle.conf

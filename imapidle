@@ -447,15 +447,6 @@ sub setup_notification {
     return 0;
 }
 
-sub min_debounce {
-    my ($folders) = @_;
-    my $min;
-    for my $f (@$folders) {
-        $min = $f->{debounce} if !defined $min || $f->{debounce} < $min;
-    }
-    return $min // 180;
-}
-
 sub register_conn {
     my ($conn) = @_;
     $conns{ $conn->{key} } = $conn;
@@ -485,7 +476,6 @@ sub arm_idle {
         tag          => $tag,
         mode         => 'IDLE',
         debounce     => $folder->{debounce},
-        last_event   => 0,
         socket       => $socket,
         channel      => $acc->{mbsync_channel},
         wait         => $acc->{wait},
@@ -504,8 +494,6 @@ sub adopt_notify {
         socket       => $socket,
         channel      => $acc->{mbsync_channel},
         wait         => $acc->{wait},
-        debounce     => min_debounce($acc->{folders}),
-        last_event   => 0,
         folders      => $acc->{folders},
         last_success => time(),
     });
@@ -659,12 +647,150 @@ sub reap_children {
     }
 }
 
-sub trigger_mbsync {
-    my ($channel, $wait) = @_;
+# Minimum time between mbsync runs is per folder. Events inside that gap
+# stay pending and run when the gap ends. A ready event opens a 5s window
+# on its mbsync channel so other ready folders of that channel share one
+# invocation: mbsync channel:box channel:box ...
+my $COMBINE_SEC = 5;
+my %box_gap;
+my %box_last_run;
+my %box_pending;
+my %box_wait;
+my %batch;
+
+sub _box_id {
+    my ($channel, $folder) = @_;
+    return $channel . "\0" . $folder;
+}
+
+sub reset_schedule_for_test {
+    %box_gap      = ();
+    %box_last_run = ();
+    %box_pending  = ();
+    %box_wait     = ();
+    %batch        = ();
+}
+
+sub _in_batch {
+    my ($channel, $folder) = @_;
+    return 0 unless exists $batch{$channel};
+    my $boxes = $batch{$channel}{boxes};
+    return 0 unless ref $boxes eq 'HASH' && exists $boxes->{$folder};
+    return 1;
+}
+
+sub queue_folder {
+    my ($channel, $folder, $now, $deadline_if_new) = @_;
+    $batch{$channel}{boxes}{$folder} = 1;
+    my $deadline = $batch{$channel}{deadline};
+    # An open window keeps its deadline so a burst cannot postpone the run.
+    return if defined $deadline && $deadline > $now;
+    $batch{$channel}{deadline} = $deadline_if_new;
+}
+
+sub note_mail_event {
+    my ($channel, $folder, $gap, $wait, $now) = @_;
+    return unless defined $channel && $channel ne '' && defined $folder && $folder ne '';
+    $now  //= time();
     $wait //= 0;
+    $gap  //= 0;
+    my $id = _box_id($channel, $folder);
+    $box_gap{$id}      = $gap;
+    $box_wait{$id}     = $wait;
+    $box_pending{$id}  = 1;
+    my $last = $box_last_run{$id} // 0;
+    if ($last && $now < $last + $gap) {
+        log_info("$channel:$folder event kept; next mbsync at " . ($last + $gap));
+        return;
+    }
+    queue_folder($channel, $folder, $now, $now + $COMBINE_SEC);
+    log_info("$channel:$folder ready; mbsync combines until " . $batch{$channel}{deadline});
+}
+
+sub promote_pending {
+    my ($now) = @_;
+    for my $id (keys %box_pending) {
+        next unless $box_pending{$id};
+        my ($channel, $folder) = split /\0/, $id, 2;
+        next if _in_batch($channel, $folder);
+        my $last = $box_last_run{$id} // 0;
+        my $gap  = $box_gap{$id} // 0;
+        next if $last && $now < $last + $gap;
+        queue_folder($channel, $folder, $now, $now);
+        log_info("$channel:$folder minimum interval elapsed; mbsync scheduled");
+    }
+}
+
+sub take_due_batches {
+    my ($now) = @_;
+    my @jobs;
+    for my $channel (sort keys %batch) {
+        my $deadline = $batch{$channel}{deadline};
+        next unless defined $deadline && $deadline <= $now;
+        my @folders = sort keys %{ $batch{$channel}{boxes} // {} };
+        next unless @folders;
+        my $wait = 0;
+        for my $folder (@folders) {
+            my $id = _box_id($channel, $folder);
+            my $w  = $box_wait{$id} // 0;
+            $wait = $w if $w > $wait;
+            $box_last_run{$id} = $now;
+            $box_pending{$id}  = 0;
+        }
+        delete $batch{$channel};
+        push @jobs, {
+            args => [ map { "$channel:$_" } @folders ],
+            wait => $wait,
+        };
+    }
+    return @jobs;
+}
+
+sub due_mbsync_jobs {
+    my ($now) = @_;
+    $now //= time();
+    promote_pending($now);
+    return take_due_batches($now);
+}
+
+sub next_schedule_delay {
+    my ($now) = @_;
+    $now //= time();
+    my $wait;
+    for my $id (keys %box_pending) {
+        next unless $box_pending{$id};
+        my ($channel, $folder) = split /\0/, $id, 2;
+        next if _in_batch($channel, $folder);
+        my $last = $box_last_run{$id} // 0;
+        next unless $last;
+        my $d = $last + ($box_gap{$id} // 0) - $now;
+        next if $d < 0;
+        $wait = $d if !defined $wait || $d < $wait;
+    }
+    for my $channel (keys %batch) {
+        my $deadline = $batch{$channel}{deadline};
+        next unless defined $deadline;
+        my $d = $deadline - $now;
+        $d = 0 if $d < 0;
+        $wait = $d if !defined $wait || $d < $wait;
+    }
+    return $wait;
+}
+
+sub schedule_deadline {
+    my ($channel) = @_;
+    return unless exists $batch{$channel};
+    return $batch{$channel}{deadline};
+}
+
+sub trigger_mbsync {
+    my ($wait, @args) = @_;
+    $wait //= 0;
+    return unless @args;
+    my $shown = join(' ', @args);
     my $pid = fork();
     if (!defined $pid) {
-        log_error("fork mbsync '$channel' failed: $!");
+        log_error("fork mbsync '$shown' failed: $!");
         return;
     }
     if ($pid == 0) {
@@ -676,11 +802,56 @@ sub trigger_mbsync {
         open STDOUT, '>', '/dev/null';
         open STDERR, '>', '/dev/null';
         sleep $wait if $wait > 0;
-        exec '/usr/local/bin/mbsync', $channel
+        exec '/usr/local/bin/mbsync', @args
             or _exit(1);
     }
-    $children{$pid} = "mbsync $channel";
-    log_info("forked mbsync '$channel' (pid $pid)");
+    $children{$pid} = "mbsync $shown";
+    log_info("forked mbsync '$shown' (pid $pid)");
+}
+
+sub pump_schedule {
+    my ($now) = @_;
+    $now //= time();
+    for my $job (due_mbsync_jobs($now)) {
+        trigger_mbsync($job->{wait}, @{ $job->{args} });
+    }
+}
+
+sub mailbox_from_line {
+    my ($line) = @_;
+    return $1 if $line =~ /STATUS\s+"((?:\\.|[^"\\])*)"/i;
+    return $1 if $line =~ /STATUS\s+(\S+)/i;
+    return;
+}
+
+sub folders_for_lines {
+    my ($conn, @lines) = @_;
+    my %seen;
+    if (($conn->{mode} // '') eq 'IDLE' && defined $conn->{folder} && $conn->{folder} ne '') {
+        $seen{ $conn->{folder} } = 1 if @lines;
+        return sort keys %seen;
+    }
+    my $named_any = 0;
+    for my $line (@lines) {
+        my $named = mailbox_from_line($line);
+        next unless defined $named && $named ne '';
+        $named_any = 1;
+        for my $f (@{ $conn->{folders} // [] }) {
+            $seen{ $f->{name} } = 1 if $f->{name} eq $named;
+        }
+    }
+    if (!$named_any) {
+        $seen{ $_->{name} } = 1 for @{ $conn->{folders} // [] };
+    }
+    return sort keys %seen;
+}
+
+sub gap_for_folder {
+    my ($conn, $folder) = @_;
+    for my $f (@{ $conn->{folders} // [] }) {
+        return $f->{debounce} if $f->{name} eq $folder;
+    }
+    return $conn->{debounce} // calculate_debounce(5);
 }
 
 sub process_notification {
@@ -688,7 +859,7 @@ sub process_notification {
     die "missing IMAP session\n" unless $conn && $conn->{imap};
 
     my $ok = eval {
-        my $any  = 0;
+        my @lines;
         my $spins = 0;
         while ($spins++ < 100) {
             my @data = $conn->{imap}->idle_data(0);
@@ -697,23 +868,19 @@ sub process_notification {
             }
             @data = grep { defined && $_ ne '' } @data;
             last unless @data;
-            $any = 1;
             for my $line (@data) {
                 chomp $line;
+                next if $line eq '';
+                push @lines, $line;
                 log_info("[$conn->{name}] $line");
             }
         }
-        if ($any) {
-            my $now = time();
-            my $debounce = $conn->{debounce} // 180;
-            if ($now - $conn->{last_event} > $debounce) {
-                my $wait = $conn->{wait} // 0;
-                log_info("[$conn->{name}] debounce passed, mbsync $conn->{channel}");
-                trigger_mbsync($conn->{channel}, $wait);
-                $conn->{last_event} = $now;
-            } else {
-                log_info("[$conn->{name}] notification grouped (debounce active)");
-            }
+        for my $folder (folders_for_lines($conn, @lines)) {
+            note_mail_event(
+                $conn->{channel}, $folder,
+                gap_for_folder($conn, $folder),
+                $conn->{wait} // 0,
+            );
         }
         1;
     };
@@ -791,11 +958,14 @@ sub loop_timeout {
         $d = 0 if $d < 0;
         $wait = $d if $d < $wait;
     }
+    my $sched = next_schedule_delay($now);
+    $wait = $sched if defined $sched && $sched < $wait;
     return $wait;
 }
 
 sub one_iteration {
     reap_children();
+    pump_schedule();
     my @ready = $select->can_read(loop_timeout());
     # Drain ready sockets before housekeeping sends DONE or NOOP.
     for my $sock (@ready) {
@@ -810,6 +980,7 @@ sub one_iteration {
         }
     }
     housekeeping();
+    pump_schedule();
 }
 
 sub daemonize {

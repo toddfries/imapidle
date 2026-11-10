@@ -85,10 +85,21 @@ and facility
 .Sy mbsync
 is executed as
 .Pa /usr/local/bin/mbsync
-with the account's channel name as its only argument.
-The child waits for that account's
+followed by one
+.Ar channel:box
+argument per folder in the batch.
+Folders of the same channel that become ready together are one process:
+.Bd -literal -offset indent
+mbsync channel:INBOX channel:Archive
+.Ed
+.Pp
+A ready event starts a 5 second wait on that channel.
+Other ready events for the same channel during those 5 seconds join the
+same invocation.
+The 5 seconds are not restarted by a later event.
+The child then waits for the largest
 .Va wait
-seconds, then replaces itself with
+of the folders in the batch, then replaces itself with
 .Sy mbsync .
 A non-zero exit is logged.
 The IMAP loop does not wait for
@@ -101,10 +112,9 @@ If the server advertises
 sends
 .Dl NOTIFY SET (personal (MessageNew MessageExpunge MessageFlags))
 on the connection it keeps.
-One event on that connection runs the account's
-.Sy mbsync
-channel.
-The debounce interval is the smallest interval among that account's folders.
+Each configured folder keeps its own minimum time.
+An event that names a mailbox schedules that folder.
+An event that names none schedules every folder configured for the account.
 .Pp
 Otherwise
 .Nm
@@ -126,10 +136,26 @@ On
 connections the same timer sends
 .Cm NOOP .
 .Pp
-The first matching event for a connection starts
-.Sy mbsync .
-Further events on that connection are logged and ignored until the
-debounce interval has passed since that start.
+Priority is the minimum time between
+.Sy mbsync
+runs for one folder.
+A folder that has never been included in a run, or whose minimum time
+since that run has already passed, is ready: the next event starts the
+5 second channel wait described above.
+An event that arrives before the minimum time has passed is kept.
+When that time expires, the folder is scheduled on the next wake.
+That scheduling does not add another 5 seconds, unless the channel
+already has a combine window open, in which case the folder joins it.
+If the minimum time passes with no further event, the folder stays
+ready until the next event.
+For example,
+.Cm INBOX
+at priority 5 is included in a run, and another event for that mailbox
+arrives during the following 420 seconds.
+That event does not start a second run immediately.
+When the 420 seconds end, the folder is scheduled.
+If those 420 seconds pass with no event, the next event is what
+schedules the run, after the 5 second wait.
 .Sh FILES
 .Bl -tag -width Ds
 .It Pa ~/.config/imapidle/imapidle.conf

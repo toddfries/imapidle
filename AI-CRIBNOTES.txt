@@ -29,12 +29,12 @@ Project facts (sourced 20261109, updated the same day)
 - known_hosts sits next to the config file. SHA256 fingerprint, accept on a tty, refuse otherwise. New files use mode 0600. Directory created mode 0700.
 - TLS: IO::Socket::SSL with SSL_VERIFY_NONE, then that TOFU check. IO::Socket::SSL 2.099 is installed.
 - IMAP: Mail::IMAPClient 3.43. idle, idle_data, and done exist. NOTIFY is sent on the socket that stays in the select set. Otherwise one IDLE connection per folder.
-- mbsync: /usr/local/bin/mbsync. isync-1.5.1p0 is installed. wait seconds happen in the child. No concurrency cap. Child closes inherited descriptors.
+- mbsync: /usr/local/bin/mbsync channel:box [channel:box ...]. isync-1.5.1p0 is installed. Same-channel folders that are ready within one 5s window share that argv. wait seconds (the max in the batch) happen in the child after the 5s. No concurrency cap. Child closes inherited descriptors.
 - Syslog: ident imapidle, options cons,pid, facility mail.
 - After startup, a failed account, socket, pass_cmd, or mbsync does not exit the process. The loop exits only on SIGTERM or SIGINT (exit 0). Backoff is remembered on the account (5s, x1.5, cap 900) and does not sleep the other accounts.
 - IDLE is refreshed about every 30s with DONE then IDLE. NOOP is not sent during IDLE. NOTIFY connections get NOOP on that timer.
-- Debounce from priority: <=2 → 8s; >=9 → 3600s; else 180+(priority-3)*120. Priority 3 is 180, 5 is 420, 8 is 780. The first event starts mbsync. Later events on that connection are ignored until the interval has passed.
-- wait (seconds, default 0) sleeps in the mbsync child, not in the IMAP loop.
+- Priority is the minimum time between mbsync runs for one folder: <=2 → 8s; >=9 → 3600s; else 180+(priority-3)*120. Priority 5 is 420. A ready folder's event opens a 5s channel window (not restarted by later events). An event inside the minimum gap stays pending and is scheduled when the gap ends, with no extra 5s unless another folder's window is already open. No event during the gap leaves the folder ready for the next event.
+- wait (seconds, default 0) sleeps in the mbsync child after the 5s combine, not in the IMAP loop.
 
 Config shape the script reads
 - One INI section per account. Required: server, user, mbsync_channel, and exactly one of pass or pass_cmd. port defaults to 993. Missing required keys exit 1.
