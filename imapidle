@@ -109,22 +109,45 @@ sub cloexec {
     fcntl($fh, F_SETFD, $flags | FD_CLOEXEC);
 }
 
+my %CERT_SEEN;
+my %CERT_INDEX;
+my $CERT_SEQ = 0;
+
+sub _cert_stamp {
+    my @t = gmtime();
+    return sprintf('%04d%02d%02dT%02d:%02d:%02dZ',
+        $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
+}
+
 sub load_known_hosts {
-    my %known;
-    return %known unless defined $KNOWN_HOSTS && -f $KNOWN_HOSTS;
-    open my $fh, '<', $KNOWN_HOSTS or return %known;
+    my %certs;
+    return %certs unless defined $KNOWN_HOSTS && -f $KNOWN_HOSTS;
+    open my $fh, '<', $KNOWN_HOSTS or return %certs;
     while (<$fh>) {
         chomp;
         next if /^\s*#/ || /^\s*$/;
-        my ($hostkey, $fp) = split /\s+/, $_, 2;
-        $known{$hostkey} = $fp if $hostkey && $fp;
+        my ($hostkey, $fp, $expired) = split /\s+/, $_, 3;
+        next unless $hostkey && $fp;
+        push @{ $certs{$hostkey} }, {
+            fp      => $fp,
+            expired => $expired // '',
+        };
     }
     close $fh;
-    return %known;
+    return %certs;
+}
+
+sub _current_cert {
+    my ($rows) = @_;
+    my $cur;
+    for my $row (@{ $rows // [] }) {
+        $cur = $row if ($row->{expired} // '') eq '';
+    }
+    return $cur;
 }
 
 sub save_known_hosts {
-    my %known = @_;
+    my %certs = @_;
     return unless defined $KNOWN_HOSTS;
     my $old = umask 077;
     open my $fh, '>', $KNOWN_HOSTS or do {
@@ -133,12 +156,34 @@ sub save_known_hosts {
         return;
     };
     print $fh "# imapidle known_hosts\n";
-    print $fh "# server:port\tfingerprint\n\n";
-    for my $k (sort keys %known) {
-        print $fh "$k\t$known{$k}\n";
+    print $fh "# server:port\tfingerprint\t[expired]\n\n";
+    for my $host (sort keys %certs) {
+        my @rows = @{ $certs{$host} // [] };
+        my @gone = sort { $a->{expired} cmp $b->{expired} }
+            grep { ($_->{expired} // '') ne '' } @rows;
+        my @live = grep { ($_->{expired} // '') eq '' } @rows;
+        for my $row (@gone) {
+            print $fh "$host\t$row->{fp}\t$row->{expired}\n";
+        }
+        for my $row (@live) {
+            print $fh "$host\t$row->{fp}\n";
+        }
     }
     close $fh;
     umask $old;
+}
+
+sub _announce_cert {
+    my ($hostkey, $kind, $fp, $old) = @_;
+    if (exists $CERT_SEEN{$hostkey} && $CERT_SEEN{$hostkey} eq $fp) {
+        return;
+    }
+    $CERT_SEEN{$hostkey} = $fp;
+    $CERT_INDEX{$hostkey} //= ++$CERT_SEQ;
+    my $n = sprintf('%02d', $CERT_INDEX{$hostkey});
+    log_info("[cert] $n: $hostkey tls fp $kind");
+    log_info("[cert] $n: +$fp") if $kind eq 'new' || $kind eq 'change';
+    log_info("[cert] $n: -$old") if $kind eq 'change';
 }
 
 sub approve_fingerprint {
@@ -148,18 +193,26 @@ sub approve_fingerprint {
         log_error("Certificate fingerprint missing for $hostkey");
         return 0;
     }
-    my %known = load_known_hosts();
-    my $old   = $known{$hostkey};
-    if ($old && $old eq $fingerprint) {
+    my %certs = load_known_hosts();
+    my $cur   = _current_cert($certs{$hostkey});
+    my $old   = $cur ? $cur->{fp} : '';
+    if ($old eq $fingerprint) {
+        _announce_cert($hostkey, 'match', $fingerprint, '');
         return 1;
     }
-    if ($old) {
-        log_warn("Certificate changed for $hostkey old $old new $fingerprint");
-    } else {
-        log_info("Certificate stored for $hostkey $fingerprint");
+    if ($old eq '') {
+        push @{ $certs{$hostkey} }, { fp => $fingerprint, expired => '' };
+        save_known_hosts(%certs);
+        _announce_cert($hostkey, 'new', $fingerprint, '');
+        return 1;
     }
-    $known{$hostkey} = $fingerprint;
-    save_known_hosts(%known);
+    my $stamp = _cert_stamp();
+    for my $row (@{ $certs{$hostkey} }) {
+        $row->{expired} = $stamp if ($row->{expired} // '') eq '';
+    }
+    push @{ $certs{$hostkey} }, { fp => $fingerprint, expired => '' };
+    save_known_hosts(%certs);
+    _announce_cert($hostkey, 'change', $fingerprint, $old);
     return 1;
 }
 
@@ -476,8 +529,6 @@ sub create_imap_connection {
     cloexec($socket);
 
     my $fingerprint = $socket->get_fingerprint('SHA256');
-    log_info("[$name] SSL $acc->{server} port $acc->{port}");
-    log_info("[$name] fingerprint $fingerprint");
     if (!approve_fingerprint($acc->{server}, $acc->{port}, $fingerprint)) {
         $socket->close;
         die 'Certificate fingerprint missing';

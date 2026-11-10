@@ -237,8 +237,12 @@ among its folders.
 Default path.
 .It Pa ~/.config/imapidle/known_hosts
 SHA256 certificate fingerprints for this configuration's directory.
-An unknown fingerprint is stored on first connect.
-A changed fingerprint is logged and replaces the stored value.
+A current line is
+.Pa server:port
+and the fingerprint.
+A retired line adds the GMT time it was replaced, as
+.Ql YYYYMMDDTHH:MM:SSZ .
+One line per host has no time.
 .El
 .Sh EXAMPLES
 A password stored in the file, with a hot inbox and a lazy archive:

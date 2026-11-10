@@ -106,9 +106,23 @@ Use this to watch a run.
 An unknown certificate is stored in
 .Pa known_hosts
 and the connection continues.
-A fingerprint that differs from the stored one is logged.
-The new fingerprint replaces the stored one, and the connection
-continues.
+The first look at a host logs
+.Cm match ,
+.Cm new ,
+or
+.Cm change .
+.Cm new
+adds a line beginning with
+.Ql +
+and the fingerprint.
+.Cm change
+adds that line and a line beginning with
+.Ql -
+and the previous fingerprint.
+A later connection to the same host does not repeat them.
+A replaced fingerprint stays in the file with the GMT time it was
+retired.
+One fingerprint per host has no retired time, and that one is current.
 .Pp
 Operational messages use
 .Xr syslog 3
@@ -205,8 +219,12 @@ See
 .Sy imapidle.conf(5) .
 .It Pa ~/.config/imapidle/known_hosts
 SHA256 certificate fingerprints accepted for the default configuration.
-An unknown fingerprint is stored on first connect.
-A changed fingerprint is logged and replaces the stored value.
+A current line is
+.Pa server:port
+and the fingerprint.
+A retired line adds the GMT time it was replaced, as
+.Ql YYYYMMDDTHH:MM:SSZ .
+One line per host has no time.
 The file mode is 0600 when
 .Nm
 creates it.
