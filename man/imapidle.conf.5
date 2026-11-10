@@ -211,7 +211,9 @@ among its folders.
 .It Pa ~/.config/imapidle/imapidle.conf
 Default path.
 .It Pa ~/.config/imapidle/known_hosts
-Certificates accepted while using the default path.
+SHA256 certificate fingerprints for this configuration's directory.
+An unknown fingerprint is stored on first connect.
+A changed fingerprint is logged and replaces the stored value.
 .El
 .Sh EXAMPLES
 A password stored in the file, with a hot inbox and a lazy archive:

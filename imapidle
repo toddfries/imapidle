@@ -122,8 +122,8 @@ sub save_known_hosts {
         log_error("Cannot write $KNOWN_HOSTS: $!");
         return;
     };
-    print $fh "# imapidle known_hosts (TOFU)\n";
-    print $fh "# format: server:port\tSHA256:fingerprint\n\n";
+    print $fh "# imapidle known_hosts\n";
+    print $fh "# server:port\tfingerprint\n\n";
     for my $k (sort keys %known) {
         print $fh "$k\t$known{$k}\n";
     }
@@ -134,33 +134,23 @@ sub save_known_hosts {
 sub approve_fingerprint {
     my ($server, $port, $fingerprint) = @_;
     my $hostkey = "$server:$port";
-    my %known   = load_known_hosts();
-    my $old     = $known{$hostkey};
-    return 1 if $old && $old eq $fingerprint;
-
-    if (!-t STDIN) {
-        log_error("Certificate unknown or changed for $hostkey — run imapidle -d to approve");
+    if (!defined $fingerprint || $fingerprint eq '') {
+        log_error("Certificate fingerprint missing for $hostkey");
         return 0;
     }
-
-    print STDERR "\n";
-    if ($old) {
-        print STDERR "WARNING: Certificate CHANGED for $hostkey!\n  Old: $old\n  New: $fingerprint\n\n";
-    } else {
-        print STDERR "New SSL certificate for $hostkey\nFingerprint: $fingerprint\n\n";
-    }
-    print STDERR "Accept this certificate? (y/N) ";
-    my $ans = <STDIN>;
-    $ans = '' unless defined $ans;
-    chomp $ans;
-    if ($ans =~ /^y/i) {
-        $known{$hostkey} = $fingerprint;
-        save_known_hosts(%known);
-        log_info("Certificate accepted for $hostkey");
+    my %known = load_known_hosts();
+    my $old   = $known{$hostkey};
+    if ($old && $old eq $fingerprint) {
         return 1;
     }
-    log_error("Certificate rejected for $hostkey");
-    return 0;
+    if ($old) {
+        log_warn("Certificate changed for $hostkey old $old new $fingerprint");
+    } else {
+        log_info("Certificate stored for $hostkey $fingerprint");
+    }
+    $known{$hostkey} = $fingerprint;
+    save_known_hosts(%known);
+    return 1;
 }
 
 sub calculate_debounce {
@@ -417,7 +407,7 @@ sub create_imap_connection {
     log_info("[$name] fingerprint $fingerprint");
     if (!approve_fingerprint($acc->{server}, $acc->{port}, $fingerprint)) {
         $socket->close;
-        die 'Certificate not approved';
+        die 'Certificate fingerprint missing';
     }
 
     my $imap = Mail::IMAPClient->new(
@@ -1436,6 +1426,7 @@ sub install_broken_conn_for_test {
 
 sub clear_conns_for_test { %conns = (); %sock_to_key = (); }
 sub set_foreground_for_test { $FOREGROUND = $_[0] ? 1 : 0; }
+sub set_known_hosts_for_test { $KNOWN_HOSTS = $_[0]; }
 sub note_child_for_test { $children{ $_[0] } = $_[1]; }
 sub clear_children_for_test { %children = (); }
 sub set_next_try_for_test {
