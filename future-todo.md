@@ -6,6 +6,5 @@ Parked from imap-idle-notify-session-extraction.md. Todd asked for a password co
 - Max concurrent mbsync processes. Why: forks are unlimited. Saving: a semaphore is unused until more than one account is syncing.
 - After-sync hook (for example notmuch new). Why: the child only execs mbsync. Saving: one less process to supervise.
 - Poll fallback for servers without IDLE or NOTIFY. Why: the code tries NOTIFY, then IDLE. Saving: no third mode until those two have been watched against a real server.
-- XOAUTH2 / SASL inside this program. Why: pass_cmd already runs a helper that can print a token. The IMAP login is still a password. Saving: no token exchange in this tree.
 - Trigger only on EXISTS, ignore flag-only events. Why: every drained line can arm mbsync. Saving: filter after a live trace shows which lines matter.
 - Log level switch beyond -d. Why: -d copies every line to stderr. Saving: no second logger until a real run is noisy.

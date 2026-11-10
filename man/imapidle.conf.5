@@ -118,11 +118,24 @@ Required unless
 is set.
 The command is run again on each connection, so a helper that prints a
 fresh access token can be dropped in here.
-OAuth itself is not implemented;
-.Nm imapidle
-only reads the password the command prints.
-The command text and the password are not written to the log.
+The command text and its output are not written to the log.
 Standard error from the command is discarded.
+.It Va auth
+How
+.Va pass ,
+or the first line from
+.Va pass_cmd ,
+is presented to the server.
+.Cm login
+is the default and sends IMAP
+.Cm LOGIN .
+.Cm xoauth2
+sends
+.Cm AUTHENTICATE XOAUTH2 .
+For
+.Cm xoauth2
+the value is a bearer token.
+The token is not written to the log.
 .It Va mbsync_channel
 Channel name passed to
 .Sy mbsync .

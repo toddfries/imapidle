@@ -37,7 +37,7 @@ Project facts (sourced 20261109, updated the same day)
 - wait (seconds, default 0) sleeps in the mbsync child after the 5s combine, not in the IMAP loop.
 
 Config shape the script reads
-- One INI section per account. Required: server, user, mbsync_channel, and exactly one of pass or pass_cmd. port defaults to 993. Missing required keys exit 1. disabled = yes keeps the section without connecting or checking those keys. Any other value leaves it active. SIGHUP leaves a yes section disabled until yes is removed (2026-11-10).
+- One INI section per account. Required: server, user, mbsync_channel, and exactly one of pass or pass_cmd. port defaults to 993. Missing required keys exit 1. disabled = yes keeps the section without connecting or checking those keys. Any other value leaves it active. SIGHUP leaves a yes section disabled until yes is removed (2026-11-10). auth is login (default) or xoauth2. xoauth2 sends AUTHENTICATE XOAUTH2 with the pass or pass_cmd value as the bearer token. The token is not logged.
 - folder0, folder1, ... value is NAME or NAME;priority=N. Numbers start at 0 and have no gaps. Only the priority suffix is read. Missing suffix → priority 5.
 - If no folderN keys: folder (default INBOX) and priority (default 5).
 - Every folder in a section shares that section's mbsync_channel.

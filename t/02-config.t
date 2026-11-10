@@ -15,6 +15,7 @@
 use strict;
 use warnings;
 use File::Temp qw(tempfile);
+use MIME::Base64 qw(decode_base64);
 use Test::More;
 
 require './imapidle';
@@ -28,6 +29,11 @@ is(calculate_debounce(5), 420,  'priority 5 is 420s');
 is(calculate_debounce(6), 540,  'priority 6 is 540s');
 is(calculate_debounce(8), 780,  'priority 8 is 780s');
 is(calculate_debounce(9), 3600, 'priority 9 is 3600s');
+
+my $sasl = xoauth2_initial('user@example.com', 'tok');
+is(decode_base64($sasl), "user=user\@example.com\x01auth=Bearer tok\x01\x01",
+    'xoauth2 initial response is the bearer string');
+unlike($sasl, qr/\n/, 'the initial response is one line');
 
 my ($fh, $path) = tempfile('imapidle-XXXX', SUFFIX => '.conf', TMPDIR => 1);
 print $fh <<'EOF';
@@ -166,5 +172,32 @@ disabled = no
 EOF
 like(load_config($no), qr/\[nope\] missing server, user, mbsync_channel/, 'no does not skip required keys');
 unlink $no;
+
+my $xo = write_conf(<<'EOF');
+[ma]
+server = outlook.example.com
+user = a@example.com
+pass_cmd = printf '%s\n' tok
+auth = XOAUTH2
+mbsync_channel = ma-ttf
+folder0 = INBOX
+EOF
+is(load_config($xo), '', 'xoauth2 account loads');
+is(loaded_account('ma')->{auth}, 'xoauth2', 'auth XOAUTH2 is stored');
+my @xo = info_lines(time());
+like($xo[1], qr/^\[ma\] down server outlook\.example\.com channel ma-ttf auth xoauth2 retry /,
+    'state names xoauth2');
+unlink $xo;
+
+my $bogus = write_conf(<<'EOF');
+[bad]
+server = imap.example.com
+user = a@example.com
+pass = secret
+auth = plain
+mbsync_channel = ch
+EOF
+like(load_config($bogus), qr/\[bad\] auth must be login or xoauth2/, 'unknown auth is rejected');
+unlink $bogus;
 
 done_testing;

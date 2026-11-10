@@ -24,6 +24,7 @@ use File::Path qw(make_path);
 use Getopt::Std;
 use IO::Select;
 use IO::Socket::SSL;
+use MIME::Base64 qw(encode_base64);
 use Mail::IMAPClient;
 use POSIX qw(:sys_wait_h :signal_h _exit setsid);
 use Sys::Syslog qw(:standard :macros);
@@ -77,6 +78,15 @@ sub scrub {
     chomp $err;
     if (defined $secret && length $secret) {
         $err =~ s/\Q$secret\E/***/g;
+    }
+    return $err;
+}
+
+sub _scrub_login {
+    my ($err, $acc, $secret) = @_;
+    $err = scrub($err, $secret);
+    if ($acc && ($acc->{auth} // '') eq 'xoauth2') {
+        $err = scrub($err, xoauth2_initial($acc->{user}, $secret));
     }
     return $err;
 }
@@ -218,6 +228,11 @@ sub parse_config_file {
             $bad->('missing pass or pass_cmd');
         }
 
+        my $auth = lc($row->{auth} // 'login');
+        if ($auth ne 'login' && $auth ne 'xoauth2') {
+            $bad->('auth must be login or xoauth2');
+        }
+
         my $port = $row->{port} // 993;
         if ($port !~ /^\d+$/ || $port < 1 || $port > 65535) {
             $bad->('bad port');
@@ -267,6 +282,7 @@ sub parse_config_file {
             pass           => $has_pw ? $row->{pass} : undef,
             pass_cmd       => $has_cmd ? $row->{pass_cmd} : undef,
             mbsync_channel => $row->{mbsync_channel},
+            auth           => $auth,
             folders        => \@folders,
             wait           => $wait + 0,
             backoff        => 5,
@@ -289,6 +305,20 @@ sub _config_disabled {
     return defined $val && $val =~ /^yes$/i;
 }
 
+sub _auth_name {
+    my ($val) = @_;
+    my $auth = lc($val // 'login');
+    return $auth if $auth eq 'xoauth2';
+    return 'login';
+}
+
+sub xoauth2_initial {
+    my ($user, $token) = @_;
+    $user  //= '';
+    $token //= '';
+    return encode_base64("user=$user\x01auth=Bearer $token\x01\x01", '');
+}
+
 sub _held_account {
     my ($row) = @_;
     my $port = $row->{port} // 993;
@@ -302,6 +332,7 @@ sub _held_account {
         pass            => $has_pw ? $row->{pass} : undef,
         pass_cmd        => $has_cmd ? $row->{pass_cmd} : undef,
         mbsync_channel  => $row->{mbsync_channel} // '',
+        auth            => _auth_name($row->{auth}),
         folders         => [],
         wait            => 0,
         backoff         => 5,
@@ -332,7 +363,8 @@ sub _log_loaded_account {
         return;
     }
     my $how = defined $acc->{pass_cmd} && $acc->{pass_cmd} ne '' ? 'pass_cmd' : 'pass';
-    log_info("[$section] $how, mbsync $acc->{mbsync_channel}, "
+    my $mech = ($acc->{auth} // '') eq 'xoauth2' ? ', xoauth2' : '';
+    log_info("[$section] $how$mech, mbsync $acc->{mbsync_channel}, "
           . scalar(@{ $acc->{folders} }) . ' folder(s)');
 }
 
@@ -451,20 +483,30 @@ sub create_imap_connection {
         die 'Certificate fingerprint missing';
     }
 
-    my $imap = Mail::IMAPClient->new(
+    my %login = (
         Socket   => $socket,
         User     => $acc->{user},
         Password => $password,
     );
-    unless ($imap) {
-        my $err = scrub($@, $password);
+    if (($acc->{auth} // 'login') eq 'xoauth2') {
+        my $step = 0;
+        $login{Authmechanism} = 'XOAUTH2';
+        $login{Authcallback}  = sub {
+            return '' if $step++;
+            return xoauth2_initial($acc->{user}, $password);
+        };
+    }
+    my $imap = Mail::IMAPClient->new(%login);
+    unless ($imap && $imap->IsAuthenticated) {
+        my $err = _scrub_login(($imap ? $imap->LastError : $@), $acc, $password);
+        eval { $imap->logout } if $imap;
         $socket->close;
         die "IMAP login: $err";
     }
     cloexec($imap->Socket) if $imap->Socket;
 
     unless ($imap->select($folder)) {
-        my $err = scrub($imap->LastError, $password);
+        my $err = _scrub_login($imap->LastError, $acc, $password);
         eval { $imap->logout };
         $socket->close;
         die "SELECT $folder: $err";
@@ -1089,6 +1131,7 @@ sub _session_key {
         $acc->{user}           // '',
         $acc->{pass}           // '',
         $acc->{pass_cmd}       // '',
+        $acc->{auth}           // 'login',
         $acc->{mbsync_channel} // '',
     );
 }
@@ -1276,6 +1319,7 @@ sub info_lines {
             $line .= " server $acc->{server}" if ($acc->{server} // '') ne '';
             $line .= " channel $acc->{mbsync_channel}"
                 if ($acc->{mbsync_channel} // '') ne '';
+            $line .= ' auth xoauth2' if ($acc->{auth} // '') eq 'xoauth2';
             push @lines, $line;
             next;
         }
@@ -1287,6 +1331,7 @@ sub info_lines {
         my $mode = @modes ? join(', ', @modes) : ($acc->{disabled} ? 'disabled' : 'down');
         $mode .= ' disabled' if $acc->{disabled} && @modes;
         my $line = "[$name] $mode server $acc->{server} channel $acc->{mbsync_channel}";
+        $line .= ' auth xoauth2' if ($acc->{auth} // '') eq 'xoauth2';
         if ($mode eq 'down') {
             my $wait = int(($acc->{next_try} // 0) - $now);
             $wait = 0 if $wait < 0;
