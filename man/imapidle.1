@@ -22,7 +22,7 @@
 .Nd watch IMAP mailboxes and run mbsync
 .Sh SYNOPSIS
 .Nm imapidle
-.Op Fl d
+.Op Fl dv
 .Op Fl c Ar file
 .Sh DESCRIPTION
 .Nm
@@ -101,6 +101,16 @@ Do not double-fork.
 Copy each log line to standard error as well as
 .Xr syslog 3 .
 Use this to watch a run.
+.It Fl v
+Log the IMAP keepalive lines.
+Those are
+.Ql * OK Still here
+and the notice that
+.Cm IDLE
+was armed again.
+They are omitted by default.
+The flag applies when the process is a daemon and with
+.Fl d .
 .El
 .Pp
 An unknown certificate is stored in
@@ -152,7 +162,16 @@ The child then waits for the largest
 .Va wait
 of the folders in the batch, then replaces itself with
 .Sy mbsync .
-A non-zero exit is logged.
+When that process exits, one line names the command, the pid, and
+the exit status or the signal.
+The same line carries the figures
+.Xr time 1
+.Fl l
+prints: real, user, and system seconds, the maximum resident set
+size in kilobytes, page reclaims, page faults, block input, block
+output, and voluntary and involuntary context switches.
+A zero exit is informational.
+Any other exit is a warning.
 The IMAP loop does not wait for
 .Sy mbsync
 to finish.
@@ -211,9 +230,15 @@ runs for one folder.
 A folder that has never been included in a run, or whose minimum time
 since that run has already passed, is ready: the next event starts the
 5 second channel wait described above.
+A continuation or a tagged reply is logged and does not schedule a
+run.
 A server keepalive such as
-.Ql * OK Still here ,
-a continuation, or a tagged reply is logged and does not schedule a run.
+.Ql * OK Still here
+and the notice that
+.Cm IDLE
+was armed again are logged only with
+.Fl v .
+They do not schedule a run either.
 .Pp
 An event that arrives before the minimum time has passed is kept.
 When that time expires, the folder is scheduled on the next wake.

@@ -34,6 +34,7 @@ my $CONFIG_DIR;
 my $CONFIG_FILE;
 my $KNOWN_HOSTS;
 my $FOREGROUND = 0;
+my $VERBOSE    = 0;
 my $LOG_OPEN   = 0;
 
 my %accounts;
@@ -72,7 +73,7 @@ sub log_warn  { log_line(LOG_WARNING, $_[0]); }
 sub log_error { log_line(LOG_ERR,     $_[0]); }
 
 sub usage {
-    print STDERR "usage: imapidle [-d] [-c file]\n";
+    print STDERR "usage: imapidle [-dv] [-c file]\n";
     exit 1;
 }
 
@@ -925,21 +926,102 @@ sub restart_idle {
         return 0;
     }
     $conn->{last_idle} = time();
-    log_info("[$conn->{name}] IDLE re-armed");
+    note_idle_rearmed($conn->{name});
     return 1;
 }
 
+# * OK Still here and the IDLE re-arm notice are the 30s keepalive.
+# -v logs them. Other server lines stay.
+sub _keepalive_line {
+    my ($line) = @_;
+    return 0 unless defined $line;
+    return $line =~ /^\*\s+OK\s+Still here\b/i;
+}
+
+sub trace_imap_line {
+    my ($name, $line) = @_;
+    return if !$VERBOSE && _keepalive_line($line);
+    log_info("[$name] $line");
+}
+
+sub note_idle_rearmed {
+    my ($name) = @_;
+    log_info("[$name] IDLE re-armed") if $VERBOSE;
+}
+
+# OpenBSD SYS_wait4. Same rusage time -l prints, collected here so the
+# exit log is one line instead of time's stderr block.
+my $SYS_wait4 = 11;
+
+sub _time_secs {
+    my ($sec, $usec) = @_;
+    $sec  //= 0;
+    $usec //= 0;
+    my $n = $sec + ($usec / 1_000_000);
+    return $n < 0 ? 0 : $n;
+}
+
+sub format_time_stats {
+    my ($real, $ru) = @_;
+    $real //= 0;
+    $real = 0 if $real < 0;
+    $ru = "\0" x 144 unless defined $ru && length($ru) >= 144;
+    my ($u_sec, $u_usec, $s_sec, $s_usec, $maxrss, undef, undef, undef,
+        $minflt, $majflt, undef, $inblock, $oublock, undef, undef,
+        undef, $nvcsw, $nivcsw) = unpack('q18', $ru);
+    return sprintf(
+        '%.2f real %.2f user %.2f sys rss %dk minflt %d majflt %d inblock %d oublock %d nvcsw %d nivcsw %d',
+        $real,
+        _time_secs($u_sec, $u_usec),
+        _time_secs($s_sec, $s_usec),
+        $maxrss // 0,
+        $minflt // 0,
+        $majflt // 0,
+        $inblock // 0,
+        $oublock // 0,
+        $nvcsw // 0,
+        $nivcsw // 0,
+    );
+}
+
+sub child_exit_summary {
+    my ($what, $pid, $status, $real, $ru) = @_;
+    my $how;
+    if ($status == 0) {
+        $how = 'exited 0';
+    } elsif ($status & 127) {
+        $how = 'signal ' . ($status & 127);
+    } else {
+        $how = 'exit ' . ($status >> 8);
+    }
+    return "$what pid $pid $how  " . format_time_stats($real, $ru);
+}
+
+my $LAST_CHILD_EXIT = '';
+
 sub reap_children {
-    while ((my $pid = waitpid(-1, WNOHANG)) > 0) {
-        my $status = $?;
+    while (1) {
+        my $statb = pack('i', 0);
+        my $ru    = "\0" x 144;
+        my $pid   = syscall($SYS_wait4, -1, $statb, WNOHANG, $ru);
+        if (!defined $pid || $pid < 0) {
+            next if $!{EINTR};
+            last;
+        }
+        last if $pid == 0;
+        my $status = unpack('i', $statb);
         my $rec    = delete $children{$pid};
         my $what   = child_label($rec);
+        my $real   = 0;
+        if (ref $rec eq 'HASH' && defined $rec->{started}) {
+            $real = time() - $rec->{started};
+        }
+        my $line = child_exit_summary($what, $pid, $status, $real, $ru);
+        $LAST_CHILD_EXIT = $line;
         if ($status == 0) {
-            log_info("$what pid $pid exited 0");
-        } elsif ($status & 127) {
-            log_warn("$what pid $pid signal " . ($status & 127));
+            log_info($line);
         } else {
-            log_warn("$what pid $pid exit " . ($status >> 8));
+            log_warn($line);
         }
         finish_offline_channel($rec->{offline}) if ref $rec eq 'HASH';
     }
@@ -1174,6 +1256,7 @@ sub trigger_mbsync {
         label   => "mbsync $shown",
         args    => [@args],
         offline => $meta->{offline},
+        started => time(),
     };
     log_info("forked mbsync '$shown' (pid $pid)");
     return $pid;
@@ -1311,7 +1394,7 @@ sub process_notification {
                 chomp $line;
                 next if $line eq '';
                 push @lines, $line;
-                log_info("[$conn->{name}] $line");
+                trace_imap_line($conn->{name}, $line);
             }
         }
         my @mail_lines = grep { mail_event_line($_) } @lines;
@@ -1820,10 +1903,11 @@ sub run {
     my (@argv) = @_;
     local @ARGV = @argv;
     my %opt;
-    getopts('dc:', \%opt) or usage();
+    getopts('dvc:', \%opt) or usage();
     usage() if @ARGV;
 
     $FOREGROUND = $opt{d} ? 1 : 0;
+    $VERBOSE    = $opt{v} ? 1 : 0;
     if (defined $opt{c}) {
         $CONFIG_FILE = $opt{c};
     } else {
@@ -1905,6 +1989,8 @@ sub install_broken_conn_for_test {
 
 sub clear_conns_for_test { %conns = (); %sock_to_key = (); }
 sub set_foreground_for_test { $FOREGROUND = $_[0] ? 1 : 0; }
+sub set_verbose_for_test    { $VERBOSE    = $_[0] ? 1 : 0; }
+sub last_child_exit_for_test { $LAST_CHILD_EXIT }
 sub set_known_hosts_for_test { $KNOWN_HOSTS = $_[0]; }
 sub note_child_for_test {
     my ($pid, $label) = @_;
