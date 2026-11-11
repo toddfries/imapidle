@@ -32,6 +32,11 @@ channel to run when mail changes.
 The file is INI.
 One section is one account.
 The section name is a label used in log lines.
+The name
+.Pa offline
+is reserved for channels that are not IMAP accounts.
+See
+.Sx OFFLINE .
 .Pp
 The directory should be mode 0700 and the file mode 0600.
 A
@@ -61,8 +66,11 @@ A missing required key, both
 .Va pass
 and
 .Va pass_cmd ,
-a bad port, or an empty
-.Va folderN
+a bad port, an empty
+.Va folderN ,
+or a bad
+.Pa [offline]
+section
 is written to standard error.
 .Nm imapidle
 then exits 1 and does not become a daemon.
@@ -231,6 +239,60 @@ child, after the 5 second wait.
 A batch uses the largest
 .Va wait
 among its folders.
+.Sh OFFLINE
+The optional
+.Pa [offline]
+section names
+.Sy mbsync
+channels that are not IMAP accounts.
+.Nm
+runs each one as
+.Pa mbsync channel
+with no mailbox argument.
+.Va channel0 ,
+.Va channel1 ,
+and so on start at 0 and have no gaps.
+A channel name may not contain a space or a colon, and may not start
+with a dash.
+The same name twice is an error.
+.Pp
+.Va sweep
+is how many seconds that channel waits after its own
+.Sy mbsync
+exits before it runs again.
+The default is 3600.
+Each channel keeps its own clock.
+The first time the section is loaded, every channel is due and the
+runs start together.
+A run that takes longer starts its next wait later.
+A channel that is still running is not started a second time.
+The wait starts when that process exits.
+.Pp
+These runs do not pause IMAP, the 5 second combine window, or a
+different channel.
+The same channel does not overlap.
+A bare
+.Pa mbsync
+of that channel and a
+.Ar channel:box
+run wait for each other.
+.Pp
+.Va disabled
+set to
+.Cm yes
+holds the section.
+.Va sweep
+and
+.Va channelN
+are not checked while it is held.
+Any other value leaves it active.
+.Pp
+On reload, a channel that remains keeps the clock it already has.
+A channel that is new is due immediately.
+A channel that was removed is not started again.
+Changing
+.Va sweep
+applies the next time a run exits.
 .Sh FILES
 .Bl -tag -width Ds
 .It Pa ~/.config/imapidle/imapidle.conf
@@ -268,6 +330,14 @@ pass_cmd = pizauth show work
 mbsync_channel = work
 folder = INBOX
 priority = 3
+.Ed
+.Pp
+Channels that are not watched over IMAP:
+.Bd -literal -offset indent
+[offline]
+sweep = 3600
+channel0 = lists
+channel1 = archive
 .Ed
 .Sh SEE ALSO
 .Xr syslog 3 ,

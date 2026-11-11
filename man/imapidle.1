@@ -63,7 +63,7 @@ or
 re-reads the configuration file on the next wake of the loop,
 within about 30 seconds, and does not exit.
 A file that would be rejected at startup is logged and the
-running accounts stay as they are.
+running accounts and offline channels stay as they are.
 An account whose server, port, user, secret, or channel changed
 is disconnected and connected again.
 Folder names and priorities apply to the connection already open.
@@ -79,9 +79,9 @@ A daemonized process writes the same lines to
 .Xr syslog 3
 instead.
 The lines name each account and connection, each folder's priority,
-when that folder was last synced, and any
+when that folder was last synced, any
 .Sy mbsync
-child.
+child, and each offline channel.
 A disabled account is named as disabled and has no retry time.
 On a terminal, Ctrl-T sends this signal.
 .Pp
@@ -156,6 +156,24 @@ A non-zero exit is logged.
 The IMAP loop does not wait for
 .Sy mbsync
 to finish.
+.Pp
+An optional
+.Pa [offline]
+section runs
+.Pa mbsync channel
+with no mailbox, once per listed channel.
+Those runs start together the first time the section is loaded.
+Each channel then waits
+.Va sweep
+seconds after its own process exits.
+The default is 3600 seconds.
+Channels run at the same time.
+IMAP is not paused, and a different channel is not delayed.
+A bare channel and a
+.Ar channel:box
+for that same channel do not run together.
+See
+.Sy imapidle.conf(5) .
 .Sh IDLE AND NOTIFY
 If the server advertises
 .Cm NOTIFY ,
@@ -232,8 +250,8 @@ creates it.
 .Sh EXIT STATUS
 .Ex -std imapidle
 Startup failures exit 1 before the main loop.
-That includes a missing configuration, a file with no usable account,
-and any account that lacks
+That includes a missing configuration, a file with no account and no
+offline channel, and any account that lacks
 .Va server ,
 .Va user ,
 .Va mbsync_channel ,

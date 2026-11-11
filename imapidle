@@ -40,9 +40,13 @@ my %accounts;
 my %conns;
 my %sock_to_key;
 my %children;
+my %offline_next;
+my $offline_cfg = { disabled => 0, sweep => 3600, channels => [] };
 my $select = IO::Select->new();
 my $INFO_R;
 my $INFO_W;
+my $CHLD_R;
+my $CHLD_W;
 
 sub log_line {
     my ($pri, $msg) = @_;
@@ -244,15 +248,78 @@ sub parse_folder_spec {
     };
 }
 
+sub _blank_offline {
+    return { disabled => 0, sweep => 3600, channels => [] };
+}
+
+sub _offline_usable {
+    my ($off) = @_;
+    return 0 unless $off;
+    return 1 if $off->{disabled};
+    return @{ $off->{channels} // [] } ? 1 : 0;
+}
+
+# [offline] is not an account. A bad value is pushed onto @$problems.
+sub _parse_offline_section {
+    my ($row, $problems) = @_;
+    my $empty = _blank_offline();
+    return $empty unless ref $row eq 'HASH';
+    if (_config_disabled($row->{disabled})) {
+        return { disabled => 1, sweep => 3600, channels => [] };
+    }
+
+    my $bad = sub { push @$problems, "[offline] $_[0]"; };
+    my $sweep = 3600;
+    if (exists $row->{sweep}) {
+        if (!defined $row->{sweep} || $row->{sweep} !~ /^\d+$/) {
+            $bad->('bad sweep');
+        } else {
+            $sweep = $row->{sweep} + 0;
+        }
+    }
+
+    my $max = -1;
+    for my $key (keys %$row) {
+        next unless $key =~ /^channel(\d+)$/;
+        $max = $1 + 0 if $1 > $max;
+    }
+    my (@channels, %seen);
+    if ($max >= 0) {
+        for my $i (0 .. $max) {
+            unless (exists $row->{"channel$i"}) {
+                $bad->("gap before channel$i");
+                last;
+            }
+            my $name = $row->{"channel$i"};
+            if (!defined $name || $name eq '') {
+                $bad->("empty channel$i");
+                last;
+            }
+            if ($name =~ /[[:space:]:]/ || $name =~ /^-/) {
+                $bad->("bad channel$i");
+                last;
+            }
+            if ($seen{$name}++) {
+                $bad->("duplicate channel $name");
+                last;
+            }
+            push @channels, $name;
+        }
+    }
+    return { disabled => 0, sweep => $sweep, channels => \@channels };
+}
+
 # Returns (hashref, '') or (undef, error). Does not touch %accounts.
+# The third value is the offline section, and only matters on success.
 sub parse_config_file {
     my ($file) = @_;
     my $cfg = Config::Tiny->read($file)
       or return (undef, "Cannot read $file: " . (Config::Tiny->errstr // $!));
 
     my (%fresh, @problems);
+    my $offline = _parse_offline_section($cfg->{offline}, \@problems);
     for my $section (sort keys %{$cfg}) {
-        next if $section eq '_';
+        next if $section eq '_' || $section eq 'offline';
         my $row = $cfg->{$section};
         next unless ref $row eq 'HASH';
 
@@ -349,8 +416,10 @@ sub parse_config_file {
     if (@problems) {
         return (undef, join("\n", @problems));
     }
-    return (undef, 'no usable accounts in ' . $file) unless %fresh;
-    return (\%fresh, '');
+    unless (%fresh || _offline_usable($offline)) {
+        return (undef, 'no usable accounts in ' . $file);
+    }
+    return (\%fresh, '', $offline);
 }
 
 sub _config_disabled {
@@ -398,12 +467,65 @@ sub _held_account {
 }
 
 # Returns an error string, or the empty string and fills %accounts.
+sub reset_offline_state {
+    %offline_next = ();
+    $offline_cfg = _blank_offline();
+}
+
+# $reload keeps the clock of a channel that is still listed.
+# A new channel is due immediately. The sweep wait starts at exit.
+sub install_offline {
+    my ($new, $reload) = @_;
+    $new //= _blank_offline();
+    my $old = $offline_cfg // _blank_offline();
+    if ($new->{disabled}) {
+        log_info('offline disabled') if !$reload || !$old->{disabled};
+        %offline_next = ();
+        $offline_cfg = { disabled => 1, sweep => 3600, channels => [] };
+        return;
+    }
+
+    my (%keep, @added);
+    for my $ch (@{ $new->{channels} }) {
+        if ($reload && !$old->{disabled} && exists $offline_next{$ch}) {
+            $keep{$ch} = $offline_next{$ch};
+        } else {
+            $keep{$ch} = 0;
+            push @added, $ch if $reload;
+        }
+    }
+    if ($reload) {
+        log_info('offline enabled') if $old->{disabled};
+        for my $ch (sort keys %offline_next) {
+            log_info("offline $ch removed") unless exists $keep{$ch};
+        }
+        log_info("offline $_ added") for @added;
+        my $had = !$old->{disabled} && (@{ $old->{channels} } || @{ $new->{channels} });
+        if ($had && ($old->{sweep} // 3600) != $new->{sweep}) {
+            log_info("offline sweep $new->{sweep}");
+        }
+    } elsif (@{ $new->{channels} }) {
+        log_info('offline sweep ' . $new->{sweep} . ': ' . join(' ', @{ $new->{channels} }));
+    }
+    %offline_next = %keep;
+    $offline_cfg = {
+        disabled => 0,
+        sweep    => $new->{sweep},
+        channels => [ @{ $new->{channels} } ],
+    };
+}
+
 sub load_config {
     my ($file) = @_;
-    my ($fresh, $err) = parse_config_file($file);
+    my ($fresh, $err, $off) = parse_config_file($file);
     %accounts = ();
-    return $err if $err || !$fresh;
+    if ($err || !$fresh) {
+        reset_offline_state();
+        return $err if $err;
+        return 'empty config';
+    }
     %accounts = %$fresh;
+    install_offline($off, 0);
     _log_loaded_account($_) for sort keys %accounts;
     return '';
 }
@@ -810,7 +932,8 @@ sub restart_idle {
 sub reap_children {
     while ((my $pid = waitpid(-1, WNOHANG)) > 0) {
         my $status = $?;
-        my $what   = delete $children{$pid} // 'child';
+        my $rec    = delete $children{$pid};
+        my $what   = child_label($rec);
         if ($status == 0) {
             log_info("$what pid $pid exited 0");
         } elsif ($status & 127) {
@@ -818,6 +941,7 @@ sub reap_children {
         } else {
             log_warn("$what pid $pid exit " . ($status >> 8));
         }
+        finish_offline_channel($rec->{offline}) if ref $rec eq 'HASH';
     }
 }
 
@@ -917,6 +1041,9 @@ sub take_due_batches {
         next unless defined $deadline && $deadline <= $now;
         my @folders = sort keys %{ $batch{$channel}{boxes} // {} };
         next unless @folders;
+        # A bare channel and channel:box are one mbsync. Leave the batch
+        # until that process exits; the gap clock starts at the later spawn.
+        next if channel_busy($channel);
         my $wait = 0;
         for my $folder (@folders) {
             my $id = _box_id($channel, $folder);
@@ -956,6 +1083,7 @@ sub next_schedule_delay {
         $wait = $d if !defined $wait || $d < $wait;
     }
     for my $channel (keys %batch) {
+        next if channel_busy($channel);
         my $deadline = $batch{$channel}{deadline};
         next unless defined $deadline;
         my $d = $deadline - $now;
@@ -971,20 +1099,67 @@ sub schedule_deadline {
     return $batch{$channel}{deadline};
 }
 
+sub _channel_of_target {
+    my ($arg) = @_;
+    return unless defined $arg && $arg ne '';
+    my ($ch) = split /:/, $arg, 2;
+    return if !defined $ch || $ch eq '';
+    return $ch;
+}
+
+sub child_label {
+    my ($rec) = @_;
+    return 'child' unless defined $rec;
+    return $rec unless ref $rec;
+    my $label = $rec->{label} // '';
+    return $label eq '' ? 'child' : $label;
+}
+
+sub child_channels {
+    my ($rec) = @_;
+    my @args;
+    if (ref $rec eq 'HASH' && @{ $rec->{args} // [] }) {
+        @args = @{ $rec->{args} };
+    } else {
+        my $label = child_label($rec);
+        $label =~ s/^mbsync\s+//;
+        @args = split / /, $label if $label ne '' && $label ne 'child';
+    }
+    my %ch;
+    for my $arg (@args) {
+        my $ch = _channel_of_target($arg);
+        $ch{$ch} = 1 if defined $ch;
+    }
+    return keys %ch;
+}
+
+sub channel_busy {
+    my ($channel) = @_;
+    return 0 unless defined $channel && $channel ne '';
+    for my $pid (keys %children) {
+        for my $ch (child_channels($children{$pid})) {
+            return 1 if $ch eq $channel;
+        }
+    }
+    return 0;
+}
+
 sub trigger_mbsync {
+    my $meta = (ref($_[-1]) eq 'HASH') ? pop @_ : {};
     my ($wait, @args) = @_;
     $wait //= 0;
-    return unless @args;
+    return 0 unless @args;
     my $shown = join(' ', @args);
     my $pid = fork();
     if (!defined $pid) {
         log_error("fork mbsync '$shown' failed: $!");
-        return;
+        return 0;
     }
     if ($pid == 0) {
         $SIG{PIPE} = 'IGNORE';
         $SIG{HUP}  = 'DEFAULT';
         $SIG{INFO} = 'DEFAULT';
+        $SIG{CHLD} = 'DEFAULT';
         $SIG{TERM} = 'DEFAULT';
         $SIG{INT}  = 'DEFAULT';
         close_extra_fds();
@@ -995,8 +1170,68 @@ sub trigger_mbsync {
         exec '/usr/local/bin/mbsync', @args
             or _exit(1);
     }
-    $children{$pid} = "mbsync $shown";
+    $children{$pid} = {
+        label   => "mbsync $shown",
+        args    => [@args],
+        offline => $meta->{offline},
+    };
     log_info("forked mbsync '$shown' (pid $pid)");
+    return $pid;
+}
+
+# Each offline channel is due on its own. sweep seconds are counted from
+# the exit of that channel's process, not from the start.
+sub due_offline_channels {
+    my ($now) = @_;
+    $now //= time();
+    return () if $offline_cfg->{disabled};
+    my @due;
+    for my $ch (@{ $offline_cfg->{channels} // [] }) {
+        next unless exists $offline_next{$ch};
+        next if ($offline_next{$ch} // 0) > $now;
+        next if channel_busy($ch);
+        push @due, $ch;
+    }
+    return @due;
+}
+
+sub finish_offline_channel {
+    my ($ch, $now) = @_;
+    $now //= time();
+    return unless defined $ch && $ch ne '';
+    return if $offline_cfg->{disabled};
+    return unless exists $offline_next{$ch};
+    my $sweep = $offline_cfg->{sweep} // 3600;
+    $offline_next{$ch} = $now + $sweep;
+    log_info("offline $ch next in ${sweep}s");
+}
+
+sub pump_offline {
+    my ($now) = @_;
+    $now //= time();
+    return if $offline_cfg->{disabled};
+    for my $ch (due_offline_channels($now)) {
+        my $pid = trigger_mbsync(0, $ch, { offline => $ch });
+        if (!$pid) {
+            my $sweep = $offline_cfg->{sweep} // 3600;
+            $sweep = 1 if $sweep < 1;
+            $offline_next{$ch} = $now + $sweep;
+        }
+    }
+}
+
+sub next_offline_delay {
+    my ($now) = @_;
+    return if $offline_cfg->{disabled};
+    my $wait;
+    for my $ch (@{ $offline_cfg->{channels} // [] }) {
+        next unless exists $offline_next{$ch};
+        next if channel_busy($ch);
+        my $d = ($offline_next{$ch} // 0) - $now;
+        $d = 0 if $d < 0;
+        $wait = $d if !defined $wait || $d < $wait;
+    }
+    return $wait;
 }
 
 sub pump_schedule {
@@ -1005,6 +1240,7 @@ sub pump_schedule {
     for my $job (due_mbsync_jobs($now)) {
         trigger_mbsync($job->{wait}, @{ $job->{args} });
     }
+    pump_offline($now);
 }
 
 # Server keepalive and command replies are not mail. EXISTS, EXPUNGE,
@@ -1167,6 +1403,8 @@ sub loop_timeout {
     }
     my $sched = next_schedule_delay($now);
     $wait = $sched if defined $sched && $sched < $wait;
+    my $off = next_offline_delay($now);
+    $wait = $off if defined $off && $off < $wait;
     return $wait;
 }
 
@@ -1241,7 +1479,7 @@ sub reload_config_now {
         log_error('reload kept the previous config: no config file');
         return 'no config file';
     }
-    my ($fresh, $err) = parse_config_file($file);
+    my ($fresh, $err, $off) = parse_config_file($file);
     if ($err || !$fresh) {
         $err //= 'empty config';
         log_error("reload kept the previous config: $err");
@@ -1307,6 +1545,7 @@ sub reload_config_now {
             log_info("[$name] folders updated");
         }
     }
+    install_offline($off, 1);
     log_info('config reloaded');
     return '';
 }
@@ -1348,12 +1587,37 @@ sub install_info_signal {
     POSIX::sigaction($sig, $sa) or die "sigaction INFO: $!";
 }
 
-sub _drain_info {
-    return unless defined $INFO_R;
+sub _drain_fd {
+    my ($fh) = @_;
+    return unless defined $fh;
     while (1) {
-        my $n = sysread($INFO_R, my $buf, 64);
+        my $n = sysread($fh, my $buf, 64);
         last if !defined $n || $n == 0;
     }
+}
+
+sub _drain_info { _drain_fd($INFO_R); }
+
+sub _poke_chld {
+    return unless defined $CHLD_W;
+    syswrite($CHLD_W, 'x');
+}
+
+# A finished mbsync starts its sweep clock at exit, so the loop wakes
+# instead of waiting out the select timeout to reap.
+sub install_chld_signal {
+    pipe($CHLD_R, $CHLD_W) or die "chld pipe: $!";
+    cloexec($CHLD_R);
+    cloexec($CHLD_W);
+    for my $fh ($CHLD_R, $CHLD_W) {
+        my $flags = fcntl($fh, F_GETFL, 0);
+        fcntl($fh, F_SETFL, ($flags // 0) | O_NONBLOCK) if defined $flags;
+    }
+    $select->add($CHLD_R);
+    my $sig = _signal_number('CHLD');
+    die "SIGCHLD is not available\n" unless defined $sig;
+    my $sa = POSIX::SigAction->new(\&_poke_chld, POSIX::SigSet->new(), SA_RESTART);
+    POSIX::sigaction($sig, $sa) or die "sigaction CHLD: $!";
 }
 
 sub info_lines {
@@ -1393,8 +1657,31 @@ sub info_lines {
             push @lines, _folder_info_line($name, $acc, $folder, $now);
         }
     }
+    push @lines, _offline_info_lines($now);
     for my $pid (@kids) {
-        push @lines, "child pid $pid $children{$pid}";
+        push @lines, 'child pid ' . $pid . ' ' . child_label($children{$pid});
+    }
+    return @lines;
+}
+
+sub _offline_info_lines {
+    my ($now) = @_;
+    return () unless $offline_cfg;
+    return ('offline disabled') if $offline_cfg->{disabled};
+    my @lines;
+    my $sweep = $offline_cfg->{sweep} // 3600;
+    for my $ch (@{ $offline_cfg->{channels} // [] }) {
+        my $state;
+        if (channel_busy($ch)) {
+            $state = 'running';
+        } elsif (!exists $offline_next{$ch} || $offline_next{$ch} <= $now) {
+            $state = 'due';
+        } else {
+            my $in = int($offline_next{$ch} - $now);
+            $in = 0 if $in < 0;
+            $state = "next ${in}s";
+        }
+        push @lines, "offline $ch sweep ${sweep}s $state";
     }
     return @lines;
 }
@@ -1439,6 +1726,7 @@ sub report_info {
 }
 
 sub one_iteration {
+    _drain_fd($CHLD_R);
     reap_children();
     apply_reload();
     pump_schedule();
@@ -1448,6 +1736,11 @@ sub one_iteration {
     # Drain ready sockets before housekeeping sends DONE or NOOP.
     my $want_info = 0;
     for my $sock (@ready) {
+        if (defined $CHLD_R && defined fileno($sock) && fileno($sock) == fileno($CHLD_R)) {
+            _drain_fd($CHLD_R);
+            reap_children();
+            next;
+        }
         if (defined $INFO_R && defined fileno($sock) && fileno($sock) == fileno($INFO_R)) {
             $want_info = 1;
             next;
@@ -1558,6 +1851,7 @@ sub run {
     }
 
     daemonize() unless $FOREGROUND;
+    install_chld_signal();
     main_loop();
 }
 
@@ -1612,8 +1906,34 @@ sub install_broken_conn_for_test {
 sub clear_conns_for_test { %conns = (); %sock_to_key = (); }
 sub set_foreground_for_test { $FOREGROUND = $_[0] ? 1 : 0; }
 sub set_known_hosts_for_test { $KNOWN_HOSTS = $_[0]; }
-sub note_child_for_test { $children{ $_[0] } = $_[1]; }
+sub note_child_for_test {
+    my ($pid, $label) = @_;
+    my $text = defined $label ? $label : 'child';
+    my @args;
+    my $body = $text;
+    if ($body =~ s/^mbsync\s+//) {
+        @args = split / /, $body;
+        $text = 'mbsync ' . join(' ', @args);
+    }
+    $children{$pid} = {
+        label => $text,
+        args  => \@args,
+    };
+}
 sub clear_children_for_test { %children = (); }
+sub offline_snapshot_for_test {
+    return {
+        disabled => $offline_cfg->{disabled} ? 1 : 0,
+        sweep    => $offline_cfg->{sweep},
+        channels => [ @{ $offline_cfg->{channels} // [] } ],
+        next     => { %offline_next },
+    };
+}
+sub set_offline_next_for_test {
+    my ($ch, $when) = @_;
+    return unless exists $offline_next{$ch};
+    $offline_next{$ch} = $when;
+}
 sub set_next_try_for_test {
     my ($name, $when) = @_;
     return unless $accounts{$name};
