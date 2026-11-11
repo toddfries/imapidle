@@ -1117,6 +1117,28 @@ sub child_exit_summary {
 
 my $LAST_CHILD_EXIT = '';
 
+# Real seconds for one mbsync argv. The key is that command line.
+# n and total are kept, and the average is total/n after this run.
+my %MBSYNC_REAL;
+
+sub mbsync_cli {
+    my ($rec) = @_;
+    return unless ref $rec eq 'HASH' && ref $rec->{args} eq 'ARRAY' && @{ $rec->{args} };
+    return join("\0", @{ $rec->{args} });
+}
+
+sub note_mbsync_real {
+    my ($cli, $real) = @_;
+    return unless defined $cli && $cli ne '';
+    $real = 0 if !defined $real || $real < 0;
+    my $row = $MBSYNC_REAL{$cli} //= { n => 0, total => 0 };
+    $row->{n}++;
+    $row->{total} += $real;
+    return sprintf('(x%d avg %f)', $row->{n}, $row->{total} / $row->{n});
+}
+
+sub reset_mbsync_real_for_test { %MBSYNC_REAL = (); }
+
 sub reap_children {
     while (1) {
         my $statb = pack('i', 0);
@@ -1135,6 +1157,8 @@ sub reap_children {
             $real = time() - $rec->{started};
         }
         my $line = child_exit_summary($what, $pid, $status, $real, $ru);
+        my $avg  = note_mbsync_real(mbsync_cli($rec), $real);
+        $line .= " $avg" if defined $avg;
         $LAST_CHILD_EXIT = $line;
         if ($status == 0) {
             log_info($line);
