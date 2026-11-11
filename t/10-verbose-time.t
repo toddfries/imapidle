@@ -33,7 +33,7 @@ my $kept = capture(sub {
     trace_imap_line('acct', '* 1 EXISTS');
     trace_imap_line('acct', 'A001 OK IDLE completed');
 });
-like($kept, qr/\[acct\] \* 1 EXISTS/, 'EXISTS is still logged');
+like($kept, qr/acct: \* 1 EXISTS/, 'EXISTS is still logged');
 like($kept, qr/A001 OK IDLE completed/, 'a tagged reply is still logged');
 
 set_verbose_for_test(1);
@@ -41,8 +41,8 @@ my $loud = capture(sub {
     trace_imap_line('acct', '* OK Still here');
     note_idle_rearmed('acct');
 });
-like($loud, qr/\[acct\] \* OK Still here/, '-v logs the server keepalive');
-like($loud, qr/\[acct\] IDLE re-armed/, '-v logs the re-arm notice');
+like($loud, qr/acct: \* OK Still here/, '-v logs the server keepalive');
+like($loud, qr/acct: IDLE re-armed/, '-v logs the re-arm notice');
 set_verbose_for_test(0);
 
 my $ru = pack('q18',
@@ -71,14 +71,21 @@ like($sig, qr/^mbsync ch pid 9 signal 15  /, 'a signal status names the signal')
 set_foreground_for_test(0);
 clear_children_for_test();
 my $true_line = reap_one('/usr/bin/true', 'mbsync true');
-like($true_line, qr/^mbsync true pid \d+ exited 0  \d+\.\d\d real \d+\.\d\d user \d+\.\d\d sys rss \d+k minflt \d+ majflt \d+ inblock \d+ oublock \d+ nvcsw \d+ nivcsw \d+$/,
+like($true_line, qr/^true: mbsync pid \d+ exited 0  \d+\.\d\d real \d+\.\d\d user \d+\.\d\d sys rss \d+k minflt \d+ majflt \d+ inblock \d+ oublock \d+ nvcsw \d+ nivcsw \d+$/,
     'wait4 records a successful child on one line');
 my ($rss) = $true_line =~ /rss (\d+)k/;
 cmp_ok($rss, '>', 0, 'the resident set came from the child');
 
 my $exit_line = reap_one('/usr/bin/perl', 'mbsync bad', '-e', 'exit 3');
-like($exit_line, qr/^mbsync bad pid \d+ exit 3  \d+\.\d\d real \d+\.\d\d user \d+\.\d\d sys rss \d+k /,
+like($exit_line, qr/^bad: mbsync pid \d+ exit 3  \d+\.\d\d real \d+\.\d\d user \d+\.\d\d sys rss \d+k /,
     'a non-zero child keeps the same stats tail');
+is(mbsync_phrase('forked mbsync', 'fdc-list:INBOX.2026-11'),
+    'fdc-list: forked mbsync INBOX.2026-11',
+    'a fork line names the channel once');
+is(mbsync_phrase('mbsync', 'fdc-list:INBOX.2026-11', 'fdc-list:openbsd.2026-11'),
+    'fdc-list: mbsync INBOX.2026-11 openbsd.2026-11',
+    'mailboxes follow the channel');
+is(mbsync_phrase('mbsync', 'knf'), 'knf: mbsync', 'a bare channel has no mailbox');
 
 done_testing;
 

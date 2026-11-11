@@ -281,16 +281,16 @@ sub server_uses_idle {
 sub _log_discovery {
     my ($name, $notify, $id, $folders) = @_;
     if ($notify eq 'absent') {
-        log_info("[$name] server does not advertise NOTIFY, using IDLE");
+        log_info("$name: server does not advertise NOTIFY, using IDLE");
         return;
     }
-    log_info("[$name] server identified as $id") if defined $id && $id ne '';
+    log_info("$name: server identified as $id") if defined $id && $id ne '';
     if ($notify eq 'rejected') {
-        log_warn("[$name] NOTIFY rejected, falling back to IDLE");
+        log_warn("$name: NOTIFY rejected, falling back to IDLE");
         return;
     }
     my $n = $folders ? scalar(@$folders) : 0;
-    log_info("[$name] NOTIFY active ($n folder(s) in the personal namespace)");
+    log_info("$name: NOTIFY active ($n folder(s) in the personal namespace)");
 }
 
 sub remember_discovery {
@@ -571,7 +571,7 @@ sub install_offline {
     $new //= _blank_offline();
     my $old = $offline_cfg // _blank_offline();
     if ($new->{disabled}) {
-        log_info('offline disabled') if !$reload || !$old->{disabled};
+        log_info('offline: disabled') if !$reload || !$old->{disabled};
         %offline_next = ();
         $offline_cfg = { disabled => 1, sweep => 3600, channels => [] };
         return;
@@ -587,17 +587,17 @@ sub install_offline {
         }
     }
     if ($reload) {
-        log_info('offline enabled') if $old->{disabled};
+        log_info('offline: enabled') if $old->{disabled};
         for my $ch (sort keys %offline_next) {
-            log_info("offline $ch removed") unless exists $keep{$ch};
+            log_info("$ch: offline removed") unless exists $keep{$ch};
         }
-        log_info("offline $_ added") for @added;
+        log_info("$_: offline added") for @added;
         my $had = !$old->{disabled} && (@{ $old->{channels} } || @{ $new->{channels} });
         if ($had && ($old->{sweep} // 3600) != $new->{sweep}) {
-            log_info("offline sweep $new->{sweep}");
+            log_info("offline: sweep $new->{sweep}");
         }
     } elsif (@{ $new->{channels} }) {
-        log_info('offline sweep ' . $new->{sweep} . ': ' . join(' ', @{ $new->{channels} }));
+        log_info('offline: sweep ' . $new->{sweep} . ': ' . join(' ', @{ $new->{channels} }));
     }
     %offline_next = %keep;
     $offline_cfg = {
@@ -626,12 +626,12 @@ sub _log_loaded_account {
     my ($section) = @_;
     my $acc = $accounts{$section} or return;
     if ($acc->{config_disabled}) {
-        log_info("[$section] disabled");
+        log_info("$section: disabled");
         return;
     }
     my $how = defined $acc->{pass_cmd} && $acc->{pass_cmd} ne '' ? 'pass_cmd' : 'pass';
     my $mech = ($acc->{auth} // '') eq 'xoauth2' ? ', xoauth2' : '';
-    log_info("[$section] $how$mech, mbsync $acc->{mbsync_channel}, "
+    log_info("$section: $how$mech, mbsync $acc->{mbsync_channel}, "
           . scalar(@{ $acc->{folders} }) . ' folder(s)');
 }
 
@@ -726,7 +726,7 @@ sub account_pass {
     my $acc = $accounts{$name} or return;
     if (defined $acc->{pass_cmd}) {
         my $pw = capture_pass_cmd($acc->{pass_cmd});
-        log_error("[$name] pass_cmd failed") unless defined $pw;
+        log_error("$name: pass_cmd failed") unless defined $pw;
         return $pw;
     }
     return $acc->{pass};
@@ -814,18 +814,18 @@ sub setup_notification {
         ? $known->{id}
         : detect_server_version($imap);
     my $cmd = 'NOTIFY SET (personal (MessageNew MessageExpunge MessageFlags))';
-    log_info("[$name] NOTIFY $cmd") unless $quiet;
+    log_info("$name: NOTIFY $cmd") unless $quiet;
     # tag_and_run returns a single undef on failure, which is not a response line.
     my @resp = grep { defined && $_ ne '' } $imap->tag_and_run($cmd);
     my $last = $resp[-1] // '';
     my $res  = @resp ? join(' | ', @resp) : ($imap->LastError // 'empty');
     if ($last =~ /OK/i) {
-        log_info("[$name] NOTIFY response [$res]") unless $quiet;
+        log_info("$name: NOTIFY response [$res]") unless $quiet;
         remember_discovery($name, $server, $port, 'active', $server_id, $folder_list);
         return 1;
     }
-    log_info("[$name] NOTIFY $cmd") if $quiet;
-    log_info("[$name] NOTIFY response [$res]");
+    log_info("$name: NOTIFY $cmd") if $quiet;
+    log_info("$name: NOTIFY response [$res]");
     remember_discovery($name, $server, $port, 'rejected', $server_id, $folder_list);
     return 0;
 }
@@ -865,7 +865,7 @@ sub arm_idle {
         last_success => time(),
         last_idle    => time(),
     });
-    log_info("[$name] IDLE $folder->{name} (priority $folder->{priority})");
+    log_info("$name: IDLE $folder->{name} (priority $folder->{priority})");
 }
 
 sub adopt_notify {
@@ -881,7 +881,7 @@ sub adopt_notify {
         folders      => $acc->{folders},
         last_success => time(),
     });
-    log_info("[$name] NOTIFY mode, " . scalar(@{ $acc->{folders} }) . ' folder(s)');
+    log_info("$name: NOTIFY mode, " . scalar(@{ $acc->{folders} }) . ' folder(s)');
 }
 
 sub account_covered {
@@ -904,7 +904,7 @@ sub mark_retry {
     if (!$acc->{up} && $acc->{fails} >= start_give_up()) {
         $acc->{disabled} = 1;
         $acc->{next_try} = 0;
-        log_error("[$name] disabled after $acc->{fails} failures");
+        log_error("$name: disabled after $acc->{fails} failures");
         return;
     }
     my $b = $acc->{backoff} // 5;
@@ -913,7 +913,7 @@ sub mark_retry {
     my $n = int($b * 1.5 + 0.5);
     $n = 900 if $n > 900;
     $acc->{backoff} = $n;
-    log_info("[$name] retry in ${b}s");
+    log_info("$name: retry in ${b}s");
 }
 
 sub note_success {
@@ -940,7 +940,9 @@ sub drop_conn {
     drop_socket($conn->{socket});
     my $name = $conn->{name} // '?';
     $why = scrub($why);
-    log_warn("[$name] dropping $key: $why");
+    my $what = $key;
+    $what =~ s/^\Q$name\E:// if $name ne '?';
+    log_warn("$name: dropping $what: $why");
     eval {
         if ($conn->{imap} && $conn->{mode} && $conn->{mode} eq 'IDLE' && $conn->{tag}) {
             $conn->{imap}->done($conn->{tag});
@@ -962,7 +964,7 @@ sub connect_idle_folders {
         };
         next if $ok;
         $failed = 1;
-        log_error("[$name] $folder->{name}: " . scrub($@, $password));
+        log_error("$name: $folder->{name}: " . scrub($@, $password));
     }
     return $failed ? 0 : 1;
 }
@@ -1014,14 +1016,14 @@ sub connect_account {
 sub _settle_account {
     my ($name, $ok, $err, $password) = @_;
     if (!$ok) {
-        log_error("[$name] connect failed: " . scrub($err, $password));
+        log_error("$name: connect failed: " . scrub($err, $password));
         mark_retry($name);
         return 0;
     }
     if (account_covered($name)) {
         note_success($name);
         my $channel = $accounts{$name}{mbsync_channel} // '';
-        log_info("[$name] monitoring $channel");
+        log_info("$name: monitoring $channel");
         return 1;
     }
     mark_retry($name);
@@ -1038,7 +1040,7 @@ sub restart_idle {
         1;
     };
     if (!$ok) {
-        log_warn("[$conn->{name}] idle re-arm failed: " . scrub($@));
+        log_warn("$conn->{name}: idle re-arm failed: " . scrub($@));
         return 0;
     }
     $conn->{last_idle} = time();
@@ -1057,12 +1059,12 @@ sub _keepalive_line {
 sub trace_imap_line {
     my ($name, $line) = @_;
     return if !$VERBOSE && _keepalive_line($line);
-    log_info("[$name] $line");
+    log_info("$name: $line");
 }
 
 sub note_idle_rearmed {
     my ($name) = @_;
-    log_info("[$name] IDLE re-armed") if $VERBOSE;
+    log_info("$name: IDLE re-armed") if $VERBOSE;
 }
 
 # OpenBSD SYS_wait4. Same rusage time -l prints, collected here so the
@@ -1127,7 +1129,7 @@ sub reap_children {
         last if $pid == 0;
         my $status = unpack('i', $statb);
         my $rec    = delete $children{$pid};
-        my $what   = child_label($rec);
+        my $what   = mbsync_exit_what($rec);
         my $real   = 0;
         if (ref $rec eq 'HASH' && defined $rec->{started}) {
             $real = time() - $rec->{started};
@@ -1210,11 +1212,11 @@ sub note_mail_event {
     $box_pending{$id}  = 1;
     my $last = $box_last_run{$id} // 0;
     if ($last && $now < $last + $gap) {
-        log_info("$channel:$folder event kept; next mbsync at " . ($last + $gap));
+        log_info("$channel: $folder event kept; next mbsync at " . ($last + $gap));
         return;
     }
     queue_folder($channel, $folder, $now, $now + $COMBINE_SEC);
-    log_info("$channel:$folder ready; mbsync combines until " . $batch{$channel}{deadline});
+    log_info("$channel: $folder ready; mbsync combines until " . $batch{$channel}{deadline});
 }
 
 sub promote_pending {
@@ -1227,7 +1229,7 @@ sub promote_pending {
         my $gap  = $box_gap{$id} // 0;
         next if $last && $now < $last + $gap;
         queue_folder($channel, $folder, $now, $now);
-        log_info("$channel:$folder minimum interval elapsed; mbsync scheduled");
+        log_info("$channel: $folder minimum interval elapsed; mbsync scheduled");
     }
 }
 
@@ -1342,6 +1344,46 @@ sub channel_busy {
     return 0;
 }
 
+# One channel per process. The log names that channel once, then the
+# mailboxes, so every line about it starts with "channel: ".
+sub mbsync_phrase {
+    my ($verb, @args) = @_;
+    return $verb unless @args;
+    my ($channel, @boxes);
+    for my $arg (@args) {
+        my ($ch, $box) = split /:/, $arg, 2;
+        if (!defined $ch || $ch eq '' || (defined $channel && $ch ne $channel)) {
+            return $verb . ' ' . join(' ', @args);
+        }
+        $channel = $ch;
+        push @boxes, $box if defined $box && $box ne '';
+    }
+    my $rest = @boxes ? "$verb @boxes" : $verb;
+    return "$channel: $rest";
+}
+
+sub mbsync_exit_what {
+    my ($rec) = @_;
+    my @args;
+    if (ref $rec eq 'HASH' && ref $rec->{args} eq 'ARRAY' && @{ $rec->{args} }) {
+        @args = @{ $rec->{args} };
+    } else {
+        my $label = child_label($rec);
+        return $label unless $label =~ /^mbsync\s+(\S.*)\z/;
+        @args = split / /, $1;
+    }
+    return mbsync_phrase('mbsync', @args);
+}
+
+sub child_state_line {
+    my ($pid, $rec) = @_;
+    my $what = mbsync_exit_what($rec);
+    if ($what =~ /^(\S+): mbsync(.*)\z/) {
+        return "$1: child pid $pid mbsync$2";
+    }
+    return "child pid $pid $what";
+}
+
 sub trigger_mbsync {
     my $meta = (ref($_[-1]) eq 'HASH') ? pop @_ : {};
     my ($wait, @args) = @_;
@@ -1350,7 +1392,7 @@ sub trigger_mbsync {
     my $shown = join(' ', @args);
     my $pid = fork();
     if (!defined $pid) {
-        log_error("fork mbsync '$shown' failed: $!");
+        log_error(mbsync_phrase('fork mbsync', @args) . " failed: $!");
         return 0;
     }
     if ($pid == 0) {
@@ -1374,7 +1416,7 @@ sub trigger_mbsync {
         offline => $meta->{offline},
         started => time(),
     };
-    log_info("forked mbsync '$shown' (pid $pid)");
+    log_info(mbsync_phrase('forked mbsync', @args) . " (pid $pid)");
     return $pid;
 }
 
@@ -1402,7 +1444,7 @@ sub finish_offline_channel {
     return unless exists $offline_next{$ch};
     my $sweep = $offline_cfg->{sweep} // 3600;
     $offline_next{$ch} = $now + $sweep;
-    log_info("offline $ch next in ${sweep}s");
+    log_info("$ch: offline next in ${sweep}s");
 }
 
 sub pump_offline {
@@ -1583,7 +1625,7 @@ sub housekeeping {
         next if ($accounts{$name}{next_try} // 0) > $now;
         eval { connect_account($name) };
         if ($@) {
-            log_error("[$name] reconnect: " . scrub($@));
+            log_error("$name: reconnect: " . scrub($@));
             mark_retry($name);
         }
     }
@@ -1691,7 +1733,7 @@ sub reload_config_now {
         _drop_account_conns($name, 'account removed');
         _forget_account_schedule($old);
         delete $accounts{$name};
-        log_info("[$name] removed");
+        log_info("$name: removed");
     }
 
     for my $name (sort keys %$fresh) {
@@ -1699,28 +1741,28 @@ sub reload_config_now {
         my $old = $accounts{$name};
         if (!$old) {
             $accounts{$name} = $new;
-            log_info($new->{config_disabled} ? "[$name] disabled" : "[$name] added");
+            log_info($new->{config_disabled} ? "$name: disabled" : "$name: added");
             next;
         }
         if ($new->{config_disabled}) {
             unless ($old->{config_disabled}) {
                 _drop_account_conns($name, 'disabled');
                 _forget_account_schedule($old);
-                log_info("[$name] disabled");
+                log_info("$name: disabled");
             }
             $accounts{$name} = $new;
             next;
         }
         if ($old->{config_disabled}) {
             $accounts{$name} = $new;
-            log_info("[$name] enabled");
+            log_info("$name: enabled");
             next;
         }
         if (_session_key($old) ne _session_key($new)) {
             _drop_account_conns($name, 'config changed');
             _forget_account_schedule($old);
             $accounts{$name} = $new;
-            log_info("[$name] reconnecting");
+            log_info("$name: reconnecting");
             next;
         }
         $new->{backoff}  = $old->{backoff}  // 5;
@@ -1732,7 +1774,7 @@ sub reload_config_now {
             $new->{fails}    = 0;
             $new->{backoff}  = 5;
             $new->{next_try} = 0;
-            log_info("[$name] enabled");
+            log_info("$name: enabled");
         }
         my $folders_changed = _folder_key($old) ne _folder_key($new);
         $accounts{$name} = $new;
@@ -1741,7 +1783,7 @@ sub reload_config_now {
             my %had = map { $_->{name} => 1 } @{ $old->{folders} };
             my $added = grep { !$had{ $_->{name} } } @{ $new->{folders} };
             $new->{next_try} = 0 if $added && !$conns{"$name:NOTIFY"};
-            log_info("[$name] folders updated");
+            log_info("$name: folders updated");
         }
     }
     install_offline($off, 1);
@@ -1829,7 +1871,7 @@ sub info_lines {
     for my $name (sort keys %accounts) {
         my $acc = $accounts{$name};
         if ($acc->{config_disabled}) {
-            my $line = "[$name] disabled";
+            my $line = "$name: disabled";
             $line .= " server $acc->{server}" if ($acc->{server} // '') ne '';
             $line .= " channel $acc->{mbsync_channel}"
                 if ($acc->{mbsync_channel} // '') ne '';
@@ -1844,7 +1886,7 @@ sub info_lines {
         }
         my $mode = @modes ? join(', ', @modes) : ($acc->{disabled} ? 'disabled' : 'down');
         $mode .= ' disabled' if $acc->{disabled} && @modes;
-        my $line = "[$name] $mode server $acc->{server} channel $acc->{mbsync_channel}";
+        my $line = "$name: $mode server $acc->{server} channel $acc->{mbsync_channel}";
         $line .= ' auth xoauth2' if ($acc->{auth} // '') eq 'xoauth2';
         if ($mode eq 'down') {
             my $wait = int(($acc->{next_try} // 0) - $now);
@@ -1858,7 +1900,7 @@ sub info_lines {
     }
     push @lines, _offline_info_lines($now);
     for my $pid (@kids) {
-        push @lines, 'child pid ' . $pid . ' ' . child_label($children{$pid});
+        push @lines, child_state_line($pid, $children{$pid});
     }
     return @lines;
 }
@@ -1866,7 +1908,7 @@ sub info_lines {
 sub _offline_info_lines {
     my ($now) = @_;
     return () unless $offline_cfg;
-    return ('offline disabled') if $offline_cfg->{disabled};
+    return ('offline: disabled') if $offline_cfg->{disabled};
     my @lines;
     my $sweep = $offline_cfg->{sweep} // 3600;
     for my $ch (@{ $offline_cfg->{channels} // [] }) {
@@ -1880,7 +1922,7 @@ sub _offline_info_lines {
             $in = 0 if $in < 0;
             $state = "next ${in}s";
         }
-        push @lines, "offline $ch sweep ${sweep}s $state";
+        push @lines, "$ch: offline sweep ${sweep}s $state";
     }
     return @lines;
 }
@@ -1916,7 +1958,7 @@ sub _folder_info_line {
             $bits .= " combine ${in}s";
         }
     }
-    return "[$name] $folder->{name} $bits";
+    return "$name: $folder->{name} $bits";
 }
 
 sub report_info {
@@ -2048,7 +2090,7 @@ sub run {
 
     for my $name (sort keys %accounts) {
         eval { connect_account($name) };
-        log_error("[$name] startup: " . scrub($@)) if $@;
+        log_error("$name: startup: " . scrub($@)) if $@;
     }
 
     daemonize() unless $FOREGROUND;

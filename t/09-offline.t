@@ -85,7 +85,7 @@ EOF
 is(load_config($held), '', 'disabled = yes does not check the offline keys');
 is(offline_snapshot_for_test()->{disabled}, 1, 'the section is held');
 is_deeply([due_offline_channels(1000)], [], 'a held section starts nothing');
-is_deeply([grep { /^offline / } info_lines(1000)], ['offline disabled'], 'state names the held section');
+is_deeply([grep { /^offline: / } info_lines(1000)], ['offline: disabled'], 'state names the held section');
 unlink $held;
 
 my $only = write_conf(<<'EOF');
@@ -136,11 +136,11 @@ is_deeply(
     'every offline channel is due on the first load',
 );
 is_deeply(
-    [grep { /^offline / } info_lines(1000)],
+    [grep { /: offline sweep / } info_lines(1000)],
     [
-        'offline gm-ctf sweep 3600s due',
-        'offline knf sweep 3600s due',
-        'offline knfmobile sweep 3600s due',
+        'gm-ctf: offline sweep 3600s due',
+        'knf: offline sweep 3600s due',
+        'knfmobile: offline sweep 3600s due',
     ],
     'state shows each channel due',
 );
@@ -154,8 +154,8 @@ is_deeply(
     'a running channel does not start a second copy',
 );
 is_deeply(
-    [grep { /^offline gm-ctf / } info_lines(1000)],
-    ['offline gm-ctf sweep 3600s running'],
+    [grep { /^gm-ctf: offline / } info_lines(1000)],
+    ['gm-ctf: offline sweep 3600s running'],
     'state shows the running channel',
 );
 note_mail_event('gm-ctf', 'INBOX', 420, 0, 1000);
@@ -196,8 +196,8 @@ is_deeply([due_offline_channels(4609)], ['gm-ctf'], 'only the channel whose wait
 is_deeply([due_offline_channels(4618)], [qw(gm-ctf knf)], 'each clock stays independent');
 is_deeply([due_offline_channels(4640)], [qw(gm-ctf knf knfmobile)], 'a later exit is due later');
 is_deeply(
-    [grep { /^offline gm-ctf / } info_lines(1109)],
-    ['offline gm-ctf sweep 3600s next 3500s'],
+    [grep { /^gm-ctf: offline / } info_lines(1109)],
+    ['gm-ctf: offline sweep 3600s next 3500s'],
     'state shows the remaining wait',
 );
 

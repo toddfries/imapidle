@@ -155,12 +155,12 @@ ok(loaded_account('park')->{config_disabled}, 'yes holds the section');
 ok(loaded_account('off')->{config_disabled}, 'Yes holds the section');
 is(connect_account('park'), 0, 'a held section is not connected');
 is(connect_account('off'), 0, 'a held section with keys is not connected');
-my @held_lines = grep { /\] disabled/ } info_lines(time());
+my @held_lines = grep { /: disabled/ } info_lines(time());
 is_deeply(
     \@held_lines,
     [
-        '[off] disabled server imap.example.com channel other',
-        '[park] disabled',
+        'off: disabled server imap.example.com channel other',
+        'park: disabled',
     ],
     'state names a config-disabled section',
 );
@@ -185,7 +185,7 @@ EOF
 is(load_config($xo), '', 'xoauth2 account loads');
 is(loaded_account('ma')->{auth}, 'xoauth2', 'auth XOAUTH2 is stored');
 my @xo = info_lines(time());
-like($xo[1], qr/^\[ma\] down server outlook\.example\.com channel ma-ttf auth xoauth2 retry /,
+like($xo[1], qr/^ma: down server outlook\.example\.com channel ma-ttf auth xoauth2 retry /,
     'state names xoauth2');
 unlink $xo;
 

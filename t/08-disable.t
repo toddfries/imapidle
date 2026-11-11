@@ -57,20 +57,20 @@ my $limit = start_give_up();
 my $gave_up = stderr_of(sub {
     mark_retry('acct') for 1 .. $limit;
 });
-like($gave_up, qr/\[acct\] retry in 5s/, 'the first failure is retried');
-like($gave_up, qr/\[acct\] disabled after $limit failures/, 'the limit disables the account');
+like($gave_up, qr/acct: retry in 5s/, 'the first failure is retried');
+like($gave_up, qr/acct: disabled after $limit failures/, 'the limit disables the account');
 unlike($gave_up, qr/retry in 27s/, 'the disabling failure does not schedule another retry');
 ok(loaded_account('acct')->{disabled}, 'the account is disabled');
 is(account_next_try('acct'), 0, 'a disabled account has no retry time');
 
 my @info = info_lines(time());
-is($info[1], '[acct] disabled server imap.example.com channel ch', 'state names the account disabled');
+is($info[1], 'acct: disabled server imap.example.com channel ch', 'state names the account disabled');
 is(loop_timeout(), 30, 'a disabled account does not shorten the wait');
 
 my $enabled = stderr_of(sub {
     is(reload_config_now($path), '', 'reload accepts the same file');
 });
-like($enabled, qr/\[acct\] enabled/, 'SIGHUP enables the account');
+like($enabled, qr/acct: enabled/, 'SIGHUP enables the account');
 ok(!loaded_account('acct')->{disabled}, 'the account is no longer disabled');
 is(loaded_account('acct')->{fails}, 0, 'the failure count starts over');
 
@@ -81,7 +81,7 @@ stderr_of(sub {
 ok(!loaded_account('acct')->{disabled}, 'an account that has monitored keeps retrying');
 ok(account_next_try('acct') > time(), 'that account still has a retry time');
 my @later = info_lines(time());
-like($later[1], qr/^\[acct\] down server imap\.example\.com channel ch retry \d+s$/,
+like($later[1], qr/^acct: down server imap\.example\.com channel ch retry \d+s$/,
     'a retrying account is down, not disabled');
 
 clear_conns_for_test();
@@ -93,7 +93,7 @@ stderr_of(sub {
 });
 ok(conn_exists_for_test('acct:INBOX'), 'a connection already up is left in place');
 my @partial = info_lines(time());
-is($partial[1], '[acct] IDLE INBOX disabled server imap.example.com channel ch',
+is($partial[1], 'acct: IDLE INBOX disabled server imap.example.com channel ch',
     'a partial account shows the open mailbox and disabled');
 
 set_foreground_for_test(0);
@@ -130,19 +130,19 @@ set_foreground_for_test(1);
 my $flagged = stderr_of(sub {
     is(reload_config_now($off), '', 'reload accepts disabled = yes');
 });
-like($flagged, qr/\[acct\] disabled/, 'the flag disables the running section');
+like($flagged, qr/acct: disabled/, 'the flag disables the running section');
 ok(!conn_exists_for_test('acct:INBOX'), 'the open connection is dropped');
 ok(loaded_account('acct')->{config_disabled}, 'the flag stays on the account');
 my $stay = stderr_of(sub {
     is(reload_config_now($off), '', 'reloading the flag again is accepted');
 });
-unlike($stay, qr/\[acct\] enabled/, 'the flag is not cleared by another reload');
+unlike($stay, qr/acct: enabled/, 'the flag is not cleared by another reload');
 ok(loaded_account('acct')->{config_disabled}, 'the section remains disabled');
 set_foreground_for_test(1);
 my $back = stderr_of(sub {
     is(reload_config_now($on), '', 'removing yes enables the section');
 });
-like($back, qr/\[acct\] enabled/, 'removing the flag is logged');
+like($back, qr/acct: enabled/, 'removing the flag is logged');
 ok(!loaded_account('acct')->{disabled}, 'the section is active again');
 is(account_next_try('acct'), 0, 'the enabled section is due to connect');
 set_foreground_for_test(0);
