@@ -305,6 +305,21 @@ and the fingerprint.
 A retired line adds the GMT time it was replaced, as
 .Ql YYYYMMDDTHH:MM:SSZ .
 One line per host has no time.
+.It Pa ~/.config/imapidle/learned
+What each server did with
+.Cm NOTIFY .
+A line is
+.Pa server:port ,
+then
+.Cm absent ,
+.Cm rejected ,
+or
+.Cm active .
+A rejected or active server may add the name it reported.
+Delete a line to probe that server again.
+The file mode is 0600 when
+.Nm imapidle
+creates it.
 .El
 .Sh EXAMPLES
 A password stored in the file, with a hot inbox and a lazy archive:

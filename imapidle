@@ -33,6 +33,7 @@ use Time::HiRes qw(time);
 my $CONFIG_DIR;
 my $CONFIG_FILE;
 my $KNOWN_HOSTS;
+my $LEARNED;
 my $FOREGROUND = 0;
 my $VERBOSE    = 0;
 my $LOG_OPEN   = 0;
@@ -219,6 +220,96 @@ sub approve_fingerprint {
     save_known_hosts(%certs);
     _announce_cert($hostkey, 'change', $fingerprint, $old);
     return 1;
+}
+
+# What a server did with NOTIFY. Absent and rejected stay on IDLE and
+# are not probed again. Delete the host's line to learn it again.
+sub load_learned {
+    my %rows;
+    return %rows unless defined $LEARNED && -f $LEARNED;
+    open my $fh, '<', $LEARNED or return %rows;
+    while (<$fh>) {
+        chomp;
+        next if /^\s*#/ || /^\s*$/;
+        my ($host, $notify, $id) = split /\s+/, $_, 3;
+        next unless defined $host && $host ne '';
+        next unless defined $notify && $notify =~ /^(absent|rejected|active)\z/;
+        $rows{$host} = { notify => $notify, id => $id // '' };
+    }
+    close $fh;
+    return %rows;
+}
+
+sub save_learned {
+    my %rows = @_;
+    return unless defined $LEARNED;
+    my $old = umask 077;
+    open my $fh, '>', $LEARNED or do {
+        umask $old;
+        log_error("Cannot write $LEARNED: $!");
+        return;
+    };
+    print $fh "# imapidle learned\n";
+    print $fh "# server:port\tnotify\tid\n";
+    print $fh "# Delete a host line to probe that server again.\n\n";
+    for my $host (sort keys %rows) {
+        my $row = $rows{$host};
+        my $id  = $row->{id} // '';
+        if ($id ne '') {
+            print $fh "$host\t$row->{notify}\t$id\n";
+        } else {
+            print $fh "$host\t$row->{notify}\n";
+        }
+    }
+    close $fh;
+    umask $old;
+}
+
+sub learned_row {
+    my ($server, $port) = @_;
+    return unless defined $server && defined $port;
+    my %rows = load_learned();
+    return $rows{"$server:$port"};
+}
+
+sub server_uses_idle {
+    my ($server, $port) = @_;
+    my $row = learned_row($server, $port) or return 0;
+    return $row->{notify} eq 'absent' || $row->{notify} eq 'rejected';
+}
+
+sub _log_discovery {
+    my ($name, $notify, $id, $folders) = @_;
+    if ($notify eq 'absent') {
+        log_info("[$name] server does not advertise NOTIFY, using IDLE");
+        return;
+    }
+    log_info("[$name] server identified as $id") if defined $id && $id ne '';
+    if ($notify eq 'rejected') {
+        log_warn("[$name] NOTIFY rejected, falling back to IDLE");
+        return;
+    }
+    my $n = $folders ? scalar(@$folders) : 0;
+    log_info("[$name] NOTIFY active ($n folder(s) in the personal namespace)");
+}
+
+sub remember_discovery {
+    my ($name, $server, $port, $notify, $id, $folders) = @_;
+    return unless defined $server && defined $port;
+    return unless defined $notify && $notify =~ /^(absent|rejected|active)\z/;
+    $id //= '';
+    $id = '' if $id !~ /^[\w.-]+\z/;
+    my $host = "$server:$port";
+    my %rows = load_learned();
+    my $prev = $rows{$host};
+    my $same = $prev
+        && $prev->{notify} eq $notify
+        && ($prev->{id} // '') eq $id;
+    return $notify if $same;
+    $rows{$host} = { notify => $notify, id => $id };
+    save_learned(%rows);
+    _log_discovery($name, $notify, $id, $folders);
+    return $notify;
 }
 
 sub calculate_debounce {
@@ -701,30 +792,41 @@ sub detect_server_version {
 }
 
 sub setup_notification {
-    my ($name, $imap, $folder_list) = @_;
-    my @caps = $imap->capability or return 0;
-    my $has_notify = grep { uc($_) eq 'NOTIFY' } @caps;
-    if (!$has_notify) {
-        log_info("[$name] server does not advertise NOTIFY, using IDLE");
+    my ($name, $acc, $imap, $folder_list) = @_;
+    my $server = $acc->{server};
+    my $port   = $acc->{port};
+    my $known  = learned_row($server, $port);
+    if ($known && ($known->{notify} eq 'absent' || $known->{notify} eq 'rejected')) {
         return 0;
     }
+    my $quiet = $known && $known->{notify} eq 'active';
 
-    my $server_id = detect_server_version($imap);
-    log_info("[$name] server identified as $server_id");
+    if (!$quiet) {
+        my @caps = $imap->capability or return 0;
+        my $has_notify = grep { uc($_) eq 'NOTIFY' } @caps;
+        if (!$has_notify) {
+            remember_discovery($name, $server, $port, 'absent', undef, $folder_list);
+            return 0;
+        }
+    }
 
+    my $server_id = ($quiet && ($known->{id} // '') ne '')
+        ? $known->{id}
+        : detect_server_version($imap);
     my $cmd = 'NOTIFY SET (personal (MessageNew MessageExpunge MessageFlags))';
-    log_info("[$name] NOTIFY $cmd");
+    log_info("[$name] NOTIFY $cmd") unless $quiet;
     # tag_and_run returns a single undef on failure, which is not a response line.
     my @resp = grep { defined && $_ ne '' } $imap->tag_and_run($cmd);
     my $last = $resp[-1] // '';
     my $res  = @resp ? join(' | ', @resp) : ($imap->LastError // 'empty');
-    log_info("[$name] NOTIFY response [$res]");
     if ($last =~ /OK/i) {
-        my $n = $folder_list ? scalar(@$folder_list) : 0;
-        log_info("[$name] NOTIFY active ($n folder(s) in the personal namespace)");
+        log_info("[$name] NOTIFY response [$res]") unless $quiet;
+        remember_discovery($name, $server, $port, 'active', $server_id, $folder_list);
         return 1;
     }
-    log_warn("[$name] NOTIFY rejected, falling back to IDLE");
+    log_info("[$name] NOTIFY $cmd") if $quiet;
+    log_info("[$name] NOTIFY response [$res]");
+    remember_discovery($name, $server, $port, 'rejected', $server_id, $folder_list);
     return 0;
 }
 
@@ -887,9 +989,17 @@ sub connect_account {
         return $ok;
     }
 
+    if (server_uses_idle($acc->{server}, $acc->{port})) {
+        my $idle_ok = eval {
+            connect_idle_folders($name, \@need, $password) or die 'IDLE failed';
+            1;
+        };
+        return _settle_account($name, $idle_ok, $@, $password);
+    }
+
     my $ok = eval {
         my ($socket, $imap) = create_imap_connection($name, $acc, $need[0]{name}, $password);
-        my $notify = setup_notification($name, $imap, $acc->{folders});
+        my $notify = setup_notification($name, $acc, $imap, $acc->{folders});
         if ($notify) {
             adopt_notify($name, $acc, $socket, $imap);
         } else {
@@ -898,14 +1008,20 @@ sub connect_account {
         }
         1;
     };
+    return _settle_account($name, $ok, $@, $password);
+}
+
+sub _settle_account {
+    my ($name, $ok, $err, $password) = @_;
     if (!$ok) {
-        log_error("[$name] connect failed: " . scrub($@, $password));
+        log_error("[$name] connect failed: " . scrub($err, $password));
         mark_retry($name);
         return 0;
     }
     if (account_covered($name)) {
         note_success($name);
-        log_info("[$name] monitoring $acc->{mbsync_channel}");
+        my $channel = $accounts{$name}{mbsync_channel} // '';
+        log_info("[$name] monitoring $channel");
         return 1;
     }
     mark_retry($name);
@@ -1916,6 +2032,7 @@ sub run {
     }
     $CONFIG_DIR  = dirname($CONFIG_FILE);
     $KNOWN_HOSTS = "$CONFIG_DIR/known_hosts";
+    $LEARNED     = "$CONFIG_DIR/learned";
 
     openlog('imapidle', 'cons,pid', 'mail');
     $LOG_OPEN = 1;
@@ -1992,6 +2109,7 @@ sub set_foreground_for_test { $FOREGROUND = $_[0] ? 1 : 0; }
 sub set_verbose_for_test    { $VERBOSE    = $_[0] ? 1 : 0; }
 sub last_child_exit_for_test { $LAST_CHILD_EXIT }
 sub set_known_hosts_for_test { $KNOWN_HOSTS = $_[0]; }
+sub set_learned_for_test     { $LEARNED     = $_[0]; }
 sub note_child_for_test {
     my ($pid, $label) = @_;
     my $text = defined $label ? $label : 'child';

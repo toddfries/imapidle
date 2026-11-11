@@ -224,6 +224,25 @@ On
 connections the same timer sends
 .Cm NOOP .
 .Pp
+The first look at a host records whether it offers
+.Cm NOTIFY .
+The record is
+.Pa learned ,
+beside the configuration file.
+A host that does not advertise
+.Cm NOTIFY ,
+or that rejects it, is opened with
+.Cm IDLE
+after that.
+Later connections do not repeat the discovery and do not send
+.Cm NOTIFY
+again.
+A host that accepts
+.Cm NOTIFY
+is armed on each new connection.
+That arming is logged when the record changes.
+Delete the host's line to probe it again.
+.Pp
 Priority is the minimum time between
 .Sy mbsync
 runs for one folder.
@@ -268,6 +287,22 @@ and the fingerprint.
 A retired line adds the GMT time it was replaced, as
 .Ql YYYYMMDDTHH:MM:SSZ .
 One line per host has no time.
+The file mode is 0600 when
+.Nm
+creates it.
+.It Pa ~/.config/imapidle/learned
+What each server did with
+.Cm NOTIFY ,
+for the default configuration.
+A line is
+.Pa server:port ,
+then
+.Cm absent ,
+.Cm rejected ,
+or
+.Cm active .
+A rejected or active server may add the name it reported.
+Delete a line to probe that server again.
 The file mode is 0600 when
 .Nm
 creates it.
