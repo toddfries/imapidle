@@ -63,7 +63,7 @@ or
 re-reads the configuration file on the next wake of the loop,
 within about 30 seconds, and does not exit.
 A file that would be rejected at startup is logged and the
-running accounts and offline channels stay as they are.
+running accounts and pulse channels stay as they are.
 An account whose server, port, user, secret, or channel changed
 is disconnected and connected again.
 Folder names and priorities apply to the connection already open.
@@ -81,7 +81,7 @@ instead.
 The lines name each account and connection, each folder's priority,
 when that folder was last synced, any
 .Sy mbsync
-child, and each offline channel.
+child, and each pulse channel.
 A disabled account is named as disabled and has no retry time.
 On a terminal, Ctrl-T sends this signal.
 .Pp
@@ -181,7 +181,7 @@ The IMAP loop does not wait for
 to finish.
 .Pp
 An optional
-.Pa [offline]
+.Pa [pulse]
 section runs
 .Pa mbsync channel
 with no mailbox, once per listed channel.
@@ -315,7 +315,7 @@ creates it.
 .Ex -std imapidle
 Startup failures exit 1 before the main loop.
 That includes a missing configuration, a file with no account and no
-offline channel, and any account that lacks
+pulse channel, and any account that lacks
 .Va server ,
 .Va user ,
 .Va mbsync_channel ,

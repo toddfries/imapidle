@@ -33,10 +33,10 @@ The file is INI.
 One section is one account.
 The section name is a label used in log lines.
 The name
-.Pa offline
+.Pa pulse
 is reserved for channels that are not IMAP accounts.
 See
-.Sx OFFLINE .
+.Sx PULSE CHANNELS .
 .Pp
 The directory should be mode 0700 and the file mode 0600.
 A
@@ -69,7 +69,7 @@ and
 a bad port, an empty
 .Va folderN ,
 or a bad
-.Pa [offline]
+.Pa [pulse]
 section
 is written to standard error.
 .Nm imapidle
@@ -239,9 +239,9 @@ child, after the 5 second wait.
 A batch uses the largest
 .Va wait
 among its folders.
-.Sh OFFLINE
+.Sh PULSE CHANNELS
 The optional
-.Pa [offline]
+.Pa [pulse]
 section names
 .Sy mbsync
 channels that are not IMAP accounts.
@@ -349,7 +349,7 @@ priority = 3
 .Pp
 Channels that are not watched over IMAP:
 .Bd -literal -offset indent
-[offline]
+[pulse]
 sweep = 3600
 channel0 = lists
 channel1 = archive

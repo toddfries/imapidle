@@ -42,8 +42,8 @@ my %accounts;
 my %conns;
 my %sock_to_key;
 my %children;
-my %offline_next;
-my $offline_cfg = { disabled => 0, sweep => 3600, channels => [] };
+my %pulse_next;
+my $pulse_cfg = { disabled => 0, sweep => 3600, channels => [] };
 my $select = IO::Select->new();
 my $INFO_R;
 my $INFO_W;
@@ -340,27 +340,27 @@ sub parse_folder_spec {
     };
 }
 
-sub _blank_offline {
+sub _blank_pulse {
     return { disabled => 0, sweep => 3600, channels => [] };
 }
 
-sub _offline_usable {
+sub _pulse_usable {
     my ($off) = @_;
     return 0 unless $off;
     return 1 if $off->{disabled};
     return @{ $off->{channels} // [] } ? 1 : 0;
 }
 
-# [offline] is not an account. A bad value is pushed onto @$problems.
-sub _parse_offline_section {
+# [pulse] is not an account. A bad value is pushed onto @$problems.
+sub _parse_pulse_section {
     my ($row, $problems) = @_;
-    my $empty = _blank_offline();
+    my $empty = _blank_pulse();
     return $empty unless ref $row eq 'HASH';
     if (_config_disabled($row->{disabled})) {
         return { disabled => 1, sweep => 3600, channels => [] };
     }
 
-    my $bad = sub { push @$problems, "[offline] $_[0]"; };
+    my $bad = sub { push @$problems, "[pulse] $_[0]"; };
     my $sweep = 3600;
     if (exists $row->{sweep}) {
         if (!defined $row->{sweep} || $row->{sweep} !~ /^\d+$/) {
@@ -402,16 +402,16 @@ sub _parse_offline_section {
 }
 
 # Returns (hashref, '') or (undef, error). Does not touch %accounts.
-# The third value is the offline section, and only matters on success.
+# The third value is the pulse section, and only matters on success.
 sub parse_config_file {
     my ($file) = @_;
     my $cfg = Config::Tiny->read($file)
       or return (undef, "Cannot read $file: " . (Config::Tiny->errstr // $!));
 
     my (%fresh, @problems);
-    my $offline = _parse_offline_section($cfg->{offline}, \@problems);
+    my $pulse = _parse_pulse_section($cfg->{pulse}, \@problems);
     for my $section (sort keys %{$cfg}) {
-        next if $section eq '_' || $section eq 'offline';
+        next if $section eq '_' || $section eq 'pulse';
         my $row = $cfg->{$section};
         next unless ref $row eq 'HASH';
 
@@ -508,10 +508,10 @@ sub parse_config_file {
     if (@problems) {
         return (undef, join("\n", @problems));
     }
-    unless (%fresh || _offline_usable($offline)) {
+    unless (%fresh || _pulse_usable($pulse)) {
         return (undef, 'no usable accounts in ' . $file);
     }
-    return (\%fresh, '', $offline);
+    return (\%fresh, '', $pulse);
 }
 
 sub _config_disabled {
@@ -559,48 +559,48 @@ sub _held_account {
 }
 
 # Returns an error string, or the empty string and fills %accounts.
-sub reset_offline_state {
-    %offline_next = ();
-    $offline_cfg = _blank_offline();
+sub reset_pulse_state {
+    %pulse_next = ();
+    $pulse_cfg = _blank_pulse();
 }
 
 # $reload keeps the clock of a channel that is still listed.
 # A new channel is due immediately. The sweep wait starts at exit.
-sub install_offline {
+sub install_pulse {
     my ($new, $reload) = @_;
-    $new //= _blank_offline();
-    my $old = $offline_cfg // _blank_offline();
+    $new //= _blank_pulse();
+    my $old = $pulse_cfg // _blank_pulse();
     if ($new->{disabled}) {
-        log_info('offline: disabled') if !$reload || !$old->{disabled};
-        %offline_next = ();
-        $offline_cfg = { disabled => 1, sweep => 3600, channels => [] };
+        log_info('pulse: disabled') if !$reload || !$old->{disabled};
+        %pulse_next = ();
+        $pulse_cfg = { disabled => 1, sweep => 3600, channels => [] };
         return;
     }
 
     my (%keep, @added);
     for my $ch (@{ $new->{channels} }) {
-        if ($reload && !$old->{disabled} && exists $offline_next{$ch}) {
-            $keep{$ch} = $offline_next{$ch};
+        if ($reload && !$old->{disabled} && exists $pulse_next{$ch}) {
+            $keep{$ch} = $pulse_next{$ch};
         } else {
             $keep{$ch} = 0;
             push @added, $ch if $reload;
         }
     }
     if ($reload) {
-        log_info('offline: enabled') if $old->{disabled};
-        for my $ch (sort keys %offline_next) {
-            log_info("$ch: offline removed") unless exists $keep{$ch};
+        log_info('pulse: enabled') if $old->{disabled};
+        for my $ch (sort keys %pulse_next) {
+            log_info("$ch: pulse removed") unless exists $keep{$ch};
         }
-        log_info("$_: offline added") for @added;
+        log_info("$_: pulse added") for @added;
         my $had = !$old->{disabled} && (@{ $old->{channels} } || @{ $new->{channels} });
         if ($had && ($old->{sweep} // 3600) != $new->{sweep}) {
-            log_info("offline: sweep $new->{sweep}");
+            log_info("pulse: sweep $new->{sweep}");
         }
     } elsif (@{ $new->{channels} }) {
-        log_info('offline: sweep ' . $new->{sweep} . ': ' . join(' ', @{ $new->{channels} }));
+        log_info('pulse: sweep ' . $new->{sweep} . ': ' . join(' ', @{ $new->{channels} }));
     }
-    %offline_next = %keep;
-    $offline_cfg = {
+    %pulse_next = %keep;
+    $pulse_cfg = {
         disabled => 0,
         sweep    => $new->{sweep},
         channels => [ @{ $new->{channels} } ],
@@ -612,12 +612,12 @@ sub load_config {
     my ($fresh, $err, $off) = parse_config_file($file);
     %accounts = ();
     if ($err || !$fresh) {
-        reset_offline_state();
+        reset_pulse_state();
         return $err if $err;
         return 'empty config';
     }
     %accounts = %$fresh;
-    install_offline($off, 0);
+    install_pulse($off, 0);
     _log_loaded_account($_) for sort keys %accounts;
     return '';
 }
@@ -1165,7 +1165,7 @@ sub reap_children {
         } else {
             log_warn($line);
         }
-        finish_offline_channel($rec->{offline}) if ref $rec eq 'HASH';
+        finish_pulse_channel($rec->{pulse}) if ref $rec eq 'HASH';
     }
 }
 
@@ -1437,62 +1437,62 @@ sub trigger_mbsync {
     $children{$pid} = {
         label   => "mbsync $shown",
         args    => [@args],
-        offline => $meta->{offline},
+        pulse => $meta->{pulse},
         started => time(),
     };
     log_info(mbsync_phrase('forked mbsync', @args) . " (pid $pid)");
     return $pid;
 }
 
-# Each offline channel is due on its own. sweep seconds are counted from
+# Each pulse channel is due on its own. sweep seconds are counted from
 # the exit of that channel's process, not from the start.
-sub due_offline_channels {
+sub due_pulse_channels {
     my ($now) = @_;
     $now //= time();
-    return () if $offline_cfg->{disabled};
+    return () if $pulse_cfg->{disabled};
     my @due;
-    for my $ch (@{ $offline_cfg->{channels} // [] }) {
-        next unless exists $offline_next{$ch};
-        next if ($offline_next{$ch} // 0) > $now;
+    for my $ch (@{ $pulse_cfg->{channels} // [] }) {
+        next unless exists $pulse_next{$ch};
+        next if ($pulse_next{$ch} // 0) > $now;
         next if channel_busy($ch);
         push @due, $ch;
     }
     return @due;
 }
 
-sub finish_offline_channel {
+sub finish_pulse_channel {
     my ($ch, $now) = @_;
     $now //= time();
     return unless defined $ch && $ch ne '';
-    return if $offline_cfg->{disabled};
-    return unless exists $offline_next{$ch};
-    my $sweep = $offline_cfg->{sweep} // 3600;
-    $offline_next{$ch} = $now + $sweep;
-    log_info("$ch: offline next in ${sweep}s");
+    return if $pulse_cfg->{disabled};
+    return unless exists $pulse_next{$ch};
+    my $sweep = $pulse_cfg->{sweep} // 3600;
+    $pulse_next{$ch} = $now + $sweep;
+    log_info("$ch: pulse next in ${sweep}s");
 }
 
-sub pump_offline {
+sub pump_pulse {
     my ($now) = @_;
     $now //= time();
-    return if $offline_cfg->{disabled};
-    for my $ch (due_offline_channels($now)) {
-        my $pid = trigger_mbsync(0, $ch, { offline => $ch });
+    return if $pulse_cfg->{disabled};
+    for my $ch (due_pulse_channels($now)) {
+        my $pid = trigger_mbsync(0, $ch, { pulse => $ch });
         if (!$pid) {
-            my $sweep = $offline_cfg->{sweep} // 3600;
+            my $sweep = $pulse_cfg->{sweep} // 3600;
             $sweep = 1 if $sweep < 1;
-            $offline_next{$ch} = $now + $sweep;
+            $pulse_next{$ch} = $now + $sweep;
         }
     }
 }
 
-sub next_offline_delay {
+sub next_pulse_delay {
     my ($now) = @_;
-    return if $offline_cfg->{disabled};
+    return if $pulse_cfg->{disabled};
     my $wait;
-    for my $ch (@{ $offline_cfg->{channels} // [] }) {
-        next unless exists $offline_next{$ch};
+    for my $ch (@{ $pulse_cfg->{channels} // [] }) {
+        next unless exists $pulse_next{$ch};
         next if channel_busy($ch);
-        my $d = ($offline_next{$ch} // 0) - $now;
+        my $d = ($pulse_next{$ch} // 0) - $now;
         $d = 0 if $d < 0;
         $wait = $d if !defined $wait || $d < $wait;
     }
@@ -1505,7 +1505,7 @@ sub pump_schedule {
     for my $job (due_mbsync_jobs($now)) {
         trigger_mbsync($job->{wait}, @{ $job->{args} });
     }
-    pump_offline($now);
+    pump_pulse($now);
 }
 
 # Server keepalive and command replies are not mail. EXISTS, EXPUNGE,
@@ -1668,7 +1668,7 @@ sub loop_timeout {
     }
     my $sched = next_schedule_delay($now);
     $wait = $sched if defined $sched && $sched < $wait;
-    my $off = next_offline_delay($now);
+    my $off = next_pulse_delay($now);
     $wait = $off if defined $off && $off < $wait;
     return $wait;
 }
@@ -1810,7 +1810,7 @@ sub reload_config_now {
             log_info("$name: folders updated");
         }
     }
-    install_offline($off, 1);
+    install_pulse($off, 1);
     log_info('config reloaded');
     return '';
 }
@@ -1922,31 +1922,31 @@ sub info_lines {
             push @lines, _folder_info_line($name, $acc, $folder, $now);
         }
     }
-    push @lines, _offline_info_lines($now);
+    push @lines, _pulse_info_lines($now);
     for my $pid (@kids) {
         push @lines, child_state_line($pid, $children{$pid});
     }
     return @lines;
 }
 
-sub _offline_info_lines {
+sub _pulse_info_lines {
     my ($now) = @_;
-    return () unless $offline_cfg;
-    return ('offline: disabled') if $offline_cfg->{disabled};
+    return () unless $pulse_cfg;
+    return ('pulse: disabled') if $pulse_cfg->{disabled};
     my @lines;
-    my $sweep = $offline_cfg->{sweep} // 3600;
-    for my $ch (@{ $offline_cfg->{channels} // [] }) {
+    my $sweep = $pulse_cfg->{sweep} // 3600;
+    for my $ch (@{ $pulse_cfg->{channels} // [] }) {
         my $state;
         if (channel_busy($ch)) {
             $state = 'running';
-        } elsif (!exists $offline_next{$ch} || $offline_next{$ch} <= $now) {
+        } elsif (!exists $pulse_next{$ch} || $pulse_next{$ch} <= $now) {
             $state = 'due';
         } else {
-            my $in = int($offline_next{$ch} - $now);
+            my $in = int($pulse_next{$ch} - $now);
             $in = 0 if $in < 0;
             $state = "next ${in}s";
         }
-        push @lines, "$ch: offline sweep ${sweep}s $state";
+        push @lines, "$ch: pulse sweep ${sweep}s $state";
     }
     return @lines;
 }
@@ -2191,18 +2191,18 @@ sub note_child_for_test {
     };
 }
 sub clear_children_for_test { %children = (); }
-sub offline_snapshot_for_test {
+sub pulse_snapshot_for_test {
     return {
-        disabled => $offline_cfg->{disabled} ? 1 : 0,
-        sweep    => $offline_cfg->{sweep},
-        channels => [ @{ $offline_cfg->{channels} // [] } ],
-        next     => { %offline_next },
+        disabled => $pulse_cfg->{disabled} ? 1 : 0,
+        sweep    => $pulse_cfg->{sweep},
+        channels => [ @{ $pulse_cfg->{channels} // [] } ],
+        next     => { %pulse_next },
     };
 }
-sub set_offline_next_for_test {
+sub set_pulse_next_for_test {
     my ($ch, $when) = @_;
-    return unless exists $offline_next{$ch};
-    $offline_next{$ch} = $when;
+    return unless exists $pulse_next{$ch};
+    $pulse_next{$ch} = $when;
 }
 sub set_next_try_for_test {
     my ($name, $when) = @_;
