@@ -41,10 +41,16 @@ A failed
 .Sy mbsync
 is logged and does not disable the account.
 Five consecutive failures before the account has monitored a mailbox
-disable it.
-The log records that once, and the account is not tried again.
+pause it.
+The first pause is 1800 seconds.
+The failure count and the connect backoff are reset, and the account
+is tried again when that pause ends.
+Another five failures pause it for one and a half times as long,
+rounded.
+A step that would pass 12 hours is not taken, so the pause stays
+on the last step before that.
 .Dv SIGHUP
-enables it on the next wake.
+enables it on the next wake and the pause starts over at 1800 seconds.
 A section that sets
 .Va disabled
 to
@@ -100,7 +106,7 @@ child, and each pulse channel.
 With
 .Fl v
 each tracked mailbox is listed on its own line.
-A disabled account is named as disabled and has no retry time.
+A paused account is named disabled and shows how long it has left.
 On a terminal, Ctrl-T sends this signal.
 .Pp
 The options are as follows:

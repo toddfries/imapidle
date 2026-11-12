@@ -58,14 +58,58 @@ my $gave_up = stderr_of(sub {
     mark_retry('acct') for 1 .. $limit;
 });
 like($gave_up, qr/acct    : retry in 5s/, 'the first failure is retried');
-like($gave_up, qr/acct    : disabled after $limit failures/, 'the limit disables the account');
-unlike($gave_up, qr/retry in 27s/, 'the disabling failure does not schedule another retry');
-ok(loaded_account('acct')->{disabled}, 'the account is disabled');
-is(account_next_try('acct'), 0, 'a disabled account has no retry time');
+like($gave_up, qr/acct    : disabled after $limit failures, back in 1800s at \d{8} \d{2}:\d{2}:\d{2}\.\d{6}/,
+    'the limit pauses the account for 30 minutes');
+unlike($gave_up, qr/retry in 27s/, 'the pausing failure does not schedule another short retry');
+ok(loaded_account('acct')->{disabled}, 'the account is paused');
+is(loaded_account('acct')->{backoff}, 5, 'the connect backoff is reset');
+is(loaded_account('acct')->{fails}, 0, 'the failure count is reset');
+is(loaded_account('acct')->{disable_for}, 2700, 'the next pause is 45 minutes');
+my $now = time();
+my $left = int(account_next_try('acct') - $now);
+ok($left == 1800 || $left == 1799, 'the pause is 1800 seconds');
+my @info = info_lines($now);
+is($info[1], "acct: disabled server imap.example.com channel ch back in ${left}s",
+    'state names the pause and how long is left');
+is(loop_timeout(), 30, 'a long pause does not shorten the 30s wait');
+my $hold = account_next_try('acct');
+set_next_try_for_test('acct', time() + 10);
+my $woke = loop_timeout();
+ok($woke >= 8 && $woke <= 10, 'a pause shorter than 30s wakes the loop') or diag($woke);
+set_next_try_for_test('acct', $hold);
 
-my @info = info_lines(time());
-is($info[1], 'acct: disabled server imap.example.com channel ch', 'state names the account disabled');
-is(loop_timeout(), 30, 'a disabled account does not shorten the wait');
+my $ended = stderr_of(sub {
+    ok(lift_account_disable('acct', $hold), 'the pause ends on its clock');
+});
+like($ended, qr/acct    : backoff reset/, 'the end of the pause resets the backoff');
+ok(!loaded_account('acct')->{disabled}, 'the account tries again');
+my $again = stderr_of(sub {
+    mark_retry('acct') for 1 .. $limit;
+});
+like($again, qr/back in 2700s at /, 'the second pause is one and a half times 30 minutes');
+is(loaded_account('acct')->{disable_for}, 4050, 'the pause keeps growing by half');
+
+note_success('acct');
+ok(!defined loaded_account('acct')->{disable_for}, 'a successful monitor clears the pause ladder');
+set_monitored_for_test('acct', 0);
+my $restarted = stderr_of(sub {
+    mark_retry('acct') for 1 .. $limit;
+});
+like($restarted, qr/back in 1800s at /, 'the ladder starts over after a success');
+
+my $step = 1800;
+my @steps = ($step);
+for (1 .. 12) {
+    my $n = next_disable_for($step);
+    last if $n == $step;
+    push @steps, $n;
+    $step = $n;
+}
+is_deeply(\@steps, [1800, 2700, 4050, 6075, 9113, 13670, 20505, 30758],
+    'the pause grows by half and stops before 12 hours');
+is(next_disable_for(30758), 30758, 'the last step under 12 hours is repeated');
+cmp_ok(int(30758 * 1.5 + 0.5), '>', disable_ceiling(),
+    'the following step would pass 12 hours');
 
 my $enabled = stderr_of(sub {
     is(reload_config_now($path), '', 'reload accepts the same file');
@@ -73,6 +117,11 @@ my $enabled = stderr_of(sub {
 like($enabled, qr/acct    : enabled/, 'SIGHUP enables the account');
 ok(!loaded_account('acct')->{disabled}, 'the account is no longer disabled');
 is(loaded_account('acct')->{fails}, 0, 'the failure count starts over');
+ok(!defined loaded_account('acct')->{disable_for}, 'SIGHUP starts the pause ladder over');
+my $after_hup = stderr_of(sub {
+    mark_retry('acct') for 1 .. $limit;
+});
+like($after_hup, qr/back in 1800s at /, 'the next pause after SIGHUP is 30 minutes');
 
 note_success('acct');
 stderr_of(sub {
@@ -92,9 +141,11 @@ stderr_of(sub {
     mark_retry('acct') for 1 .. $limit;
 });
 ok(conn_exists_for_test('acct:INBOX'), 'a connection already up is left in place');
-my @partial = info_lines(time());
-is($partial[1], 'acct: IDLE INBOX disabled server imap.example.com channel ch',
-    'a partial account shows the open mailbox and disabled');
+my $partial_now = time();
+my $partial_left = int(account_next_try('acct') - $partial_now);
+my @partial = info_lines($partial_now);
+is($partial[1], "acct: IDLE INBOX disabled server imap.example.com channel ch back in ${partial_left}s",
+    'a partial account shows the open mailbox and the pause');
 
 set_foreground_for_test(0);
 

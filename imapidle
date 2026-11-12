@@ -2584,7 +2584,19 @@ sub account_covered {
     return 1;
 }
 
-sub start_give_up { 5 }
+sub start_give_up    { 5 }
+sub disable_floor    { 1800 }
+sub disable_ceiling  { 12 * 3600 }
+
+# Same half-again step as the connect backoff. A step past 12 hours
+# is not taken, so the pause stays on the previous one.
+sub next_disable_for {
+    my ($cur) = @_;
+    $cur = disable_floor() if !defined $cur || $cur < disable_floor();
+    my $n = int($cur * 1.5 + 0.5);
+    return $cur if $n > disable_ceiling();
+    return $n;
+}
 
 sub mark_retry {
     my ($name) = @_;
@@ -2592,9 +2604,16 @@ sub mark_retry {
     return if $acc->{disabled};
     $acc->{fails} = ($acc->{fails} // 0) + 1;
     if (!$acc->{up} && $acc->{fails} >= start_give_up()) {
-        $acc->{disabled} = 1;
-        $acc->{next_try} = 0;
-        log_error("$name: disabled after $acc->{fails} failures");
+        my $nfail = $acc->{fails};
+        my $b = $acc->{disable_for} // disable_floor();
+        $b = disable_floor() if $b < disable_floor();
+        $acc->{disabled}    = 1;
+        $acc->{fails}       = 0;
+        $acc->{backoff}     = 5;
+        $acc->{next_try}    = time() + $b;
+        $acc->{disable_for} = next_disable_for($b);
+        log_error("$name: disabled after $nfail failures, back in ${b}s at "
+            . _clock($acc->{next_try}));
         return;
     }
     my $b = $acc->{backoff} // 5;
@@ -2606,6 +2625,22 @@ sub mark_retry {
     log_info("$name: retry in ${b}s");
 }
 
+# The pause ended. The connect backoff starts over at 5 seconds.
+sub lift_account_disable {
+    my ($name, $now) = @_;
+    my $acc = $accounts{$name} or return 0;
+    return 0 if $acc->{config_disabled} || !$acc->{disabled};
+    $now //= time();
+    my $due = $acc->{next_try} // 0;
+    return 0 if $due <= 0 || $due > $now;
+    $acc->{disabled} = 0;
+    $acc->{fails}    = 0;
+    $acc->{backoff}  = 5;
+    $acc->{next_try} = 0;
+    log_info("$name: backoff reset");
+    return 1;
+}
+
 sub note_success {
     my ($name) = @_;
     my $acc = $accounts{$name} or return;
@@ -2614,6 +2649,7 @@ sub note_success {
     $acc->{fails}    = 0;
     $acc->{up}       = 1;
     $acc->{disabled} = 0;
+    delete $acc->{disable_for};
 }
 
 sub drop_socket {
@@ -3911,6 +3947,7 @@ sub housekeeping {
 
     return if $shutdown_reason;
     for my $name (keys %accounts) {
+        lift_account_disable($name, $now);
         next if $accounts{$name}{disabled};
         next if account_covered($name);
         next if ($accounts{$name}{next_try} // 0) > $now;
@@ -3926,9 +3963,16 @@ sub loop_timeout {
     my $now  = time();
     my $wait = 30;
     for my $name (keys %accounts) {
-        next if $accounts{$name}{disabled};
+        my $acc = $accounts{$name};
+        if ($acc->{disabled}) {
+            my $due = $acc->{next_try} // 0;
+            next unless $due > $now;
+            my $d = $due - $now;
+            $wait = $d if $d < $wait;
+            next;
+        }
         next if account_covered($name);
-        my $due = $accounts{$name}{next_try} // $now;
+        my $due = $acc->{next_try} // $now;
         my $d   = $due - $now;
         $d = 0 if $d < 0;
         $wait = $d if $d < $wait;
@@ -4091,6 +4135,7 @@ sub reload_config_now {
         $new->{next_try}    = $old->{next_try}    // 0;
         $new->{fails}       = $old->{fails}       // 0;
         $new->{up}          = $old->{up}          // 0;
+        $new->{disable_for} = $old->{disable_for} if defined $old->{disable_for};
         $new->{secret_wait} = $old->{secret_wait} if defined $old->{secret_wait};
         $new->{secret_said} = $old->{secret_said} if defined $old->{secret_said};
         if ($old->{disabled}) {
@@ -4098,6 +4143,7 @@ sub reload_config_now {
             $new->{fails}    = 0;
             $new->{backoff}  = 5;
             $new->{next_try} = 0;
+            delete $new->{disable_for};
             log_info("$name: enabled");
         }
         my $folders_changed = _folder_key($old) ne _folder_key($new);
@@ -4220,6 +4266,9 @@ sub info_lines {
             my $wait = int(($acc->{next_try} // 0) - $now);
             $wait = 0 if $wait < 0;
             $line .= " retry ${wait}s";
+        } elsif ($acc->{disabled} && ($acc->{next_try} // 0) > $now) {
+            my $wait = int($acc->{next_try} - $now);
+            $line .= " back in ${wait}s";
         }
         push @lines, $line;
         for my $folder (@{ $acc->{folders} }) {
@@ -4606,6 +4655,12 @@ sub set_next_try_for_test {
     my ($name, $when) = @_;
     return unless $accounts{$name};
     $accounts{$name}{next_try} = $when;
+}
+
+sub set_monitored_for_test {
+    my ($name, $up) = @_;
+    return unless $accounts{$name};
+    $accounts{$name}{up} = $up ? 1 : 0;
 }
 
 sub set_conn_imap_for_test {
