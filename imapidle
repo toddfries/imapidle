@@ -2007,6 +2007,298 @@ sub _tls_cert_body {
     return join('', @out);
 }
 
+my $CERT_NOW;
+
+# Tests pin the clock. Production uses the current second.
+sub cert_now {
+    return $CERT_NOW if defined $CERT_NOW;
+    return time();
+}
+
+sub set_cert_now_for_test {
+    ($CERT_NOW) = @_;
+}
+
+sub cert_warn_interval { 7 * 24 * 3600 }
+
+sub _cert_warn_file {
+    return unless defined $STATE_DIR && $STATE_DIR ne '';
+    return "$STATE_DIR/cert-warn";
+}
+
+sub load_cert_warn {
+    my %when;
+    my $path = _cert_warn_file() or return %when;
+    return %when unless -f $path;
+    open my $fh, '<', $path or return %when;
+    while (my $line = <$fh>) {
+        next if $line =~ /^\s*(?:#|$)/;
+        chomp $line;
+        my ($id, $when) = split /\t/, $line, 2;
+        next unless defined $id && $id ne '' && defined $when && $when =~ /^\d+\z/;
+        $when{$id} = $when;
+    }
+    close $fh;
+    return %when;
+}
+
+sub save_cert_warn {
+    my (%when) = @_;
+    my $path = _cert_warn_file() or return;
+    my $tmp = "$path.tmp.$$";
+    my $old = umask 077;
+    my $ok = open my $fh, '>', $tmp;
+    if (!$ok) {
+        umask $old;
+        log_error("cert-warn $path: $!");
+        return;
+    }
+    print $fh "# imapidle cert-warn\n";
+    print $fh "# entry\tlast-warning-epoch\n\n";
+    for my $id (sort keys %when) {
+        print $fh "$id\t$when{$id}\n";
+    }
+    my $closed = close $fh;
+    umask $old;
+    if (!$closed || !rename($tmp, $path)) {
+        unlink $tmp;
+        log_error("cert-warn $path: $!");
+        return;
+    }
+    chmod 0600, $path;
+}
+
+sub _load_pem_x509 {
+    my ($pem) = @_;
+    return unless defined $pem && $pem ne '';
+    my $bio = Net::SSLeay::BIO_new(Net::SSLeay::BIO_s_mem());
+    return unless $bio;
+    my $n = Net::SSLeay::BIO_write($bio, $pem);
+    my $x = Net::SSLeay::PEM_read_bio_X509($bio) if defined $n && $n > 0;
+    Net::SSLeay::BIO_free($bio);
+    return $x;
+}
+
+sub _cert_label {
+    my ($i) = @_;
+    return $i ? "certificate $i" : 'server certificate';
+}
+
+sub _asn1_iso {
+    my ($cert, $which) = @_;
+    my $t = $which eq 'before'
+        ? Net::SSLeay::X509_get_notBefore($cert)
+        : Net::SSLeay::X509_get_notAfter($cert);
+    return '' unless $t;
+    return Net::SSLeay::P_ASN1_TIME_get_isotime($t) // '';
+}
+
+sub _iso_now {
+    my @t = gmtime($_[0]);
+    return sprintf('%04d-%02d-%02dT%02d:%02d:%02dZ',
+        $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
+}
+
+sub _has_san {
+    my ($cert) = @_;
+    my $want = Net::SSLeay::OBJ_txt2nid('subjectAltName') or return 0;
+    my $n = Net::SSLeay::X509_get_ext_count($cert);
+    return 0 unless defined $n && $n > 0;
+    for (my $i = 0; $i < $n; $i++) {
+        my $ext = Net::SSLeay::X509_get_ext($cert, $i) or next;
+        my $obj = Net::SSLeay::X509_EXTENSION_get_object($ext) or next;
+        my $nid = Net::SSLeay::OBJ_obj2nid($obj);
+        return 1 if $nid && $nid == $want;
+    }
+    return 0;
+}
+
+sub _name_matches {
+    my ($cert, $host) = @_;
+    return 0 if !defined $host || $host eq '';
+    my $ip = $host;
+    $ip =~ s/^\[(.*)\]\z/$1/;
+    if ($ip =~ /:/ || $ip =~ /^\d{1,3}(?:\.\d{1,3}){3}\z/) {
+        my $r = eval { Net::SSLeay::X509_check_ip_asc($cert, $ip, 0) };
+        return 1 if $r && $r > 0;
+    }
+    my $name = $host;
+    my $r = eval { Net::SSLeay::X509_check_host($cert, $name) };
+    return 1 if $r && $r > 0;
+    return 0;
+}
+
+sub _key_fact {
+    my ($cert) = @_;
+    my $pk = Net::SSLeay::X509_get_pubkey($cert) or return ('', 0);
+    my $bits = Net::SSLeay::EVP_PKEY_bits($pk) // 0;
+    my $id = Net::SSLeay::EVP_PKEY_id($pk) // 0;
+    my $sn = $id ? (Net::SSLeay::OBJ_nid2sn($id) // '') : '';
+    Net::SSLeay::EVP_PKEY_free($pk);
+    return ($sn, $bits);
+}
+
+sub _key_warning {
+    my ($label, $sn, $bits) = @_;
+    $sn //= '';
+    $bits //= 0;
+    if ($sn =~ /dsa/i) {
+        return "$label public key $sn is not suitable";
+    }
+    if ($sn =~ /ec/i) {
+        return "$label public key $sn $bits is shorter than 224"
+            if $bits && $bits < 224;
+        return;
+    }
+    if ($bits && $bits < 2048) {
+        my $what = $sn ne '' ? "$sn $bits" : "$bits-bit";
+        return "$label public key $what is shorter than 2048";
+    }
+    return;
+}
+
+sub _sig_name {
+    my ($cert) = @_;
+    my $alg = Net::SSLeay::P_X509_get_signature_alg($cert) or return '';
+    my $nid = Net::SSLeay::OBJ_obj2nid($alg) or return '';
+    return Net::SSLeay::OBJ_nid2sn($nid) // '';
+}
+
+# Time is checked on its own, so an expired chain still reports the signer.
+sub _authority_problem {
+    my ($certs) = @_;
+    return 'certificate chain could not be checked' unless $certs && $certs->[0];
+    my $ctx = Net::SSLeay::CTX_new() or return 'trust store could not be opened';
+    my $loaded = Net::SSLeay::CTX_load_verify_locations($ctx, '/etc/ssl/cert.pem', '');
+    if (!$loaded) {
+        Net::SSLeay::CTX_free($ctx);
+        return 'trust store /etc/ssl/cert.pem could not be read';
+    }
+    my $store = Net::SSLeay::CTX_get_cert_store($ctx);
+    my $flag = eval { Net::SSLeay::X509_V_FLAG_NO_CHECK_TIME() };
+    Net::SSLeay::X509_STORE_set_flags($store, $flag) if $store && $flag;
+    my $sk;
+    if (@$certs > 1) {
+        $sk = Net::SSLeay::sk_X509_new_null();
+        Net::SSLeay::sk_X509_push($sk, $certs->[$_]) for 1 .. $#$certs;
+    }
+    my $sctx = Net::SSLeay::X509_STORE_CTX_new();
+    my $init = $sctx && Net::SSLeay::X509_STORE_CTX_init($sctx, $store, $certs->[0], $sk || 0);
+    my $problem = '';
+    if (!$init) {
+        $problem = 'certificate chain could not be checked';
+    } else {
+        my $ok = Net::SSLeay::X509_verify_cert($sctx);
+        if (!$ok) {
+            my $err = Net::SSLeay::X509_STORE_CTX_get_error($sctx);
+            my $str = Net::SSLeay::X509_verify_cert_error_string($err) // 'unknown error';
+            if ($str !~ /not yet valid|has expired/i) {
+                my $depth = Net::SSLeay::X509_STORE_CTX_get_error_depth($sctx) // 0;
+                my $where = $depth ? ' (certificate ' . $depth . ')' : '';
+                $problem = "not a trusted authority ($str$where)";
+            }
+        }
+    }
+    Net::SSLeay::X509_STORE_CTX_free($sctx) if $sctx;
+    Net::SSLeay::sk_X509_free($sk) if $sk;
+    Net::SSLeay::CTX_free($ctx);
+    return $problem;
+}
+
+sub cert_problems {
+    my ($host, $text) = @_;
+    my @pem = $text =~ /(-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----)/sg;
+    return ('certificate chain is empty') unless @pem;
+    my @x;
+    my @problems;
+    my $now = _iso_now(cert_now());
+    for my $i (0 .. $#pem) {
+        my $x = _load_pem_x509($pem[$i]);
+        $x[$i] = $x;
+        my $label = _cert_label($i);
+        if (!$x) {
+            push @problems, "$label could not be read";
+            next;
+        }
+        my $before = _asn1_iso($x, 'before');
+        my $after  = _asn1_iso($x, 'after');
+        if ($before eq '') {
+            push @problems, "$label has no notBefore";
+        } elsif ($before gt $now) {
+            push @problems, "$label not valid until $before";
+        }
+        if ($after eq '') {
+            push @problems, "$label has no notAfter";
+        } elsif ($after lt $now) {
+            push @problems, "$label expired $after";
+        }
+        if ($i == 0) {
+            if (!_name_matches($x, $host)) {
+                push @problems, "$label name does not match $host";
+            }
+            if (!_has_san($x)) {
+                push @problems, "$label has no subjectAltName";
+            }
+            my $ver = Net::SSLeay::X509_get_version($x);
+            if (!defined $ver || $ver < 2) {
+                push @problems, "$label is not X.509 v3";
+            }
+        }
+        my ($sn, $bits) = _key_fact($x);
+        my $kw = _key_warning($label, $sn, $bits);
+        push @problems, $kw if $kw;
+        my $sig = _sig_name($x);
+        if ($sig eq '') {
+            push @problems, "$label signature algorithm is unknown";
+        } elsif ($sig =~ /SHA-?1(?!\d)|MD[245]/i) {
+            push @problems, "$label signature $sig is weak";
+        }
+    }
+    for my $i (0 .. $#x - 1) {
+        next unless $x[$i] && $x[$i + 1];
+        my $cmp = Net::SSLeay::X509_NAME_cmp(
+            Net::SSLeay::X509_get_issuer_name($x[$i]),
+            Net::SSLeay::X509_get_subject_name($x[$i + 1]));
+        if ($cmp) {
+            push @problems, _cert_label($i) . ' issuer is not ' . _cert_label($i + 1);
+            next;
+        }
+        my $pk = Net::SSLeay::X509_get_pubkey($x[$i + 1]);
+        if (!$pk) {
+            push @problems, _cert_label($i + 1) . ' has no public key';
+            next;
+        }
+        my $signed = Net::SSLeay::X509_verify($x[$i], $pk);
+        Net::SSLeay::EVP_PKEY_free($pk);
+        if (!$signed || $signed < 1) {
+            push @problems, _cert_label($i + 1) . ' did not sign ' . _cert_label($i);
+        }
+    }
+    if (@x && !grep { !$_ } @x) {
+        my $auth = _authority_problem(\@x);
+        push @problems, $auth if defined $auth && $auth ne '';
+    }
+    Net::SSLeay::X509_free($_) for grep { $_ } @x;
+    return @problems;
+}
+
+sub consider_cert_warnings {
+    my ($host, $port, $path, $body) = @_;
+    return unless defined $path && $path ne '';
+    my ($id) = $path =~ m{([^/]+)\z};
+    return unless defined $id && $id ne '';
+    my @problems = cert_problems($host, $body // '');
+    return unless @problems;
+    my $now = cert_now();
+    my %when = load_cert_warn();
+    my $last = $when{$id} // 0;
+    return if $last && $now >= $last && $now - $last < cert_warn_interval();
+    my $label = "$host:$port";
+    log_warn("$label: cert $_") for @problems;
+    $when{$id} = int($now);
+    save_cert_warn(%when);
+}
+
 sub _tls_chain_lines {
     my ($ssl) = @_;
     my @chain = eval { $ssl->peer_certificates };
@@ -2086,7 +2378,11 @@ sub _save_tls_observation {
     );
     _save_hashed_file('tls-negotiations', $host, $port, $body);
     my $certs = _tls_cert_body($ssl);
-    _save_hashed_file('certs', $host, $port, $certs) if defined $certs && $certs ne '';
+    return unless defined $certs && $certs ne '';
+    my $path = _save_hashed_file('certs', $host, $port, $certs);
+    return unless $path;
+    eval { consider_cert_warnings($host, $port, $path, $certs) };
+    log_error('cert check: ' . scrub($@)) if $@;
 }
 
 sub _ssl_handshake {

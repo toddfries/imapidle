@@ -165,6 +165,29 @@ A replaced fingerprint stays in the file with the GMT time it was
 retired.
 One fingerprint per host has no retired time, and that one is current.
 .Pp
+The chain stored under
+.Pa certs/
+is checked on every handshake.
+The connection continues either way.
+Each of these is its own warning:
+the certificate is expired or not yet valid, the server name does
+not match, there is no
+.Cm subjectAltName ,
+the certificate is not X.509 v3, the public key is shorter than
+2048 bits
+.Pq 224 for an elliptic curve
+or an unsuitable kind, or the signature uses MD5 or SHA-1.
+An issuer that is not the next certificate, a signature that does
+not verify, and a chain that
+.Pa /etc/ssl/cert.pem
+does not trust are warned about too.
+Every problem found is logged.
+The same
+.Pa certs/
+file stays quiet for 7 days after that report.
+The times are kept in
+.Pa cert-warn .
+.Pp
 Operational messages use
 .Xr syslog 3
 with ident
@@ -458,6 +481,14 @@ The text matches
 .Cm openssl s_client -showcerts .
 The same chain is not stored twice.
 The file mode is 0600.
+.It Pa ~/.local/imapidle/cert-warn
+The last time each
+.Pa certs/
+file produced a warning, as seconds since the epoch.
+A line is that file's name and the time.
+The file mode is 0600 when
+.Nm
+creates it.
 .It Pa ~/.local/imapidle/tls-negotiations/
 One directory per local year.
 Each file is what this client offered and what the server

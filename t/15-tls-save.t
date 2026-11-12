@@ -211,6 +211,15 @@ my $first = stderr_of(sub {
 like($first, qr/127\.0\.0\.1:$port_a: tls cert [0-9a-f]{40}/, 'a new chain is logged');
 like($first, qr/127\.0\.0\.1:$port_a: tls negotiation [0-9a-f]{40}/,
     'a new negotiation is logged');
+like($first, qr/127\.0\.0\.1:$port_a: cert server certificate name does not match 127\.0\.0\.1/,
+    'a name mismatch is warned');
+like($first, qr/127\.0\.0\.1:$port_a: cert server certificate has no subjectAltName/,
+    'a missing subjectAltName is warned');
+like($first, qr/127\.0\.0\.1:$port_a: cert not a trusted authority \(self signed certificate\)/,
+    'a self-signed chain is warned');
+cmp_ok(scalar(() = $first =~ /: cert /g), '>=', 3, 'every problem on the chain is logged');
+ok(-f "$state/cert-warn", 'the warning clock is stored');
+is((stat "$state/cert-warn")[2] & 0777, 0600, 'cert-warn is mode 0600');
 
 my $second = stderr_of(sub {
     my $sock = tcp_ssl_connect('127.0.0.1', $port_a);
@@ -218,6 +227,7 @@ my $second = stderr_of(sub {
 });
 unlike($second, qr/tls cert/, 'the same chain is not logged again');
 unlike($second, qr/tls negotiation/, 'the same negotiation is not logged again');
+unlike($second, qr/: cert /, 'the same chain stays quiet for a week');
 
 my $third = stderr_of(sub {
     my $sock = tcp_ssl_connect('127.0.0.1', $port_b);
@@ -271,5 +281,42 @@ for my $path (@live_negs) {
         'ephemeral session material is absent');
     is((stat $path)[2] & 0777, 0600, 'a negotiation file is mode 0600');
 }
+
+my ($leaf_path) = @live_certs;
+my $leaf_body = slurp($leaf_path);
+my ($leaf_port) = $leaf_path =~ /127\.0\.0\.1:(\d+)\z/;
+my @now_problems = cert_problems('127.0.0.1', $leaf_body);
+ok((grep { /name does not match/ } @now_problems), 'the stored chain fails the name');
+ok((grep { /subjectAltName/ } @now_problems), 'the stored chain has no subjectAltName');
+ok((grep { /trusted authority/ } @now_problems), 'the stored chain is not trusted');
+ok(!grep { /expired / } @now_problems, 'a fresh test certificate is inside its dates');
+
+set_cert_now_for_test(time() + 10 * 365 * 24 * 3600);
+my @later_problems = cert_problems('127.0.0.1', $leaf_body);
+ok((grep { /expired / } @later_problems), 'a clock past notAfter reports expiry');
+ok((grep { /subjectAltName/ } @later_problems), 'expiry does not hide a missing subjectAltName');
+ok((grep { /does not match/ } @later_problems), 'expiry does not hide the hostname');
+ok((grep { /trusted authority/ } @later_problems), 'expiry does not hide the signer');
+set_cert_now_for_test(time() + 8 * 24 * 3600);
+my $week = stderr_of(sub {
+    consider_cert_warnings('127.0.0.1', $leaf_port, $leaf_path, $leaf_body);
+});
+like($week, qr/expired /, 'a week later the chain is warned again');
+like($week, qr/subjectAltName/, 'the later warning still lists every problem');
+like($week, qr/trusted authority/, 'the later warning still names the signer');
+my $quiet = stderr_of(sub {
+    consider_cert_warnings('127.0.0.1', $leaf_port, $leaf_path, $leaf_body);
+});
+is($quiet, '', 'the new week starts another quiet period');
+set_cert_now_for_test(undef);
+
+my @named = cert_problems('one', slurp($crt_a));
+ok(!grep { /does not match/ } @named, 'a matching commonName is accepted');
+ok((grep { /subjectAltName/ } @named), 'a matching commonName still needs subjectAltName');
+
+my $joined = slurp($crt_a) . slurp($crt_b);
+my @broken = cert_problems('127.0.0.1', $joined);
+ok((grep { /issuer is not certificate 1/ } @broken), 'a joined chain must link');
+ok((grep { /trusted authority/ } @broken), 'a broken chain still reports trust');
 
 done_testing;
