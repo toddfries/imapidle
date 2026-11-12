@@ -2964,7 +2964,8 @@ sub reap_children {
             close $fh;
         }
         my @args = _child_args($rec);
-        my $line = mbsync_job_line('stop', $pid, @args);
+        my $slot = ref $rec eq 'HASH' ? $rec->{slot} : undef;
+        my $line = mbsync_job_line('stop', $pid, { slot => $slot }, @args);
         $line .= ' ' . exit_how($status);
         my $cli  = mbsync_cli($rec);
         my $tail = note_mbsync_real($cli, $real, $ru);
@@ -3258,12 +3259,65 @@ sub _child_args {
     return split / /, $1;
 }
 
-# start and child are five letters. stop is four, so one pad lines the
-# hash up with start. The pid is five columns inside the brackets.
+sub _connection_cap {
+    my $cap = $track_cfg->{connections} // 1;
+    return $cap < 1 ? 1 : int($cap);
+}
+
+# 0, 1, ... 9, a, ... z, then 10. A value at or past the connection
+# cap means one mbsync was started too many.
+sub slot_token {
+    my ($n) = @_;
+    return '' unless defined $n && $n =~ /^\d+$/;
+    my $s = '';
+    do {
+        $s = substr('0123456789abcdefghijklmnopqrstuvwxyz', $n % 36, 1) . $s;
+        $n = int($n / 36);
+    } while ($n > 0);
+    return $s;
+}
+
+sub alloc_mbsync_slot {
+    my $cap = _connection_cap();
+    my %used;
+    for my $pid (keys %children) {
+        my $rec = $children{$pid};
+        next unless ref $rec eq 'HASH' && defined $rec->{slot} && $rec->{slot} =~ /^\d+$/;
+        $used{ $rec->{slot} + 0 } = 1;
+    }
+    for (my $i = 0; $i < $cap; $i++) {
+        return $i unless $used{$i};
+    }
+    my $n = $cap;
+    $n++ while $used{$n};
+    return $n;
+}
+
+# stop is one letter shorter than start, so one pad keeps the hash
+# in one column. The pid is five columns inside the brackets.
+sub _job_field {
+    my ($verb, $slot) = @_;
+    if (defined $slot && $slot =~ /^\d+$/ && ($verb eq 'start' || $verb eq 'stop')) {
+        my $tok = slot_token($slot);
+        my $raw = $verb eq 'stop' ? "$tok.stop" : "$tok.start";
+        return sprintf('%-*s', length($tok) + 6, $raw);
+    }
+    return sprintf('%-5s', $verb);
+}
+
 sub mbsync_job_line {
     my ($verb, $pid, @args) = @_;
     $verb = 'stop' unless defined $verb && $verb ne '';
     $pid  = 0 if !defined $pid || $pid !~ /^-?\d+$/ || $pid < 0;
+    my $slot;
+    if (ref $args[0] eq 'HASH') {
+        my $opt = shift @args;
+        $slot = $opt->{slot} if exists $opt->{slot};
+    }
+    if (!defined $slot && ref $children{$pid} eq 'HASH') {
+        $slot = $children{$pid}{slot};
+    }
+    my $field = _job_field($verb, $slot);
     my ($channel, @boxes);
     my $one = @args ? 1 : 0;
     for my $arg (@args) {
@@ -3277,12 +3331,12 @@ sub mbsync_job_line {
     }
     if (!$one || !defined $channel || $channel eq '') {
         my $shown = @args ? join(' ', @args) : '';
-        my $line  = sprintf('mbsync: %-5s [%5d]', $verb, $pid);
+        my $line  = sprintf('mbsync: %s [%5d]', $field, $pid);
         $line .= " $shown" if $shown ne '';
         return $line;
     }
     my $hash = sha1_b(join("\0", @args));
-    my $line = sprintf('%s: %-5s %s[%5d]', $channel, $verb, $hash, $pid);
+    my $line = sprintf('%s: %s %s[%5d]', $channel, $field, $hash, $pid);
     $line .= ' ' . join(',', @boxes) if @boxes;
     return $line;
 }
@@ -3370,6 +3424,7 @@ sub trigger_mbsync {
     $children{$pid} = {
         label   => "mbsync $shown",
         args    => [@args],
+        slot    => alloc_mbsync_slot(),
         pulse   => $meta->{pulse},
         track   => $meta->{track},
         out_fh  => $capture ? $rd : undef,
@@ -4498,10 +4553,21 @@ sub note_child_for_test {
         @args = split / /, $body;
         $text = 'mbsync ' . join(' ', @args);
     }
+    delete $children{$pid};
     $children{$pid} = {
         label => $text,
         args  => \@args,
+        slot  => alloc_mbsync_slot(),
     };
+}
+
+sub child_slot_for_test {
+    return unless $children{ $_[0] };
+    return $children{ $_[0] }{slot};
+}
+
+sub forget_child_for_test {
+    delete $children{ $_[0] };
 }
 sub clear_children_for_test { %children = (); }
 sub pulse_snapshot_for_test {
@@ -4661,6 +4727,8 @@ sub folder_names_for_test {
 sub io_timeout_for_test { return $IO_MAX; }
 
 sub set_io_timeout_for_test { $IO_MAX = $_[0]; }
+
+sub set_connections_for_test { $track_cfg->{connections} = $_[0]; }
 
 sub set_trigger_hook_for_test { $TRIGGER_HOOK = $_[0]; }
 

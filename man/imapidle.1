@@ -186,19 +186,25 @@ The child then waits for the largest
 .Va wait
 of the folders in the batch, then replaces itself with
 .Sy mbsync .
-When the process is forked, one line names the channel, the word
+When the process is forked, the line names the channel, the slot,
 .Cm start ,
 a
 .Cm sha1 -b
 token of the argument list, the pid in five columns, and the
 mailboxes.
+The slot counts from 0 in base 36, digits 0-9 and a-z.
 When that process exits, a
 .Cm stop
-line repeats the token, the pid, and the mailboxes, then
+line repeats the slot, the token, the pid, and the mailboxes, then
 .Cm ret
 and the status, or
 .Cm sig
 and the signal number.
+A slot at or past
+.Va connections
+means more
+.Sy mbsync
+processes were started than that cap allows.
 The same line gives how many times that command has finished, this
 run against the average real seconds, and this run against the
 average resident set, in kilobytes.

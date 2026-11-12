@@ -85,14 +85,14 @@ reset_mbsync_real_for_test();
 set_foreground_for_test(0);
 clear_children_for_test();
 my $true_line = reap_one('/usr/bin/true', 'mbsync true');
-like($true_line, qr/^true: stop  \S{27}=\[\s*\d+\] ret 0 x1 \d+\.\d\d\|\d+\.\d\ds \d+\|\d+rss\z/,
+like($true_line, qr/^true: 0\.stop  \S{27}=\[\s*\d+\] ret 0 x1 \d+\.\d\d\|\d+\.\d\ds \d+\|\d+rss\z/,
     'wait4 records a successful child on one line');
 unlike($true_line, qr/user/, 'the default stop line omits user time');
 my ($rss) = $true_line =~ /(\d+)\|\d+rss/;
 cmp_ok($rss, '>', 0, 'the resident set came from the child');
 
 my $exit_line = reap_one('/usr/bin/perl', 'mbsync bad', '-e', 'exit 3');
-like($exit_line, qr/^bad: stop  \S{27}=\[\s*\d+\] ret 3 x1 \d+\.\d\d\|\d+\.\d\ds \d+\|\d+rss\z/,
+like($exit_line, qr/^bad: 0\.stop  \S{27}=\[\s*\d+\] ret 3 x1 \d+\.\d\d\|\d+\.\d\ds \d+\|\d+rss\z/,
     'a non-zero child keeps the same stats tail');
 
 set_verbose_for_test(1);
@@ -102,16 +102,50 @@ like($loud_exit, qr/ \d+\.\d\d\|\d+\.\d\duser \d+\.\d\d\|\d+\.\d\dsys \d+\|\d+rs
 set_verbose_for_test(0);
 
 my $one = sha1_b('fdc-list:INBOX.2026-11');
-is(mbsync_job_line('start', 4123, 'fdc-list:INBOX.2026-11'),
-    "fdc-list: start ${one}[ 4123] INBOX.2026-11",
-    'a start line names the channel once');
+is(mbsync_job_line('start', 4123, { slot => 0 }, 'fdc-list:INBOX.2026-11'),
+    "fdc-list: 0.start ${one}[ 4123] INBOX.2026-11",
+    'a start line names the channel and the slot');
 my $two = sha1_b("fdc-list:INBOX.2026-11\0fdc-list:openbsd.2026-11");
-is(mbsync_job_line('stop', 41230, 'fdc-list:INBOX.2026-11', 'fdc-list:openbsd.2026-11'),
-    "fdc-list: stop  ${two}[41230] INBOX.2026-11,openbsd.2026-11",
-    'mailboxes follow the hash, comma-separated');
-is(mbsync_job_line('start', 99, 'knf'),
-    'knf: start ' . sha1_b('knf') . '[   99]',
-    'a bare channel has no mailbox');
+is(mbsync_job_line('stop', 41230, { slot => 0 }, 'fdc-list:INBOX.2026-11', 'fdc-list:openbsd.2026-11'),
+    "fdc-list: 0.stop  ${two}[41230] INBOX.2026-11,openbsd.2026-11",
+    'the stop line repeats the slot and lines the hash up with start');
+is(mbsync_job_line('start', 99, { slot => 10 }, 'knf'),
+    'knf: a.start ' . sha1_b('knf') . '[   99]',
+    'slot 10 is the letter a');
+is(mbsync_job_line('start', 99, { slot => 35 }, 'knf'),
+    'knf: z.start ' . sha1_b('knf') . '[   99]',
+    'slot 35 is the letter z');
+my $wide_start = mbsync_job_line('start', 99, { slot => 36 }, 'knf');
+my $wide_stop  = mbsync_job_line('stop', 100, { slot => 36 }, 'knf');
+is(index($wide_start, sha1_b('knf')), index($wide_stop, sha1_b('knf')),
+    'a two-digit slot keeps the hash in one column');
+like($wide_start, qr/^knf: 10\.start /, 'slot 36 is 10 in base 36');
+
+clear_children_for_test();
+note_child_for_test(1, 'mbsync aa:INBOX');
+note_child_for_test(2, 'mbsync bb:INBOX');
+is(child_slot_for_test(1), 0, 'the first mbsync takes slot 0');
+is(child_slot_for_test(2), 1, 'the next mbsync takes slot 1');
+note_child_for_test(3, 'mbsync cc:INBOX');
+is(child_slot_for_test(3), 2, 'a third mbsync past the cap of 2 is slot 2');
+forget_child_for_test(2);
+note_child_for_test(4, 'mbsync dd:INBOX');
+is(child_slot_for_test(4), 1, 'a freed slot is the next one handed out');
+clear_children_for_test();
+set_connections_for_test(16);
+my ($high, $bad) = (0, '');
+for my $i (1 .. 16) {
+    note_child_for_test(100 + $i, "mbsync ch$i:INBOX");
+    my $slot = child_slot_for_test(100 + $i);
+    $high = $slot if $slot > $high;
+    $bad = $slot if !defined $slot || $slot >= 16;
+}
+ok($bad eq '', 'sixteen mbsync processes stay below the connection count')
+    or diag("slot $bad");
+is($high, 15, 'those processes fill slots 0 through 15');
+is(slot_token(15), 'f', 'the last slot under a cap of 16 is f');
+clear_children_for_test();
+set_connections_for_test(2);
 is(mbsync_phrase('fork mbsync', 'fdc-list:INBOX'),
     'fdc-list: fork mbsync INBOX',
     'a fork failure still names the channel once');
