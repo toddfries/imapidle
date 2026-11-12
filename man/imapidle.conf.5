@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 10 2026 $
+.Dd $Mdocdate: November 11 2026 $
 .Dt IMAPIDLE.CONF 5
 .Os
 .Sh NAME
@@ -35,8 +35,14 @@ The section name is a label used in log lines.
 The name
 .Pa pulse
 is reserved for channels that are not IMAP accounts.
+The name
+.Pa track
+is reserved for mailboxes that are not in
+.Va folderN .
 See
-.Sx PULSE CHANNELS .
+.Sx PULSE CHANNELS
+and
+.Sx TRACKED MAILBOXES .
 .Pp
 The directory should be mode 0700 and the file mode 0600.
 A
@@ -70,6 +76,8 @@ a bad port, an empty
 .Va folderN ,
 or a bad
 .Pa [pulse]
+or
+.Pa [track]
 section
 is written to standard error.
 .Nm imapidle
@@ -262,8 +270,21 @@ is how many seconds that channel waits after its own
 exits before it runs again.
 The default is 3600.
 Each channel keeps its own clock.
-The first time the section is loaded, every channel is due and the
-runs start together.
+A channel with no saved exit is due.
+An exit is written to
+.Pa ~/.local/imapidle/pulse-last .
+A later start waits
+.Va sweep
+seconds from that exit, so a restart does not run the channel
+again while the wait remains.
+Named
+.Va folderN
+mailboxes are queued at startup.
+When
+.Va connections
+is above 1, one slot stays with those folders and pulse uses
+the other slots.
+With one slot, pulse waits until the named sync is done.
 A run that takes longer starts its next wait later.
 A channel that is still running is not started a second time.
 The wait starts when that process exits.
@@ -293,21 +314,170 @@ A channel that was removed is not started again.
 Changing
 .Va sweep
 applies the next time a run exits.
+.Sh TRACKED MAILBOXES
+The optional
+.Pa [track]
+section is not an account.
+The name
+.Pa track
+is reserved.
+With no section, the defaults below are in force and tracking is on.
+A present section overrides only the keys it sets.
+.Va disabled
+set to
+.Cm yes
+stops tracked syncs.
+.Va connections
+still limits hot folders, tracked mailboxes, and pulse channels.
+Any other value for
+.Va disabled
+leaves tracking active.
+.Pp
+Values are whole numbers.
+.Va min ,
+.Va list ,
+.Va id ,
+and
+.Va capability
+must be at least 60.
+.Va max
+must be at least
+.Va min .
+.Va capability
+must be at least
+.Va id .
+.Va messages
+and
+.Va connections
+must be at least 1.
+A bad value rejects the file.
+.Bl -tag -width "connections"
+.It Va min
+Minimum seconds between tracked syncs.
+The default is 600.
+.It Va messages
+How many new messages one check should gather, until
+.Va min
+is reached.
+The default is 5.
+New messages are the Far and Near counts
+.Sy mbsync
+prints on the summary line.
+.It Va initial
+Seconds after the first sync of a mailbox, and the start of the
+interval.
+The default is 1800.
+.It Va max
+Longest tracked interval, in seconds.
+The default is 21600.
+.It Va list
+Seconds between mailbox lists on the primary IMAP connection.
+The default is 259200, three days.
+A folder the server drops is logged and not synced until a later list
+includes it.
+.It Va id
+Seconds between
+.Cm ID
+commands when the server software is not changing.
+The default is 604800, seven days.
+A changed reply hashes differently, requests
+.Cm CAPABILITY ,
+and halves this interval down toward
+.Va min .
+Three unchanged checks double it, up to
+.Va capability .
+.It Va capability
+Seconds between
+.Cm CAPABILITY
+commands when the ID hash is unchanged.
+The default is 604800.
+.It Va connections
+How many
+.Sy mbsync
+processes may run at once.
+The default is 2.
+This does not count IMAP connections.
+When this is above 1 and a pulse channel is due, one slot stays
+with the named folders and pulse uses the others.
+With one slot, pulse waits until that named sync is done.
+When no pulse channel is due, hot folders may use every slot.
+Tracked mailboxes and pulse channels leave one free when this is
+above 1 and no named sync is using it.
+.El
+.Pp
+Every three finished syncs of one mailbox replace its interval.
+Let M be the new messages, S the sum of the three intervals, and D
+the average sync seconds.
+No messages doubles the interval, up to
+.Va max .
+Otherwise the next wait is the larger of
+.Va messages
+times S/M and three times D, then clamped to
+.Va min
+and
+.Va max .
+Three finishes with no summary double the interval the same way.
+The learned interval is kept in memory and starts again from
+.Va initial
+after a restart.
+The mailbox names are what the folder file keeps.
+.Pp
+.Pa ~/tmp/pause ,
+.Pa ~/tmp/pause.mail ,
+and
+.Pa ~/tmp/pause.imapidle
+hold new
+.Sy mbsync
+runs while any one of them exists.
+.Pa ~/tmp/shutdown
+and the same two suffixes shut the daemon down after the current
+.Sy mbsync
+processes exit.
 .Sh FILES
 .Bl -tag -width Ds
 .It Pa ~/.config/imapidle/imapidle.conf
 Default path.
-.It Pa ~/.config/imapidle/known_hosts
-SHA256 certificate fingerprints for this configuration's directory.
+.It Pa ~/.local/imapidle/
+State directory, mode 0700.
+The configuration file stays in
+.Pa ~/.config/imapidle/ .
+.It Pa ~/.local/imapidle/known_hosts
+SHA256 certificate fingerprints.
 A current line is
 .Pa server:port
 and the fingerprint.
 A retired line adds the GMT time it was replaced, as
 .Ql YYYYMMDDTHH:MM:SSZ .
 One line per host has no time.
-.It Pa ~/.config/imapidle/learned
+If this file is missing and one exists beside the configuration, that
+file is copied once and the old path is left in place.
+.It Pa ~/.local/imapidle/certs/
+One directory per local year.
+Each file is one certificate chain from a TLS handshake.
+The name is the SHA1 of the file, a hyphen, and
+.Pa host:port ,
+for example
+.Pa 2026/f0cbd2da7e9abbcce6171027bd69f28165468420-mail0.fdh.bz:993 .
+The text matches
+.Cm openssl s_client -showcerts .
+The same chain is not stored twice.
+The file mode is 0600.
+.It Pa ~/.local/imapidle/tls-negotiations/
+One directory per local year.
+Each file is what this client offered and what the server
+selected.
+The name is the SHA1 of the file, a hyphen, and
+.Pa host:port .
+Ephemeral keys, tickets, and session data are left out, so
+the same server keeps the same file until the client or the
+server changes the handshake.
+The file mode is 0600.
+.It Pa ~/.local/imapidle/learned
 What each server did with
-.Cm NOTIFY .
+.Cm NOTIFY ,
+plus the hashed
+.Cm ID
+reply and when to ask again.
 A line is
 .Pa server:port ,
 then
@@ -317,9 +487,18 @@ or
 .Cm active .
 A rejected or active server may add the name it reported.
 Delete a line to probe that server again.
+An older file beside the configuration is copied once.
 The file mode is 0600 when
 .Nm imapidle
 creates it.
+.It Pa ~/.local/imapidle/folders/
+One file per channel, one mailbox name per line.
+.It Pa ~/.local/imapidle/mbsync-real
+Count and total real seconds for each
+.Sy mbsync
+command.
+.It Pa ~/.local/imapidle/conn-time
+Count and total connected seconds for each IMAP session.
 .El
 .Sh EXAMPLES
 A password stored in the file, with a hot inbox and a lazy archive:
@@ -353,6 +532,22 @@ Channels that are not watched over IMAP:
 sweep = 3600
 channel0 = lists
 channel1 = archive
+.Ed
+.Pp
+Leaving out
+.Pa [track]
+uses these values.
+Writing the section overrides only the keys that are set:
+.Bd -literal -offset indent
+[track]
+min = 600
+messages = 5
+initial = 1800
+max = 21600
+list = 259200
+id = 604800
+capability = 604800
+connections = 2
 .Ed
 .Sh SEE ALSO
 .Xr syslog 3 ,

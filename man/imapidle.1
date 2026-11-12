@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 10 2026 $
+.Dd $Mdocdate: November 11 2026 $
 .Dt IMAPIDLE 1
 .Os
 .Sh NAME
@@ -54,11 +54,26 @@ It stays disabled until that value is removed and the file is
 reloaded.
 An account that has monitored a mailbox keeps retrying after a later
 failure, with the wait growing by half each time up to 900 seconds.
+A failing
+.Va pass_cmd
+uses its own wait.
+The first retry is 60 seconds, and each later failure doubles that
+wait up to 21600 seconds.
+The error is logged on the first failure and again only after
+86400 seconds.
+The retries in between are quiet.
+A later success logs that the command recovered, and the account
+is not disabled.
 It does not stop the other accounts, and it does not exit the process.
 The process leaves the main loop only on
 .Dv SIGTERM
 or
-.Dv SIGINT .
+.Dv SIGINT ,
+or when a shutdown file is present.
+In-flight
+.Sy mbsync
+processes finish first.
+The process then disconnects, writes its state files, and exits 0.
 .Dv SIGHUP
 re-reads the configuration file on the next wake of the loop,
 within about 30 seconds, and does not exit.
@@ -79,9 +94,12 @@ A daemonized process writes the same lines to
 .Xr syslog 3
 instead.
 The lines name each account and connection, each folder's priority,
-when that folder was last synced, any
+when that folder was last synced, tracked mailboxes, any
 .Sy mbsync
 child, and each pulse channel.
+With
+.Fl v
+each tracked mailbox is listed on its own line.
 A disabled account is named as disabled and has no retry time.
 On a terminal, Ctrl-T sends this signal.
 .Pp
@@ -91,9 +109,13 @@ The options are as follows:
 Read
 .Ar file
 instead of the default configuration.
-The certificate store is
+State files, including the certificate store, live in
+.Pa ~/.local/imapidle/ .
+A missing
 .Pa known_hosts
-in the same directory as
+or
+.Pa learned
+there is copied once from the same directory as
 .Ar file .
 .It Fl d
 Stay in the foreground.
@@ -164,28 +186,70 @@ The child then waits for the largest
 .Va wait
 of the folders in the batch, then replaces itself with
 .Sy mbsync .
-When that process exits, one line names the command, the pid, and
-the exit status or the signal.
-The same line carries the figures
-.Xr time 1
-.Fl l
-prints: real, user, and system seconds, the maximum resident set
-size in kilobytes, page reclaims, page faults, block input, block
-output, and voluntary and involuntary context switches.
-The line then gives how many times that same command has finished
-and the average of its real seconds.
-A zero exit is informational.
+When the process is forked, one line names the channel, the word
+.Cm start ,
+a
+.Cm sha1 -b
+token of the argument list, the pid in five columns, and the
+mailboxes.
+When that process exits, a
+.Cm stop
+line repeats the token, the pid, and the mailboxes, then
+.Cm ret
+and the status, or
+.Cm sig
+and the signal number.
+The same line gives how many times that command has finished, this
+run against the average real seconds, and this run against the
+average resident set, in kilobytes.
+With
+.Fl v
+it also shows user and system seconds, page reclaims, page faults,
+block input, block output, and both context-switch counts, each as
+this run against its average.
+Every one of those figures is totaled either way.
+A zero status is informational.
 Any other exit is a warning.
 The IMAP loop does not wait for
 .Sy mbsync
 to finish.
+.Pp
+.Va connections
+in
+.Pa [track]
+limits how many of those processes run at once.
+The default is 2.
+When the limit is above 1 and a pulse channel is due, one slot
+stays with the named folders and pulse uses the others.
+One long named sync does not hold every pulse channel.
+With one slot, pulse waits until that named sync is done.
+When no pulse channel is due, hot folders may use every slot.
+Tracked mailboxes and pulse channels leave one slot free when
+the limit is above 1 and no named sync is using it.
+A pause file stops new
+.Sy mbsync
+processes until it is removed.
+IMAP keeps running.
+A shutdown file uses the same finish path as
+.Dv SIGTERM .
 .Pp
 An optional
 .Pa [pulse]
 section runs
 .Pa mbsync channel
 with no mailbox, once per listed channel.
-Those runs start together the first time the section is loaded.
+A channel with no saved exit is due.
+A saved exit waits
+.Va sweep
+seconds from that time, including after a restart.
+Named
+.Va folderN
+mailboxes are queued at startup.
+When
+.Va connections
+is above 1, one slot stays with those folders and pulse uses
+the other slots.
+With one slot, pulse waits until the named sync is done.
 Each channel then waits
 .Va sweep
 seconds after its own process exits.
@@ -197,6 +261,24 @@ A bare channel and a
 for that same channel do not run together.
 See
 .Sy imapidle.conf(5) .
+.Pp
+Mailboxes on an account channel that are not in that account's
+.Va folderN
+list are tracked.
+Each one runs as its own
+.Pa mbsync channel:box
+so a long folder does not block a hot folder on that channel.
+The first wait is 30 minutes, measured after
+.Sy mbsync
+exits.
+Every three samples replace the wait.
+No new mail doubles it, up to 6 hours.
+With new mail the wait aims for about 5 messages and is at least
+three times the average sync of that mailbox, and at least 10 minutes.
+A name containing a colon is remembered and not synced: the command
+splits on the first colon.
+A folder the server no longer lists is not tried again until a later
+list contains it.
 .Sh IDLE AND NOTIFY
 If the server advertises
 .Cm NOTIFY ,
@@ -228,11 +310,26 @@ On
 connections the same timer sends
 .Cm NOOP .
 .Pp
-The first look at a host records whether it offers
-.Cm NOTIFY .
-The record is
-.Pa learned ,
-beside the configuration file.
+TCP connect and the TLS handshake share one 45 second limit.
+Each later IMAP read or write is limited to 45 seconds as well.
+The socket is non-blocking.
+While one connection waits, the other connections are polled
+and
+.Sy mbsync
+can still start.
+A wait that runs out drops that connection.
+.Pp
+The first look at a host sends
+.Dl ID ("name" "imapidle" "version" "0.1")
+and
+.Cm CAPABILITY
+on the connection that then watches the account.
+The ID reply is hashed.
+A later connection does not send either command until that record
+says it is due.
+A changed hash requests
+.Cm CAPABILITY
+again and is logged once.
 A host that does not advertise
 .Cm NOTIFY ,
 or that rejects it, is opened with
@@ -245,7 +342,13 @@ A host that accepts
 .Cm NOTIFY
 is armed on each new connection.
 That arming is logged when the record changes.
-Delete the host's line to probe it again.
+Delete the host's line in
+.Pa learned
+to probe it again.
+The primary connection also lists mailboxes when that list is due.
+Extra
+.Cm IDLE
+connections do not.
 .Pp
 Priority is the minimum time between
 .Sy mbsync
@@ -283,21 +386,68 @@ schedules the run, after the 5 second wait.
 Default configuration.
 See
 .Sy imapidle.conf(5) .
-.It Pa ~/.config/imapidle/known_hosts
-SHA256 certificate fingerprints accepted for the default configuration.
+.It Pa /etc/rc.d/imapidle
+Boot script.
+.Xr rcctl 8 Cm enable imapidle
+and
+.Cm start imapidle
+run it as
+.Va imapidle_user
+from
+.Pa /etc/rc.conf.local .
+That account owns the configuration and the mailboxes.
+.Va imapidle_flags
+is passed through, and
+.Va imapidle_timeout
+defaults to 90 seconds.
+.Cm reload
+sends
+.Dv SIGHUP
+and
+.Cm stop
+sends
+.Dv SIGTERM .
+.It Pa ~/.local/imapidle/
+State directory, mode 0700.
+.It Pa ~/.local/imapidle/known_hosts
+SHA256 certificate fingerprints.
 A current line is
 .Pa server:port
 and the fingerprint.
 A retired line adds the GMT time it was replaced, as
 .Ql YYYYMMDDTHH:MM:SSZ .
 One line per host has no time.
+If this file is missing and the configuration directory has one, that
+file is copied once.
+The old path is not deleted.
 The file mode is 0600 when
 .Nm
 creates it.
-.It Pa ~/.config/imapidle/learned
+.It Pa ~/.local/imapidle/certs/
+One directory per local year.
+Each file is one certificate chain from a TLS handshake.
+The name is the SHA1 of the file, a hyphen, and
+.Pa host:port ,
+for example
+.Pa 2026/f0cbd2da7e9abbcce6171027bd69f28165468420-mail0.fdh.bz:993 .
+The text matches
+.Cm openssl s_client -showcerts .
+The same chain is not stored twice.
+The file mode is 0600.
+.It Pa ~/.local/imapidle/tls-negotiations/
+One directory per local year.
+Each file is what this client offered and what the server
+selected.
+The name is the SHA1 of the file, a hyphen, and
+.Pa host:port .
+Ephemeral keys, tickets, and session data are left out, so
+the same server keeps the same file until the client or the
+server changes the handshake.
+The file mode is 0600.
+.It Pa ~/.local/imapidle/learned
 What each server did with
 .Cm NOTIFY ,
-for the default configuration.
+plus the ID hash and when to ask again.
 A line is
 .Pa server:port ,
 then
@@ -307,9 +457,47 @@ or
 .Cm active .
 A rejected or active server may add the name it reported.
 Delete a line to probe that server again.
-The file mode is 0600 when
-.Nm
-creates it.
+An older file beside the configuration is copied once, the same way
+as
+.Pa known_hosts .
+.It Pa ~/.local/imapidle/folders/
+One file per channel.
+One mailbox name per line, as the server spelled it.
+.It Pa ~/.local/imapidle/mbsync-real
+How many times each
+.Sy mbsync
+command has run, and the totals used on the stop line.
+The key is the
+.Cm sha1 -b
+token of that command.
+An older base64 key is still read.
+.It Pa ~/.local/imapidle/conn-time
+How many times each IMAP session has ended, and the total seconds it
+stayed connected.
+The key is the same
+.Cm sha1 -b
+token.
+An older base64 key is still read.
+.It Pa ~/.local/imapidle/pulse-last
+The last time each pulse channel's
+.Sy mbsync
+exited.
+One channel and that time per line.
+A restart waits
+.Va sweep
+seconds from the time.
+.It Pa ~/tmp/pause
+.It Pa ~/tmp/pause.mail
+.It Pa ~/tmp/pause.imapidle
+While any of these exists, no new
+.Sy mbsync
+is started.
+.It Pa ~/tmp/shutdown
+.It Pa ~/tmp/shutdown.mail
+.It Pa ~/tmp/shutdown.imapidle
+While any of these exists, the process shuts down after
+.Sy mbsync
+exits.
 .El
 .Sh EXIT STATUS
 .Ex -std imapidle
@@ -326,9 +514,9 @@ and
 The message is written to standard error.
 The process does not fork.
 After the main loop has started, the process exits 0 on
-.Dv SIGTERM
-or
-.Dv SIGINT .
+.Dv SIGTERM ,
+.Dv SIGINT ,
+or a shutdown file.
 .Dv SIGHUP
 reloads the configuration and does not exit.
 .Dv SIGINFO
