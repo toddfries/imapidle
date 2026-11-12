@@ -76,10 +76,13 @@ The process leaves the main loop only on
 or
 .Dv SIGINT ,
 or when a shutdown file is present.
+Each open IDLE session is ended with DONE and then LOGOUT.
+Each NOTIFY session is ended with LOGOUT.
+A session that is already dead is closed without those commands.
 In-flight
 .Sy mbsync
-processes finish first.
-The process then disconnects, writes its state files, and exits 0.
+processes finish, the state files are written, and the process
+exits 0.
 .Dv SIGHUP
 re-reads the configuration file on the next wake of the loop,
 within about 30 seconds, and does not exit.
@@ -516,9 +519,10 @@ is started.
 .It Pa ~/tmp/shutdown
 .It Pa ~/tmp/shutdown.mail
 .It Pa ~/tmp/shutdown.imapidle
-While any of these exists, the process shuts down after
+While any of these exists, open IMAP sessions are closed and the
+process exits after
 .Sy mbsync
-exits.
+finishes.
 .El
 .Sh EXIT STATUS
 .Ex -std imapidle

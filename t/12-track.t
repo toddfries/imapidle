@@ -514,17 +514,31 @@ reset_track_for_test();
 set_state_dir_for_test("$dir/state");
 clear_conns_for_test();
 reset_conn_time_for_test();
+my $idle_imap = ByeIMAP->new;
+my $dead_imap = ByeIMAP->new(0);
+my $notify_imap = ByeIMAP->new;
 my $ckey = plant_idle_for_test('fdc', 'INBOX', 420, 'fdc');
+my $dkey = plant_idle_for_test('fdc', 'Sent', 420, 'fdc');
+my $nkey = plant_bare_notify_for_test('fdc', 'fdc');
+set_conn_imap_for_test($ckey, $idle_imap, 41);
+set_conn_imap_for_test($dkey, $dead_imap, 42);
+set_conn_imap_for_test($nkey, $notify_imap);
 hold_child_for_test(88, 'mbsync fdc:INBOX');
 my $stop = "$run/shutdown";
 open $fh, '>', $stop or die "shutdown: $!";
 close $fh;
 set_foreground_for_test(1);
 my $waiting = capture(sub {
-    is(shutdown_step_for_test(), 'wait', 'a live child delays disconnect');
+    is(shutdown_step_for_test(), 'wait', 'a live child delays the exit');
 });
-ok(conn_exists_for_test($ckey), 'IMAP stays up while mbsync is running');
+ok(!conn_exists_for_test($ckey), 'IDLE closes when shutdown is noticed');
+ok(!conn_exists_for_test($nkey), 'NOTIFY closes when shutdown is noticed');
+ok(!conn_exists_for_test($dkey), 'a dead IDLE session is dropped too');
+is_deeply($idle_imap->{calls}, [qw(done logout)], 'IDLE is ended with DONE then LOGOUT');
+is_deeply($notify_imap->{calls}, ['logout'], 'NOTIFY is ended with LOGOUT');
+is_deeply($dead_imap->{calls}, [], 'a dead session is not sent DONE or LOGOUT');
 like($waiting, qr/shutdown file \Q$stop\E detected, finishing mbsync/, 'shutdown names the file');
+like($waiting, qr/fdc     : disconnecting INBOX \(x1 avg \d+\.\d\ds\)/, 'disconnect reports connection time');
 like($waiting, qr/waiting on 1 mbsync/, 'the wait is logged once');
 is_deeply(\@forked, [], 'shutdown does not start mbsync');
 clear_children_for_test();
@@ -532,8 +546,7 @@ my $done = capture(sub {
     is(shutdown_step_for_test(), 'exit', 'the process finishes when mbsync is gone');
 });
 set_foreground_for_test(0);
-ok(!conn_exists_for_test($ckey), 'the session closes after the last child');
-like($done, qr/fdc     : disconnecting INBOX \(x1 avg \d+\.\d\ds\)/, 'disconnect reports connection time');
+unlike($done, qr/disconnecting/, 'the sessions are not closed twice');
 like($done, qr/wrote \Q$dir\/state\E stats/, 'stats are written');
 like($done, qr/shutdown complete/, 'shutdown says it is done');
 ok(-f "$dir/state/conn-time", 'conn-time is on disk');
@@ -551,6 +564,18 @@ set_trigger_hook_for_test(undef);
 set_verbose_for_test(0);
 set_foreground_for_test(0);
 done_testing;
+
+package ByeIMAP;
+sub new {
+    my ($class, $up) = @_;
+    bless { calls => [], up => $up // 1 }, $class;
+}
+sub IsConnected { $_[0]{up} ? 1 : 0 }
+sub done   { push @{ $_[0]{calls} }, 'done';   return 'A1 OK' }
+sub logout { push @{ $_[0]{calls} }, 'logout'; return 1 }
+sub LastError { '' }
+
+package main;
 
 sub write_conf {
     my ($body) = @_;

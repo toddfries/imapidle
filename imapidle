@@ -63,6 +63,7 @@ my %MBSYNC_REAL;
 my $pause_announced = 0;
 my $shutdown_reason = '';
 my $shutdown_waiting = 0;
+my $RELEASING = 0;
 my $SHUTDOWN = 0;
 my $MBSYNC_BIN = '/usr/local/bin/mbsync';
 my $TRIGGER_HOOK;
@@ -3654,6 +3655,9 @@ sub shutdown_phase {
             $shutdown_reason = "signal $sig, finishing mbsync";
         }
         log_info($shutdown_reason);
+        # IDLE ends with DONE then LOGOUT. NOTIFY ends with LOGOUT.
+        # mbsync is still allowed to finish after the sockets are closed.
+        _release_imap_sessions();
     }
     my $n = mbsync_running();
     if ($n > 0) {
@@ -3688,8 +3692,18 @@ sub _disconnect_conn {
     close_session($conn->{imap}, $conn->{socket});
 }
 
+sub _release_imap_sessions {
+    return if $RELEASING;
+    $RELEASING = 1;
+    for my $key (sort keys %conns) {
+        eval { _disconnect_conn($key) };
+        log_error("disconnect $key: " . scrub($@)) if $@;
+    }
+    $RELEASING = 0;
+}
+
 sub _close_for_shutdown {
-    _disconnect_conn($_) for sort keys %conns;
+    _release_imap_sessions();
     save_stat_files();
     my $dir = $STATE_DIR;
     if (!defined $dir || $dir eq '') {
@@ -3913,6 +3927,7 @@ sub refresh_primary {
 
 sub housekeeping {
     my $now = time();
+    return if $shutdown_reason || _shutdown_wanted();
     for my $key (keys %conns) {
         my $conn = $conns{$key} or next;
         my $dead = 0;
@@ -4697,6 +4712,20 @@ sub plant_notify_for_test {
         channel => $acc->{mbsync_channel},
         wait    => $acc->{wait},
         folders => $acc->{folders},
+    };
+    return $key;
+}
+
+sub plant_bare_notify_for_test {
+    my ($name, $channel) = @_;
+    my $key = "$name:NOTIFY";
+    $conns{$key} = {
+        key     => $key,
+        name    => $name,
+        mode    => 'NOTIFY',
+        channel => $channel // '',
+        wait    => 0,
+        started => time(),
     };
     return $key;
 }
