@@ -550,23 +550,12 @@ sub install_track {
     $track_cfg = { %$new };
 }
 
-# OpenBSD SYS_getentropy supplies the spread.
-my $SYS_getentropy = 7;
+# OpenBSD perl seeds an unseeded rand() from arc4random().
+# srand(N) would select srand48_deterministic for this process.
 my $INTERVAL_SPREAD;
-my $SPREAD_WARNED = 0;
-
-sub _kernel_u32 {
-    my $buf = "\0" x 4;
-    my $rc = syscall($SYS_getentropy, $buf, length $buf);
-    if (!defined $rc || $rc < 0) {
-        log_info("track: random: $!") unless $SPREAD_WARNED++;
-        return 0;
-    }
-    return unpack('L', $buf);
-}
 
 # X is one quarter of the seconds the formula just added.
-# The extra wait is a kernel value modulo X.
+# The extra wait is rand() in 0 .. X-1.
 sub _spread_added {
     my ($added) = @_;
     return 0 unless defined $added && $added > 0;
@@ -576,7 +565,7 @@ sub _spread_added {
     if (defined $INTERVAL_SPREAD) {
         $r = int($INTERVAL_SPREAD->($x));
     } else {
-        $r = _kernel_u32() % $x;
+        $r = int(rand($x));
     }
     $r = 0 if $r < 0;
     $r = $x - 1 if $r >= $x;

@@ -309,9 +309,9 @@ for (1 .. 24) {
     $seen{$n} = 1;
     $outside = $n if $n < 3600 || $n > 4049;
 }
-ok(!defined $outside, 'kernel spread stays inside the added quarter')
+ok(!defined $outside, 'rand spread stays inside the added quarter')
     or diag("outside 3600..4049: $outside");
-cmp_ok(scalar keys %seen, '>', 1, 'kernel draws are not one repeated value');
+cmp_ok(scalar keys %seen, '>', 1, 'rand draws are not one repeated value');
 set_interval_spread_for_test(sub { 0 });
 
 reset_mbsync_real_for_test();

@@ -275,8 +275,8 @@ Every three samples replace the wait.
 No new mail doubles it.
 When the new wait is longer, one quarter of the added seconds
 is X.
-A kernel random value modulo X is added so those mailboxes do
-not wake together.
+A random value modulo X is added so those mailboxes do not wake
+together.
 The wait stays between 10 minutes and 6 hours.
 With new mail the wait aims for about 5 messages and is at least
 three times the average sync of that mailbox.
