@@ -192,6 +192,10 @@ a
 .Cm sha1 -b
 token of the argument list, the pid in five columns, and the
 mailboxes.
+When that command has finished before, the line also gives
+.Cm guestimate Ns ending at YYYYMMDD HH:MM:SS .
+N is the average real seconds of the command, rounded.
+The clock is local and is N seconds after the fork.
 The slot counts from 0 in base 36, digits 0-9 and a-z.
 When that process exits, a
 .Cm stop

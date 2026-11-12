@@ -3293,6 +3293,20 @@ sub alloc_mbsync_slot {
     return $n;
 }
 
+# Average real seconds of this command, rounded, and the local time
+# that far from $now. Empty until the command has finished once.
+sub start_guestimate {
+    my ($cli, $now) = @_;
+    my $avg = _argv_real_avg($cli);
+    return '' unless defined $avg;
+    my $secs = int($avg + 0.5);
+    $secs = 0 if $secs < 0;
+    $now = time() if !defined $now;
+    my $end = int($now) + $secs;
+    my $clock = POSIX::strftime('%Y%m%d %H:%M:%S', localtime($end));
+    return sprintf('guestimate %ds ending at %s', $secs, $clock);
+}
+
 # stop is one letter shorter than start, so one pad keeps the hash
 # in one column. The pid is five columns inside the brackets.
 sub _job_field {
@@ -3329,15 +3343,20 @@ sub mbsync_job_line {
         $channel = $ch;
         push @boxes, $box if defined $box && $box ne '';
     }
+    my $line;
     if (!$one || !defined $channel || $channel eq '') {
         my $shown = @args ? join(' ', @args) : '';
-        my $line  = sprintf('mbsync: %s [%5d]', $field, $pid);
+        $line = sprintf('mbsync: %s [%5d]', $field, $pid);
         $line .= " $shown" if $shown ne '';
-        return $line;
+    } else {
+        my $hash = sha1_b(join("\0", @args));
+        $line = sprintf('%s: %s %s[%5d]', $channel, $field, $hash, $pid);
+        $line .= ' ' . join(',', @boxes) if @boxes;
     }
-    my $hash = sha1_b(join("\0", @args));
-    my $line = sprintf('%s: %s %s[%5d]', $channel, $field, $hash, $pid);
-    $line .= ' ' . join(',', @boxes) if @boxes;
+    if ($verb eq 'start' && @args) {
+        my $guess = start_guestimate(join("\0", @args));
+        $line .= " $guess" if defined $guess && $guess ne '';
+    }
     return $line;
 }
 

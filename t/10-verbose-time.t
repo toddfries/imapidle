@@ -146,6 +146,25 @@ is($high, 15, 'those processes fill slots 0 through 15');
 is(slot_token(15), 'f', 'the last slot under a cap of 16 is f');
 clear_children_for_test();
 set_connections_for_test(2);
+reset_mbsync_real_for_test();
+note_mbsync_real('fdc-list:INBOX.2026-11', 12.4);
+my $guess_at = 1_700_000_000;
+my $guess_end = POSIX::strftime('%Y%m%d %H:%M:%S', localtime($guess_at + 12));
+is(start_guestimate('fdc-list:INBOX.2026-11', $guess_at),
+    "guestimate 12s ending at $guess_end",
+    'a start guess is the average real seconds and that clock');
+note_mbsync_real('knf', 2.6);
+$guess_end = POSIX::strftime('%Y%m%d %H:%M:%S', localtime($guess_at + 3));
+is(start_guestimate('knf', $guess_at), "guestimate 3s ending at $guess_end",
+    'the guess rounds to the nearest second');
+is(start_guestimate('never-run', $guess_at), '',
+    'a command with no average has no guess');
+my $started = mbsync_job_line('start', 7, { slot => 0 }, 'fdc-list:INBOX.2026-11');
+like($started, qr/ guestimate 12s ending at \d{8} \d{2}:\d{2}:\d{2}\z/,
+    'the start line carries the guess');
+my $stopped = mbsync_job_line('stop', 7, { slot => 0 }, 'fdc-list:INBOX.2026-11');
+unlike($stopped, qr/guestimate/, 'a stop line does not guess');
+reset_mbsync_real_for_test();
 is(mbsync_phrase('fork mbsync', 'fdc-list:INBOX'),
     'fdc-list: fork mbsync INBOX',
     'a fork failure still names the channel once');
