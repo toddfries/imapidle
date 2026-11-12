@@ -272,9 +272,14 @@ The first wait is 30 minutes, measured after
 .Sy mbsync
 exits.
 Every three samples replace the wait.
-No new mail doubles it, up to 6 hours.
+No new mail doubles it.
+When the new wait is longer, one quarter of the added seconds
+is X.
+A kernel random value modulo X is added so those mailboxes do
+not wake together.
+The wait stays between 10 minutes and 6 hours.
 With new mail the wait aims for about 5 messages and is at least
-three times the average sync of that mailbox, and at least 10 minutes.
+three times the average sync of that mailbox.
 A name containing a colon is remembered and not synced: the command
 splits on the first colon.
 A folder the server no longer lists is not tried again until a later

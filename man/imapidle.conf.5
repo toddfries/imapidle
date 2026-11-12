@@ -408,11 +408,16 @@ above 1 and no named sync is using it.
 Every three finished syncs of one mailbox replace its interval.
 Let M be the new messages, S the sum of the three intervals, and D
 the average sync seconds.
-No messages doubles the interval, up to
-.Va max .
+No messages doubles the interval.
 Otherwise the next wait is the larger of
 .Va messages
-times S/M and three times D, then clamped to
+times S/M and three times D.
+When that result is longer than the current interval, one
+quarter of the added seconds is X.
+A kernel random value modulo X, from
+.Xr getentropy 2 ,
+is added so mailboxes that share the math do not share a wake.
+The result is then clamped to
 .Va min
 and
 .Va max .

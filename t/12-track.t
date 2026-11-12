@@ -273,13 +273,22 @@ is(mbsync_new_messages('no summary'), undef, 'a missing Channels line is not zer
 is(mbsync_new_messages("Channels: 1    Boxes: 1    Far: +0 *0 #0 -0    Near: +0 *0 #0 -0\n"),
     0, 'a real zero is a sample');
 
+set_interval_spread_for_test(sub { 0 });
 my $zero = { msgs => 0, dur => 2, span => 1800 };
 is(next_mailbox_interval(1800,  [ ($zero) x 3 ]), 3600,  'no mail doubles 1800 to 3600');
 is(next_mailbox_interval(3600,  [ ($zero) x 3 ]), 7200,  'the next quiet window doubles again');
 is(next_mailbox_interval(7200,  [ ($zero) x 3 ]), 14400, 'quiet continues toward the ceiling');
 is(next_mailbox_interval(14400, [ ($zero) x 3 ]), 21600, '14400 doubles to the 6 hour ceiling');
 is(next_mailbox_interval(21600, [ ($zero) x 3 ]), 21600, 'the ceiling holds');
+set_interval_spread_for_test(sub { $_[0] - 1 });
+is(next_mailbox_interval(1800, [ ($zero) x 3 ]), 4049,
+    'a quiet 1800 adds one less than a quarter of the 1800s increase');
+is(next_mailbox_interval(14400, [ ($zero) x 3 ]), 21600,
+    'the ceiling still holds when the spread would pass it');
+is(next_mailbox_interval(21600, [ ($zero) x 3 ]), 21600,
+    'staying at the ceiling does not grow past max');
 
+set_interval_spread_for_test(sub { 0 });
 my $two = { msgs => 2, dur => 2, span => 1800 };
 is(next_mailbox_interval(1800, [ ($two) x 3 ]), 4500, 'two new messages target 4500s');
 my $many = { msgs => 30, dur => 2, span => 1800 };
@@ -288,6 +297,22 @@ my $slow = { msgs => 30, dur => 400, span => 1800 };
 is(next_mailbox_interval(1800, [ ($slow) x 3 ]), 1200, 'a 400s sync costs 1200s');
 my $rare = { msgs => 2, dur => 400, span => 1800 };
 is(next_mailbox_interval(1800, [ ($rare) x 3 ]), 4500, 'a quiet slow box follows the mail target');
+set_interval_spread_for_test(sub { $_[0] - 1 });
+is(next_mailbox_interval(1800, [ ($two) x 3 ]), 5174,
+    'a longer mail target adds one less than a quarter of the increase');
+is(next_mailbox_interval(1800, [ ($many) x 3 ]), 600,
+    'a shorter wait does not gain the spread');
+set_interval_spread_for_test(undef);
+my (%seen, $outside);
+for (1 .. 24) {
+    my $n = next_mailbox_interval(1800, [ ($zero) x 3 ]);
+    $seen{$n} = 1;
+    $outside = $n if $n < 3600 || $n > 4049;
+}
+ok(!defined $outside, 'kernel spread stays inside the added quarter')
+    or diag("outside 3600..4049: $outside");
+cmp_ok(scalar keys %seen, '>', 1, 'kernel draws are not one repeated value');
+set_interval_spread_for_test(sub { 0 });
 
 reset_mbsync_real_for_test();
 reset_conn_time_for_test();
