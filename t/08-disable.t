@@ -57,8 +57,8 @@ my $limit = start_give_up();
 my $gave_up = stderr_of(sub {
     mark_retry('acct') for 1 .. $limit;
 });
-like($gave_up, qr/acct: retry in 5s/, 'the first failure is retried');
-like($gave_up, qr/acct: disabled after $limit failures/, 'the limit disables the account');
+like($gave_up, qr/acct    : retry in 5s/, 'the first failure is retried');
+like($gave_up, qr/acct    : disabled after $limit failures/, 'the limit disables the account');
 unlike($gave_up, qr/retry in 27s/, 'the disabling failure does not schedule another retry');
 ok(loaded_account('acct')->{disabled}, 'the account is disabled');
 is(account_next_try('acct'), 0, 'a disabled account has no retry time');
@@ -70,7 +70,7 @@ is(loop_timeout(), 30, 'a disabled account does not shorten the wait');
 my $enabled = stderr_of(sub {
     is(reload_config_now($path), '', 'reload accepts the same file');
 });
-like($enabled, qr/acct: enabled/, 'SIGHUP enables the account');
+like($enabled, qr/acct    : enabled/, 'SIGHUP enables the account');
 ok(!loaded_account('acct')->{disabled}, 'the account is no longer disabled');
 is(loaded_account('acct')->{fails}, 0, 'the failure count starts over');
 
@@ -130,22 +130,107 @@ set_foreground_for_test(1);
 my $flagged = stderr_of(sub {
     is(reload_config_now($off), '', 'reload accepts disabled = yes');
 });
-like($flagged, qr/acct: disabled/, 'the flag disables the running section');
+like($flagged, qr/acct    : disabled/, 'the flag disables the running section');
 ok(!conn_exists_for_test('acct:INBOX'), 'the open connection is dropped');
 ok(loaded_account('acct')->{config_disabled}, 'the flag stays on the account');
 my $stay = stderr_of(sub {
     is(reload_config_now($off), '', 'reloading the flag again is accepted');
 });
-unlike($stay, qr/acct: enabled/, 'the flag is not cleared by another reload');
+unlike($stay, qr/acct    : enabled/, 'the flag is not cleared by another reload');
 ok(loaded_account('acct')->{config_disabled}, 'the section remains disabled');
 set_foreground_for_test(1);
 my $back = stderr_of(sub {
     is(reload_config_now($on), '', 'removing yes enables the section');
 });
-like($back, qr/acct: enabled/, 'removing the flag is logged');
+like($back, qr/acct    : enabled/, 'removing the flag is logged');
 ok(!loaded_account('acct')->{disabled}, 'the section is active again');
 is(account_next_try('acct'), 0, 'the enabled section is due to connect');
 set_foreground_for_test(0);
 unlink $on, $off;
+
+clear_conns_for_test();
+is(load_config($path), '', 'fresh account for a dead idle session');
+
+package DeadIMAP;
+sub new { bless { calls => [] }, shift }
+sub IsConnected { 0 }
+sub done   { push @{ $_[0]{calls} }, 'done';   die "done\n" }
+sub idle   { push @{ $_[0]{calls} }, 'idle';   die "idle\n" }
+sub logout { push @{ $_[0]{calls} }, 'logout'; die "logout\n" }
+sub LastError { 'NO not connected' }
+
+package DropIMAP;
+sub new { bless { up => 1, calls => [], err => '' }, shift }
+sub IsConnected { $_[0]{up} }
+sub done {
+    my ($self) = @_;
+    push @{ $self->{calls} }, 'done';
+    $self->{up}  = 0;
+    $self->{err} = 'socket closed while reading data from server';
+    return;
+}
+sub idle   { push @{ $_[0]{calls} }, 'idle';   die "idle\n" }
+sub logout { push @{ $_[0]{calls} }, 'logout'; die "logout\n" }
+sub LastError { $_[0]{err} }
+
+package LiveIMAP;
+sub new { bless { calls => [] }, shift }
+sub IsConnected { 1 }
+sub done   { push @{ $_[0]{calls} }, 'done';   return '* OK' }
+sub idle   { push @{ $_[0]{calls} }, 'idle';   return 41 }
+sub logout { push @{ $_[0]{calls} }, 'logout'; return 1 }
+sub LastError { }
+
+package Sock;
+sub new { bless { closed => 0 }, shift }
+sub close { $_[0]{closed} = 1 }
+
+package main;
+
+my $dead = DeadIMAP->new;
+my $dead_conn = { name => 'acct', mode => 'IDLE', tag => '40', imap => $dead };
+set_foreground_for_test(1);
+my $dead_log = stderr_of(sub {
+    ok(!restart_idle($dead_conn), 'a dead IDLE session does not re-arm');
+});
+is_deeply($dead->{calls}, [], 'DONE and IDLE are not sent on a dead session');
+like($dead_log, qr/acct +: idle re-arm failed: not connected/,
+    'a dead re-arm is one warning');
+unlike($dead_log, qr/Trying command when NOT connected|IMAPClient\.pm/,
+    'a dead re-arm does not dump the library stack');
+
+my $drop = DropIMAP->new;
+my $drop_conn = { name => 'acct', mode => 'IDLE', tag => '40', imap => $drop };
+my $drop_log = stderr_of(sub {
+    ok(!restart_idle($drop_conn), 'a DONE that loses the socket does not send IDLE');
+});
+is_deeply($drop->{calls}, ['done'], 'IDLE is not sent after the socket dies');
+like($drop_log, qr/idle re-arm failed: socket closed while reading data from server/,
+    'the DONE error is the re-arm warning');
+my $sock = Sock->new;
+stderr_of(sub { close_session($drop, $sock) });
+is_deeply($drop->{calls}, ['done'], 'LOGOUT is not sent on a dead session');
+is($sock->{closed}, 1, 'the local socket is still closed');
+
+my $live = LiveIMAP->new;
+my $live_conn = { name => 'acct', mode => 'IDLE', tag => '40', imap => $live };
+ok(restart_idle($live_conn), 'a live session re-arms');
+is_deeply($live->{calls}, [qw(done idle)], 'a live re-arm sends DONE then IDLE');
+is($live_conn->{tag}, 41, 'the new IDLE tag is kept');
+my $live_sock = Sock->new;
+stderr_of(sub { close_session($live, $live_sock) });
+is_deeply($live->{calls}, [qw(done idle logout)], 'a live session still logs out');
+
+my $key = plant_idle_for_test('acct', 'INBOX', 420, 'ch');
+my $held = DeadIMAP->new;
+set_conn_imap_for_test($key, $held, '40');
+my $gone = stderr_of(sub { drop_conn($key, 'idle refresh failed') });
+is_deeply($held->{calls}, [], 'dropping a dead session sends no IMAP command');
+like($gone, qr/acct +: dropping INBOX: idle refresh failed/,
+    'the drop is still logged');
+like($gone, qr/acct +: retry in \d+s/, 'the account still retries');
+unlike($gone, qr/Trying command when NOT connected|IMAPClient\.pm/,
+    'the drop does not dump the library stack');
+set_foreground_for_test(0);
 
 done_testing;

@@ -14,6 +14,7 @@
 
 use strict;
 use warnings;
+use File::Temp qw(tempfile);
 use Test::More;
 
 require './imapidle';
@@ -105,4 +106,40 @@ ok(!mail_event_line('* OK Still here'), 'IDLE keepalive is not mail');
 ok(!mail_event_line('+ idling'), 'IDLE continuation is not mail');
 ok(!mail_event_line('a001 OK IDLE completed'), 'tagged reply is not mail');
 
+is(_clock(1425.25), _clock(1425) =~ s/\.000000\z/.250000/r,
+    'subseconds are six digits after the seconds');
+is(_clock(1425.9999996), _clock(1426), 'a fraction that rounds up carries into the next second');
+
+reset_schedule_for_test();
+is_deeply([jobs(1005)], [], 'no run is queued yet');
+set_foreground_for_test(1);
+my $ready = capture(sub { note_mail_event('ch1', 'INBOX', 420, 0, 1000); });
+set_foreground_for_test(0);
+like($ready, qr/ch1 +: ready INBOX mbsync combines in 5s at \Q@{[_clock(1005)]}\E/,
+    'a ready event names the action, then the folder and the clock time');
+is_deeply([jobs(1005)], ['ch1:INBOX wait=0'], 'the gap clock starts at the run');
+set_foreground_for_test(1);
+my $kept = capture(sub { note_mail_event('ch1', 'INBOX', 420, 0, 1100); });
+set_foreground_for_test(0);
+like($kept, qr/ch1 +: kept  INBOX next sync in 325s at \Q@{[_clock(1425)]}\E/,
+    'a kept event names the action, then the folder and the clock time');
+
 done_testing;
+
+sub capture {
+    my ($code) = @_;
+    my ($fh, $path) = tempfile('imapidle-sched-XXXX', UNLINK => 1, TMPDIR => 1);
+    close $fh;
+    open my $old, '>&', \*STDERR or die "dup stderr: $!";
+    open STDERR, '>', $path or die "redirect stderr: $!";
+    my $err;
+    eval { $code->(); 1 } or $err = $@;
+    open STDERR, '>&', $old or die "restore stderr: $!";
+    close $old;
+    open my $in, '<', $path or die "read stderr: $!";
+    local $/;
+    my $buf = <$in> // '';
+    close $in;
+    die $err if $err;
+    return $buf;
+}

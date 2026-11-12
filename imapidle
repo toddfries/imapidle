@@ -18,13 +18,15 @@ use strict;
 use warnings;
 use Config;
 use Config::Tiny;
+use Errno qw(EINPROGRESS EWOULDBLOCK EINTR);
 use Fcntl;
 use File::Basename qw(dirname);
 use File::Path qw(make_path);
 use Getopt::Std;
 use IO::Select;
 use IO::Socket::SSL;
-use MIME::Base64 qw(encode_base64);
+use Digest::SHA qw(sha256_hex sha1);
+use MIME::Base64 qw(encode_base64 decode_base64);
 use Mail::IMAPClient;
 use POSIX qw(:sys_wait_h :signal_h _exit setsid);
 use Sys::Syslog qw(:standard :macros);
@@ -32,6 +34,11 @@ use Time::HiRes qw(time);
 
 my $CONFIG_DIR;
 my $CONFIG_FILE;
+my $STATE_DIR;
+my $FOLDERS_DIR;
+my $MBSYNC_REAL_FILE;
+my $CONN_TIME_FILE;
+my $RUNTIME_DIR;
 my $KNOWN_HOSTS;
 my $LEARNED;
 my $FOREGROUND = 0;
@@ -43,25 +50,81 @@ my %conns;
 my %sock_to_key;
 my %children;
 my %pulse_next;
+my %PULSE_LAST;
+my $PULSE_LAST_FILE;
 my $pulse_cfg = { disabled => 0, sweep => 3600, channels => [] };
+my $track_cfg;
+my %track;
+my %folder_lists;
+my %list_next;
+my %colon_noted;
+my %CONN_TIME;
+my %MBSYNC_REAL;
+my $pause_announced = 0;
+my $shutdown_reason = '';
+my $shutdown_waiting = 0;
+my $SHUTDOWN = 0;
+my $MBSYNC_BIN = '/usr/local/bin/mbsync';
+my $TRIGGER_HOOK;
 my $select = IO::Select->new();
+my $IO_MAX = 45;
+my $IO_DEPTH = 0;
 my $INFO_R;
 my $INFO_W;
 my $CHLD_R;
 my $CHLD_W;
 
+# sha1 -b: 20-byte digest, base64, 28 characters with the trailing '='.
+# Same bytes as /bin/sha1 -q -b. An identifier for a command, not a check.
+sub sha1_b {
+    my ($bytes) = @_;
+    $bytes = '' unless defined $bytes;
+    return encode_base64(sha1($bytes), '');
+}
+
+# Longest account name, mbsync channel, or pulse channel. imapidle, pulse,
+# and track share that column. A longer name is not cut.
+sub _name_width {
+    my $w = length 'imapidle';
+    for my $word (qw(pulse track)) {
+        $w = length($word) if length($word) > $w;
+    }
+    for my $name (keys %accounts) {
+        $w = length($name) if length($name) > $w;
+        my $ch = $accounts{$name}{mbsync_channel} // '';
+        $w = length($ch) if length($ch) > $w;
+    }
+    for my $ch (@{ $pulse_cfg->{channels} // [] }) {
+        $w = length($ch) if defined $ch && length($ch) > $w;
+    }
+    return $w;
+}
+
+# Left-align the name and put the colon in one column. One space follows it.
+sub _align_prefix {
+    my ($msg) = @_;
+    return $msg unless defined $msg && $msg =~ /^(\S+): (.*)\z/s;
+    return sprintf('%-*s: %s', _name_width(), $1, $2);
+}
+
+sub _prepare_log {
+    my ($msg) = @_;
+    $msg //= '';
+    $msg =~ s/[\r\n]+/ /g;
+    $msg = _align_prefix($msg);
+    return substr($msg, 0, 500);
+}
+
 sub log_line {
     my ($pri, $msg) = @_;
-    $msg =~ s/[\r\n]+/ /g;
-    $msg = substr($msg, 0, 500);
+    $msg = _prepare_log($msg);
     syslog($pri, '%s', $msg) if $LOG_OPEN;
     print STDERR "imapidle: $msg\n" if $FOREGROUND;
 }
 
 sub emit_state {
     my ($msg) = @_;
-    $msg =~ s/[\r\n]+/ /g;
-    $msg = substr($msg, 0, 500);
+    $msg = _prepare_log($msg);
     if ($FOREGROUND) {
         print STDERR "imapidle: $msg\n";
         return;
@@ -224,6 +287,14 @@ sub approve_fingerprint {
 
 # What a server did with NOTIFY. Absent and rejected stay on IDLE and
 # are not probed again. Delete the host's line to learn it again.
+sub _learned_extra_keys {
+    return qw(
+        id_hash id_status id_next id_interval id_quiet
+        id_changes id_gap_total id_last_change
+        cap_hash cap_next cap_force cap_has_notify
+    );
+}
+
 sub load_learned {
     my %rows;
     return %rows unless defined $LEARNED && -f $LEARNED;
@@ -231,10 +302,21 @@ sub load_learned {
     while (<$fh>) {
         chomp;
         next if /^\s*#/ || /^\s*$/;
-        my ($host, $notify, $id) = split /\s+/, $_, 3;
+        my ($host, $notify, @rest) = split /\t/, $_, -1;
         next unless defined $host && $host ne '';
-        next unless defined $notify && $notify =~ /^(absent|rejected|active)\z/;
-        $rows{$host} = { notify => $notify, id => $id // '' };
+        next unless defined $notify;
+        next unless $notify eq '' || $notify =~ /^(absent|rejected|active)\z/;
+        my $row = { notify => $notify, id => '' };
+        if (@rest && defined $rest[0] && $rest[0] !~ /=/) {
+            $row->{id} = shift @rest;
+        }
+        for my $kv (@rest) {
+            next unless defined $kv && $kv =~ /=/;
+            my ($k, $v) = split /=/, $kv, 2;
+            next unless defined $k && $k ne '' && defined $v;
+            $row->{$k} = $v;
+        }
+        $rows{$host} = $row;
     }
     close $fh;
     return %rows;
@@ -253,13 +335,22 @@ sub save_learned {
     print $fh "# server:port\tnotify\tid\n";
     print $fh "# Delete a host line to probe that server again.\n\n";
     for my $host (sort keys %rows) {
-        my $row = $rows{$host};
-        my $id  = $row->{id} // '';
-        if ($id ne '') {
-            print $fh "$host\t$row->{notify}\t$id\n";
-        } else {
-            print $fh "$host\t$row->{notify}\n";
+        my $row = $rows{$host} or next;
+        my $notify = $row->{notify} // '';
+        next unless $notify eq '' || $notify =~ /^(absent|rejected|active)\z/;
+        my $id = $row->{id} // '';
+        my @extra;
+        for my $k (_learned_extra_keys()) {
+            my $v = $row->{$k};
+            next unless defined $v && $v ne '' && $v ne '0';
+            $v =~ s/[\r\n\t]//g;
+            push @extra, "$k=$v";
         }
+        next if $notify eq '' && $id eq '' && !@extra;
+        my @cols = ($host, $notify);
+        push @cols, $id if $id ne '';
+        push @cols, @extra;
+        print $fh join("\t", @cols), "\n";
     }
     close $fh;
     umask $old;
@@ -303,10 +394,14 @@ sub remember_discovery {
     my %rows = load_learned();
     my $prev = $rows{$host};
     my $same = $prev
-        && $prev->{notify} eq $notify
+        && ($prev->{notify} // '') eq $notify
         && ($prev->{id} // '') eq $id;
     return $notify if $same;
-    $rows{$host} = { notify => $notify, id => $id };
+    my $row = { %{ $prev // {} } };
+    $row->{notify} = $notify;
+    $row->{id} = $id;
+    delete $row->{cap_has_notify};
+    $rows{$host} = $row;
     save_learned(%rows);
     _log_discovery($name, $notify, $id, $folders);
     return $notify;
@@ -401,8 +496,562 @@ sub _parse_pulse_section {
     return { disabled => 0, sweep => $sweep, channels => \@channels };
 }
 
+sub _blank_track {
+    return {
+        disabled    => 0,
+        min         => 600,
+        messages    => 5,
+        initial     => 1800,
+        max         => 21600,
+        list        => 259200,
+        id          => 604800,
+        capability  => 604800,
+        connections => 2,
+    };
+}
+
+$track_cfg = _blank_track();
+
+# [track] is not an account. Missing section means these defaults.
+sub _parse_track_section {
+    my ($row, $problems) = @_;
+    my $cfg = _blank_track();
+    return $cfg unless ref $row eq 'HASH';
+    my $bad = sub { push @$problems, "[track] $_[0]"; };
+    $cfg->{disabled} = 1 if _config_disabled($row->{disabled});
+
+    for my $key (qw(min messages initial max list id capability connections)) {
+        next unless exists $row->{$key};
+        if (!defined $row->{$key} || $row->{$key} !~ /^\d+$/) {
+            $bad->("bad $key");
+            next;
+        }
+        $cfg->{$key} = $row->{$key} + 0;
+    }
+    $bad->('bad min')         if $cfg->{min} < 60;
+    $bad->('bad list')        if $cfg->{list} < 60;
+    $bad->('bad id')          if $cfg->{id} < 60;
+    $bad->('bad capability')  if $cfg->{capability} < 60;
+    $bad->('bad messages')    if $cfg->{messages} < 1;
+    $bad->('bad connections') if $cfg->{connections} < 1;
+    $bad->('bad max')         if $cfg->{max} < $cfg->{min};
+    $bad->('capability below id') if $cfg->{capability} < $cfg->{id};
+    return $cfg;
+}
+
+sub install_track {
+    my ($new, $reload) = @_;
+    $new //= _blank_track();
+    my $old = $track_cfg // _blank_track();
+    if ($reload) {
+        log_info('track: disabled') if $new->{disabled} && !$old->{disabled};
+        log_info('track: enabled')  if !$new->{disabled} && $old->{disabled};
+    }
+    $track_cfg = { %$new };
+}
+
+# Mailbox wait after mbsync exits. samples are {msgs, dur, span}.
+sub next_mailbox_interval {
+    my ($current, $samples, $cfg) = @_;
+    $cfg //= $track_cfg;
+    $current = $cfg->{initial} unless defined $current;
+    my ($msgs, $span, $dur, $n) = (0, 0, 0, 0);
+    for my $s (@{ $samples // [] }) {
+        $msgs += $s->{msgs} // 0;
+        $span += $s->{span} // 0;
+        $dur  += $s->{dur}  // 0;
+        $n++;
+    }
+    my $next;
+    if ($n && $msgs > 0 && $span > 0) {
+        my $by_mail = $cfg->{messages} * $span / $msgs;
+        my $by_cost = 3 * ($dur / $n);
+        $next = $by_mail > $by_cost ? $by_mail : $by_cost;
+    } else {
+        $next = $current * 2;
+    }
+    $next = $cfg->{min} if $next < $cfg->{min};
+    $next = $cfg->{max} if $next > $cfg->{max};
+    return int($next + 0.5);
+}
+
+# One new hash halves the gap. Three quiet checks double it.
+# Both stop at [min, capability].
+sub next_id_interval {
+    my ($current, $changed, $cfg) = @_;
+    $cfg //= $track_cfg;
+    $current = $cfg->{id} unless defined $current && $current > 0;
+    my $next = $changed ? int($current / 2) : $current * 2;
+    my $floor = $cfg->{min};
+    my $ceil  = $cfg->{capability};
+    $next = $floor if $next < $floor;
+    $next = $ceil  if $next > $ceil;
+    return int($next);
+}
+
+sub id_command { return 'ID ("name" "imapidle" "version" "0.1")'; }
+
+sub id_reply_hash {
+    my ($line) = @_;
+    return 'NIL' unless defined $line && $line ne '';
+    return 'NIL' if $line =~ /\bNIL\b/ && $line !~ /"/;
+    my @s = $line =~ /"((?:\\.|[^"\\])*)"/g;
+    return 'NIL' unless @s;
+    my @pairs;
+    for (my $i = 0; $i + 1 < @s; $i += 2) {
+        push @pairs, lc($s[$i]) . "\0" . $s[$i + 1];
+    }
+    return sha256_hex(join("\n", sort @pairs));
+}
+
+sub capability_hash {
+    my (@caps) = @_;
+    return sha256_hex(join(' ', sort map { uc $_ } @caps));
+}
+
+sub mbsync_new_messages {
+    my ($text) = @_;
+    return unless defined $text;
+    my $n;
+    for my $line (split /\n/, $text) {
+        if ($line =~ /^Channels: \d+    Boxes: \d+    Far: \+(\d+) \*\d+ #\d+ -\d+    Near: \+(\d+) /) {
+            $n = $1 + $2;
+        }
+    }
+    return $n;
+}
+
+sub _encode_box {
+    my ($name) = @_;
+    $name =~ s/\\/\\\\/g;
+    $name =~ s/\r/\\r/g;
+    $name =~ s/\n/\\n/g;
+    return $name;
+}
+
+sub _decode_box {
+    my ($name) = @_;
+    $name =~ s/\\\\/\0/g;
+    $name =~ s/\\n/\n/g;
+    $name =~ s/\\r/\r/g;
+    $name =~ s/\0/\\/g;
+    return $name;
+}
+
+sub folder_names_from_list {
+    my ($recs) = @_;
+    my @names;
+    for my $rec (@{ $recs // [] }) {
+        next unless ref $rec eq 'HASH' && defined $rec->{name} && $rec->{name} ne '';
+        my $skip = 0;
+        for my $attr (@{ $rec->{attrs} // [] }) {
+            my $a = lc $attr;
+            $skip = 1 if $a eq '\\noselect' || $a eq '\\nonexistent';
+        }
+        next if $skip;
+        push @names, $rec->{name};
+    }
+    return @names;
+}
+
+sub _hot_name {
+    my ($name, $hot) = @_;
+    return 0 unless defined $name && $hot;
+    return 1 if $hot->{$name};
+    return 0 unless uc($name) eq 'INBOX';
+    for my $key (keys %$hot) {
+        return 1 if $hot->{$key} && uc($key) eq 'INBOX';
+    }
+    return 0;
+}
+
+sub _track_key {
+    my ($channel, $box) = @_;
+    return $channel . "\0" . $box;
+}
+
+# $ok is false when LIST failed. $hot is a hash of folderN names.
+sub apply_folder_list {
+    my ($channel, $names, $hot, $ok, $now) = @_;
+    return unless defined $channel && $channel ne '';
+    $now //= time();
+    $hot //= {};
+    my $st = $folder_lists{$channel} //= { names => {}, had_file => 0 };
+    if (!$ok) {
+        $list_next{$channel} = $now + ($track_cfg->{initial} // 1800);
+        return;
+    }
+    $names //= [];
+    my %new = map { $_ => 1 } @$names;
+    if (!$st->{had_file}) {
+        log_info("$channel: " . scalar(@$names) . " folders, list saved");
+    } else {
+        for my $name (sort keys %{ $st->{names} }) {
+            next if $new{$name};
+            log_info("$channel: folder $name removed");
+            delete $track{_track_key($channel, $name)};
+        }
+        for my $name (sort @$names) {
+            next if $st->{names}{$name};
+            log_info("$channel: folder $name added");
+        }
+    }
+    my $fresh = !$st->{had_file};
+    $st->{names}    = \%new;
+    $st->{had_file} = 1;
+    _save_folder_file($channel);
+
+    my %keep;
+    for my $name (@$names) {
+        my $id = _track_key($channel, $name);
+        if (index($name, ':') >= 0) {
+            log_info("$channel: folder $name not tracked") unless $colon_noted{$id};
+            $colon_noted{$id} = 1;
+            delete $track{$id};
+            next;
+        }
+        if (_hot_name($name, $hot)) {
+            delete $track{$id};
+            next;
+        }
+        $keep{$id} = 1;
+        next if $track{$id} && !$fresh;
+        my $added = !$fresh && !$track{$id};
+        $track{$id} = {
+            interval => $track_cfg->{initial},
+            next     => $now + $track_cfg->{initial},
+            samples  => [],
+            fails    => 0,
+        } unless $track{$id};
+        # A name already tracked keeps its clock. A brand-new list and
+        # a name that appeared later both start at initial.
+        $track{$id}{next} = $now + $track_cfg->{initial} if $added || $fresh;
+    }
+    for my $id (keys %track) {
+        my ($ch) = split /\0/, $id, 2;
+        next if !defined $ch || $ch ne $channel;
+        delete $track{$id} unless $keep{$id};
+    }
+    $list_next{$channel} = $now + $track_cfg->{list};
+}
+
+sub _save_folder_file {
+    my ($channel) = @_;
+    return unless defined $FOLDERS_DIR && $FOLDERS_DIR ne '';
+    return if $channel =~ m{[/\\]};
+    my $st = $folder_lists{$channel} or return;
+    make_path($FOLDERS_DIR, { mode => 0700 });
+    my $path = "$FOLDERS_DIR/$channel";
+    my $old  = umask 077;
+    open my $fh, '>', $path or do {
+        umask $old;
+        log_error("Cannot write $path: $!");
+        return;
+    };
+    for my $name (sort keys %{ $st->{names} }) {
+        print $fh _encode_box($name), "\n";
+    }
+    close $fh;
+    umask $old;
+}
+
+sub _load_folder_file {
+    my ($channel) = @_;
+    return unless defined $FOLDERS_DIR && $FOLDERS_DIR ne '';
+    my $path = "$FOLDERS_DIR/$channel";
+    return unless -f $path;
+    open my $fh, '<', $path or return;
+    my %names;
+    while (<$fh>) {
+        chomp;
+        next if $_ eq '';
+        $names{_decode_box($_)} = 1;
+    }
+    close $fh;
+    $folder_lists{$channel} = { names => \%names, had_file => 1 };
+}
+
+sub load_folder_files {
+    %folder_lists = ();
+    return unless defined $FOLDERS_DIR && -d $FOLDERS_DIR;
+    opendir my $dh, $FOLDERS_DIR or return;
+    for my $name (readdir $dh) {
+        next if $name eq '.' || $name eq '..';
+        next if $name =~ m{[/\\]};
+        _load_folder_file($name);
+    }
+    closedir $dh;
+}
+
+# user, sys, rss, and the six counters. nr is how many runs added them.
+# Real seconds keep using n, so a three-column history is not zero rss.
+my @RU_FIELDS = qw(user sys rss minflt majflt inblock oublock nvcsw nivcsw);
+
+sub _stat_num {
+    my ($n) = @_;
+    return '0' if !defined $n || $n == 0;
+    return sprintf('%.15g', $n);
+}
+
+# A sha1 -b token decodes to 20 bytes that are not text. Anything that
+# decodes to printable ASCII and NUL is an older base64 key.
+sub _sha1_b_token {
+    my ($field) = @_;
+    return 0 unless defined $field && length($field) == 28;
+    return 0 unless $field =~ /\A[A-Za-z0-9+\/]{27}=\z/;
+    my $raw = eval { decode_base64($field) };
+    return 0 unless defined $raw && length($raw) == 20;
+    return 0 if $raw =~ /\A[\x20-\x7e\0]*\z/;
+    return 1;
+}
+
+sub _key_from_stored {
+    my ($field) = @_;
+    return $field if _sha1_b_token($field);
+    my $raw = eval { decode_base64($field) };
+    return unless defined $raw && $raw ne '';
+    return unless $raw =~ /\A[\x20-\x7e\0]*\z/;
+    return sha1_b($raw);
+}
+
+sub _memory_key {
+    my ($cli) = @_;
+    return if !defined $cli || $cli eq '';
+    return $cli if _sha1_b_token($cli);
+    return sha1_b($cli);
+}
+
+sub _absorb_stat_row {
+    my ($dest, $key, $row) = @_;
+    my $have = $dest->{$key};
+    if (!$have) {
+        $dest->{$key} = $row;
+        return;
+    }
+    $have->{n}     += $row->{n};
+    $have->{total} += $row->{total};
+    return unless ($row->{nr} // 0) > 0;
+    if (($have->{nr} // 0) > 0) {
+        for my $f (@RU_FIELDS) {
+            $have->{$f} += $row->{$f} // 0;
+        }
+        $have->{nr} += $row->{nr};
+    } else {
+        for my $f (@RU_FIELDS) {
+            $have->{$f} = $row->{$f} // 0;
+        }
+        $have->{nr} = $row->{nr};
+    }
+}
+
+sub _stat_load {
+    my ($path, $dest) = @_;
+    %$dest = ();
+    return unless defined $path && -f $path;
+    open my $fh, '<', $path or return;
+    while (<$fh>) {
+        chomp;
+        next if /^\s*#/ || /^\s*$/;
+        my ($field, $n, $total, @rest) = split /\t/, $_;
+        next unless defined $field && defined $n && defined $total;
+        next unless $n =~ /^\d+$/ && $total =~ /^[\d.]+$/;
+        my $key = _key_from_stored($field);
+        next unless defined $key && $key ne '';
+        my $row = { n => $n + 0, total => $total + 0 };
+        if (@rest == @RU_FIELDS + 1) {
+            my $nr = $rest[-1];
+            my $ok = $nr =~ /^\d+$/ && $nr > 0;
+            for my $i (0 .. $#RU_FIELDS) {
+                $ok = 0 if $rest[$i] !~ /^[\d.]+$/;
+            }
+            if ($ok) {
+                for my $i (0 .. $#RU_FIELDS) {
+                    $row->{ $RU_FIELDS[$i] } = $rest[$i] + 0;
+                }
+                $row->{nr} = $nr + 0;
+            }
+        }
+        _absorb_stat_row($dest, $key, $row);
+    }
+    close $fh;
+}
+
+sub _stat_save {
+    my ($path, $src) = @_;
+    return unless defined $path && $path ne '';
+    my $dir = dirname($path);
+    make_path($dir, { mode => 0700 }) if $dir ne '' && $dir ne '.';
+    my $old = umask 077;
+    open my $fh, '>', $path or do {
+        umask $old;
+        log_error("Cannot write $path: $!");
+        return;
+    };
+    print $fh "# key\tcount\ttotal\n";
+    for my $key (sort keys %$src) {
+        my $row = $src->{$key} or next;
+        my @cols = ($key, $row->{n}, _stat_num($row->{total}));
+        if (($row->{nr} // 0) > 0) {
+            push @cols, map { _stat_num($row->{$_} // 0) } @RU_FIELDS;
+            push @cols, $row->{nr};
+        }
+        print $fh join("\t", @cols), "\n";
+    }
+    close $fh;
+    umask $old;
+}
+
+sub load_stat_files {
+    _stat_load($MBSYNC_REAL_FILE, \%MBSYNC_REAL) if defined $MBSYNC_REAL_FILE;
+    _stat_load($CONN_TIME_FILE,   \%CONN_TIME);
+}
+
+sub save_stat_files {
+    _stat_save($MBSYNC_REAL_FILE, \%MBSYNC_REAL) if defined $MBSYNC_REAL_FILE;
+    _stat_save($CONN_TIME_FILE,   \%CONN_TIME)   if defined $CONN_TIME_FILE;
+}
+
+sub note_conn_time {
+    my ($key, $seconds) = @_;
+    $key = _memory_key($key);
+    return unless defined $key;
+    $seconds = 0 if !defined $seconds || $seconds < 0;
+    my $row = $CONN_TIME{$key} //= { n => 0, total => 0 };
+    $row->{n}++;
+    $row->{total} += $seconds;
+    _stat_save($CONN_TIME_FILE, \%CONN_TIME) if defined $CONN_TIME_FILE && $CONN_TIME_FILE ne '';
+    return sprintf('(x%d avg %.2fs)', $row->{n}, $row->{total} / $row->{n});
+}
+
+sub _conn_time_key {
+    my ($conn) = @_;
+    return unless ref $conn eq 'HASH';
+    my $name = $conn->{name} // '';
+    return if $name eq '';
+    my $what = ($conn->{mode} // '') eq 'NOTIFY' ? 'notify' : ($conn->{folder} // '');
+    return if $what eq '';
+    return $name . "\0" . $what;
+}
+
+sub runtime_dir {
+    return $RUNTIME_DIR if defined $RUNTIME_DIR && $RUNTIME_DIR ne '';
+    return unless defined $ENV{HOME} && $ENV{HOME} ne '';
+    return "$ENV{HOME}/tmp";
+}
+
+sub _flag_file {
+    my ($base) = @_;
+    my $dir = runtime_dir();
+    return unless defined $dir;
+    for my $suffix ('', '.mail', '.imapidle') {
+        my $path = "$dir/$base$suffix";
+        return $path if -e $path;
+    }
+    return;
+}
+
+sub pause_path     { return _flag_file('pause'); }
+sub shutdown_path  { return _flag_file('shutdown'); }
+
+sub mbsync_running { return scalar keys %children; }
+
+# A channel:box child that is not a tracked or pulse job.
+sub _child_is_hot_sync {
+    my ($rec) = @_;
+    return 0 unless ref $rec eq 'HASH';
+    return 0 if defined $rec->{pulse} && $rec->{pulse} ne '';
+    return 0 if defined $rec->{track} && $rec->{track} ne '';
+    for my $arg (@{ $rec->{args} // [] }) {
+        return 1 if defined $arg && index($arg, ':') >= 0;
+    }
+    return 0;
+}
+
+sub _hot_running {
+    my $n = 0;
+    for my $pid (keys %children) {
+        $n++ if _child_is_hot_sync($children{$pid});
+    }
+    return $n;
+}
+
+# A due pulse channel that is not already running.
+sub _pulse_wants_slot {
+    my ($now) = @_;
+    $now //= time();
+    return 0 if $pulse_cfg->{disabled};
+    for my $ch (@{ $pulse_cfg->{channels} // [] }) {
+        next unless exists $pulse_next{$ch};
+        next if ($pulse_next{$ch} // 0) > $now;
+        next if channel_busy($ch);
+        return 1;
+    }
+    return 0;
+}
+
+sub slots_for_hot {
+    my ($now) = @_;
+    my $cap  = $track_cfg->{connections} // 1;
+    my $left = $cap - mbsync_running();
+    return 0 if $left <= 0;
+    # One slot for named folders; pulse may use the rest.
+    if ($cap > 1 && _pulse_wants_slot($now)) {
+        my $room = 1 - _hot_running();
+        $room = 0 if $room < 0;
+        $left = $room if $left > $room;
+    }
+    return $left;
+}
+
+sub slots_for_cold {
+    my ($now) = @_;
+    my $cap     = $track_cfg->{connections} // 1;
+    my $running = mbsync_running();
+    if ($cap <= 1) {
+        return 0 if named_sync_pending();
+        my $left = $cap - $running;
+        return $left > 0 ? $left : 0;
+    }
+    # The reserved slot is the running named sync. A queued named
+    # folder keeps it free. Pulse and tracked use what remains.
+    my $held = _hot_running();
+    $held = 1 if $held > 1;
+    my $blocked = 1 - $held;
+    $blocked = 0 if $blocked < 0;
+    $blocked = 1 if $held == 0 && _named_queued();
+    my $left = $cap - $blocked - $running;
+    return $left > 0 ? $left : 0;
+}
+
+sub adopt_state_file {
+    my ($dest, $src) = @_;
+    return 0 unless defined $dest && $dest ne '' && defined $src && -f $src;
+    return 0 if -e $dest;
+    my $dir = dirname($dest);
+    make_path($dir, { mode => 0700 }) if $dir ne '' && $dir ne '.';
+    open my $in, '<', $src or return 0;
+    my $old = umask 077;
+    open my $out, '>', $dest or do {
+        umask $old;
+        close $in;
+        return 0;
+    };
+    while (<$in>) { print $out $_; }
+    close $in;
+    close $out;
+    umask $old;
+    log_info("copied " . basename_file($src) . " to $dir");
+    return 1;
+}
+
+sub basename_file {
+    my ($path) = @_;
+    $path =~ s{.*/}{};
+    return $path;
+}
+
 # Returns (hashref, '') or (undef, error). Does not touch %accounts.
-# The third value is the pulse section, and only matters on success.
+# The third value is the pulse section. The fourth is track defaults.
 sub parse_config_file {
     my ($file) = @_;
     my $cfg = Config::Tiny->read($file)
@@ -410,8 +1059,9 @@ sub parse_config_file {
 
     my (%fresh, @problems);
     my $pulse = _parse_pulse_section($cfg->{pulse}, \@problems);
+    my $track = _parse_track_section($cfg->{track}, \@problems);
     for my $section (sort keys %{$cfg}) {
-        next if $section eq '_' || $section eq 'pulse';
+        next if $section eq '_' || $section eq 'pulse' || $section eq 'track';
         my $row = $cfg->{$section};
         next unless ref $row eq 'HASH';
 
@@ -511,7 +1161,7 @@ sub parse_config_file {
     unless (%fresh || _pulse_usable($pulse)) {
         return (undef, 'no usable accounts in ' . $file);
     }
-    return (\%fresh, '', $pulse);
+    return (\%fresh, '', $pulse, $track);
 }
 
 sub _config_disabled {
@@ -605,19 +1255,70 @@ sub install_pulse {
         sweep    => $new->{sweep},
         channels => [ @{ $new->{channels} } ],
     };
+    # A fresh start reads pulse-last. Exits recorded only in this process
+    # are dropped when that file is absent. SIGHUP keeps the in-memory clock.
+    if (!$reload) {
+        _pulse_last_load();
+        _apply_pulse_last();
+    }
+}
+
+# Last pulse exit, one channel per line. A missing channel is due.
+sub _pulse_last_load {
+    %PULSE_LAST = ();
+    return unless defined $PULSE_LAST_FILE && -f $PULSE_LAST_FILE;
+    open my $fh, '<', $PULSE_LAST_FILE or return;
+    while (<$fh>) {
+        chomp;
+        next if /^\s*#/ || /^\s*$/;
+        my ($ch, $when) = split /\t/, $_, 2;
+        next unless defined $ch && $ch ne '' && $ch !~ /[\s:]/;
+        next unless defined $when && $when =~ /^[\d.]+$/;
+        $PULSE_LAST{$ch} = $when + 0;
+    }
+    close $fh;
+}
+
+sub _pulse_last_save {
+    return unless defined $PULSE_LAST_FILE && $PULSE_LAST_FILE ne '';
+    my $dir = dirname($PULSE_LAST_FILE);
+    make_path($dir, { mode => 0700 }) if $dir ne '' && $dir ne '.';
+    my $old = umask 077;
+    open my $fh, '>', $PULSE_LAST_FILE or do {
+        umask $old;
+        log_error("Cannot write $PULSE_LAST_FILE: $!");
+        return;
+    };
+    print $fh "# channel\tlast\n";
+    for my $ch (sort keys %PULSE_LAST) {
+        print $fh "$ch\t", _stat_num($PULSE_LAST{$ch}), "\n";
+    }
+    close $fh;
+    umask $old;
+}
+
+sub _apply_pulse_last {
+    return if $pulse_cfg->{disabled};
+    my $sweep = $pulse_cfg->{sweep} // 3600;
+    for my $ch (@{ $pulse_cfg->{channels} // [] }) {
+        next unless exists $PULSE_LAST{$ch};
+        $pulse_next{$ch} = $PULSE_LAST{$ch} + $sweep;
+    }
 }
 
 sub load_config {
     my ($file) = @_;
-    my ($fresh, $err, $off) = parse_config_file($file);
+    my ($fresh, $err, $off, $track) = parse_config_file($file);
     %accounts = ();
     if ($err || !$fresh) {
         reset_pulse_state();
+        install_track(_blank_track(), 0);
         return $err if $err;
         return 'empty config';
     }
     %accounts = %$fresh;
     install_pulse($off, 0);
+    install_track($track, 0);
     _log_loaded_account($_) for sort keys %accounts;
     return '';
 }
@@ -657,7 +1358,9 @@ sub capture_pass_cmd {
         open STDERR, '>', '/dev/null';
         close $wr;
         $SIG{HUP}  = 'DEFAULT';
+        $SIG{CHLD} = 'DEFAULT';
         $SIG{INFO} = 'DEFAULT';
+        _restore_wake_mask();
         exec '/bin/sh', '-c', $cmd
             or _exit(127);
     }
@@ -721,25 +1424,703 @@ sub capture_pass_cmd {
     return $line;
 }
 
+sub secret_floor   { 60 }
+sub secret_ceiling { 21600 }
+sub secret_quiet   { 86400 }
+
+# pass_cmd keeps its own wait. A live mailbox resets backoff after five
+# minutes, and that must not pull a broken helper back to five seconds.
+sub note_secret_failure {
+    my ($name, $now) = @_;
+    my $acc = $accounts{$name} or return;
+    return if $acc->{disabled};
+    $now //= time();
+    my $wait = $acc->{secret_wait} || secret_floor();
+    $wait = secret_floor()   if $wait < secret_floor();
+    $wait = secret_ceiling() if $wait > secret_ceiling();
+    $acc->{next_try} = $now + $wait;
+    my $next = $wait * 2;
+    $next = secret_ceiling() if $next > secret_ceiling();
+    $acc->{secret_wait} = $next;
+    my $said = $acc->{secret_said} // 0;
+    if (!$said || $now - $said >= secret_quiet()) {
+        $acc->{secret_said} = $now;
+        log_error("$name: pass_cmd failed");
+    }
+}
+
+sub note_secret_recovered {
+    my ($name) = @_;
+    my $acc = $accounts{$name} or return;
+    return unless $acc->{secret_said};
+    delete $acc->{secret_wait};
+    delete $acc->{secret_said};
+    log_info("$name: pass_cmd recovered");
+}
+
 sub account_pass {
     my ($name) = @_;
     my $acc = $accounts{$name} or return;
     if (defined $acc->{pass_cmd}) {
         my $pw = capture_pass_cmd($acc->{pass_cmd});
-        log_error("$name: pass_cmd failed") unless defined $pw;
+        if (!defined $pw) {
+            note_secret_failure($name);
+            return;
+        }
+        note_secret_recovered($name);
         return $pw;
     }
     return $acc->{pass};
 }
 
-sub create_imap_connection {
-    my ($name, $acc, $folder, $password) = @_;
-    my $socket = IO::Socket::SSL->new(
-        PeerAddr        => $acc->{server},
-        PeerPort        => $acc->{port},
-        SSL_verify_mode => SSL_VERIFY_NONE,
-        SSL_hostname    => $acc->{server},
-    ) or die "SSL socket: $! $@";
+# One wait, every socket. A stalled handshake used to sit in a blocking
+# SSL connect and the select loop never ran. 45s is the ceiling. While
+# this socket waits, other IMAP sockets and mbsync are polled.
+sub _wait_slice {
+    my ($left) = @_;
+    return $left unless $track_cfg;
+    my $hint = eval { loop_timeout() };
+    return $left unless defined $hint && $hint < $left;
+    return $hint;
+}
+
+# OpenBSD SYS_pselect. A Perl SIGCHLD handler mallocs, and OpenBSD
+# aborts if that happens inside malloc. A burst of mbsync exits did
+# that. CHLD and INFO stay blocked except for the duration of pselect.
+my $SYS_pselect = 110;
+my $WAKE_HELD   = 0;
+my $SELECT_MASK;
+
+sub _wake_set {
+    my $set  = POSIX::SigSet->new();
+    my $chld = _signal_number('CHLD');
+    my $info = _signal_number('INFO');
+    $set->addset($chld) if defined $chld;
+    $set->addset($info) if defined $info;
+    return $set;
+}
+
+sub hold_wake_signals {
+    return if $WAKE_HELD;
+    $SELECT_MASK = POSIX::SigSet->new();
+    POSIX::sigprocmask(POSIX::SIG_BLOCK(), _wake_set(), $SELECT_MASK);
+    $WAKE_HELD = 1;
+}
+
+# Exec'd children must reap their own processes. The saved mask is the
+# one from before CHLD and INFO were blocked.
+sub _restore_wake_mask {
+    return unless $WAKE_HELD && $SELECT_MASK;
+    POSIX::sigprocmask(POSIX::SIG_SETMASK(), $SELECT_MASK);
+}
+
+sub _pselect {
+    my $timeout = $_[3];
+    unless ($WAKE_HELD) {
+        return CORE::select($_[0], $_[1], $_[2], $timeout);
+    }
+    my $nfds = 0;
+    for my $i (0, 1, 2) {
+        next unless defined $_[$i];
+        my $n = length($_[$i]) * 8;
+        $nfds = $n if $n > $nfds;
+    }
+    if ($nfds > 0) {
+        my $bytes = int(($nfds + 7) / 8);
+        for my $i (0, 1, 2) {
+            next unless defined $_[$i];
+            my $len = length($_[$i]);
+            $_[$i] .= "\0" x ($bytes - $len) if $len < $bytes;
+        }
+    }
+    my $ts;
+    if (defined $timeout) {
+        my $sec  = int($timeout);
+        $sec = 0 if $sec < 0;
+        my $frac = $timeout - int($timeout);
+        $frac = 0 if $frac < 0;
+        my $nsec = int($frac * 1_000_000_000 + 0.5);
+        if ($nsec >= 1_000_000_000) {
+            $sec++;
+            $nsec -= 1_000_000_000;
+        }
+        $ts = pack('q q', $sec, $nsec);
+    }
+    my $mask = $$SELECT_MASK;
+    my $n    = syscall(
+        $SYS_pselect, $nfds,
+        (defined $_[0] ? $_[0] : undef),
+        (defined $_[1] ? $_[1] : undef),
+        (defined $_[2] ? $_[2] : undef),
+        (defined $ts  ? $ts    : undef),
+        $mask,
+    );
+    return undef if !defined $n || $n < 0;
+    return $n;
+}
+
+sub _handles_ready {
+    my ($timeout) = @_;
+    my @handles = $select->handles;
+    my ($rin, $win, $ein) = ('', '', '');
+    for my $fh (@handles) {
+        my $fd = fileno($fh);
+        next unless defined $fd;
+        vec($rin, $fd, 1) = 1;
+    }
+    my $n = _pselect($rin, $win, $ein, $timeout);
+    return () if !defined $n || $n <= 0;
+    my @ready;
+    for my $fh (@handles) {
+        my $fd = fileno($fh);
+        next unless defined $fd && vec($rin, $fd, 1);
+        push @ready, $fh;
+    }
+    return @ready;
+}
+
+sub _fd_ready {
+    my ($sock, $write, $timeout) = @_;
+    my $fd = fileno($sock);
+    return 0 unless defined $fd;
+    if (!$write && eval { $sock->can('pending') && $sock->pending }) {
+        return 1;
+    }
+    my ($rin, $win, $ein) = ('', '', '');
+    if ($write) {
+        vec($win, $fd, 1) = 1;
+        vec($ein, $fd, 1) = 1;
+    } else {
+        vec($rin, $fd, 1) = 1;
+    }
+    my $n = _pselect($rin, $win, $ein, $timeout);
+    return -1 if !defined $n || $n < 0;
+    return $n > 0 ? 1 : 0;
+}
+
+sub _io_service {
+    return if $IO_DEPTH || !$track_cfg;
+    eval { reap_children() };
+    my $phase = eval { shutdown_phase() } // '';
+    pump_schedule() unless $phase;
+}
+
+sub _io_select {
+    my ($focus, $write, $timeout) = @_;
+    my $fd = fileno($focus);
+    return 0 unless defined $fd;
+    if (!$write && eval { $focus->can('pending') && $focus->pending }) {
+        return 1;
+    }
+    my ($rin, $win, $ein) = ('', '', '');
+    if ($write) {
+        vec($win, $fd, 1) = 1;
+        vec($ein, $fd, 1) = 1;
+    } else {
+        vec($rin, $fd, 1) = 1;
+    }
+    my @extra;
+    for my $key (keys %conns) {
+        my $sock = $conns{$key}{socket} or next;
+        my $ofd = fileno($sock);
+        next unless defined $ofd && $ofd != $fd;
+        vec($rin, $ofd, 1) = 1;
+        push @extra, $sock;
+    }
+    vec($rin, fileno($CHLD_R), 1) = 1 if $CHLD_R && defined fileno($CHLD_R);
+    vec($rin, fileno($INFO_R), 1) = 1 if $INFO_R && defined fileno($INFO_R);
+    my $n = _pselect($rin, $win, $ein, $timeout);
+    if (!defined $n || $n < 0) {
+        return 0 if $!{EINTR};
+        return -1;
+    }
+    return 0 if $n == 0;
+    $IO_DEPTH++;
+    eval {
+        if ($CHLD_R && defined fileno($CHLD_R) && vec($rin, fileno($CHLD_R), 1)) {
+            _drain_fd($CHLD_R);
+            reap_children();
+        }
+        for my $sock (@extra) {
+            my $ofd = fileno($sock);
+            next unless defined $ofd && vec($rin, $ofd, 1);
+            eval { handle_ready($sock) };
+        }
+        if ($INFO_R && defined fileno($INFO_R) && vec($rin, fileno($INFO_R), 1)) {
+            _drain_info();
+            report_info();
+        }
+    };
+    $IO_DEPTH--;
+    return 1 if $write && (vec($win, $fd, 1) || vec($ein, $fd, 1));
+    return 1 if !$write && vec($rin, $fd, 1);
+    return 0;
+}
+
+sub io_wait_fd {
+    my ($sock, $write, $timeout) = @_;
+    $timeout = $IO_MAX if !defined $timeout || $timeout > $IO_MAX;
+    $timeout = 0 if $timeout < 0;
+    if ($timeout <= 0 || $IO_DEPTH) {
+        return _fd_ready($sock, $write, $timeout) > 0 ? 1 : 0;
+    }
+    my $deadline = Time::HiRes::time() + $timeout;
+    while (1) {
+        my $left = $deadline - Time::HiRes::time();
+        last if $left <= 0;
+        my $slice = _wait_slice($left);
+        if ($slice <= 0) {
+            _io_service();
+            my $hint = $track_cfg ? eval { loop_timeout() } : undef;
+            $slice = (defined $hint && $hint > 0 && $hint < $left) ? $hint : ($left < 0.2 ? $left : 0.2);
+        }
+        my $rc = _io_select($sock, $write, $slice);
+        _io_service();
+        return 1 if $rc > 0;
+        return 0 if $rc < 0;
+    }
+    _io_service();
+    return 0;
+}
+
+sub imap_read_more {
+    my $self = shift;
+    my $opt = ref($_[0]) eq 'HASH' ? shift : {};
+    my ($socket, $timeout) = @_;
+    return 1 if $socket && eval { $socket->isa('IO::Socket::SSL') && $socket->pending };
+    $timeout = 0 if !defined $timeout || $timeout < 0;
+    $timeout = $IO_MAX if $timeout > $IO_MAX;
+    my $err_on = exists $opt->{error_on_timeout} ? $opt->{error_on_timeout} : 1;
+    return 1 if io_wait_fd($socket, 0, $timeout);
+    return 0 unless $err_on;
+    $self->LastError("timeout waiting ${timeout}s for data from server");
+    $self->_disconnect if $self->can('_disconnect');
+    return 0;
+}
+
+sub _tcp_connect {
+    my ($host, $port, $deadline) = @_;
+    my $left = $deadline - Time::HiRes::time();
+    die "tcp timeout\n" if $left <= 0;
+    my $sock;
+    my $err = 0;
+    eval {
+        local $SIG{ALRM} = sub { die "tcp timeout\n" };
+        Time::HiRes::alarm($left);
+        $sock = IO::Socket::IP->new(
+            PeerHost => $host,
+            PeerPort => $port,
+            Proto    => 'tcp',
+            Blocking => 0,
+        ) or die 'tcp: ' . ($@ || $!) . "\n";
+        # Non-blocking new() returns the socket for refusal and for
+        # EINPROGRESS. $! is the outcome, and the next call replaces it.
+        $err = $! + 0;
+        Time::HiRes::alarm(0);
+        1;
+    };
+    Time::HiRes::alarm(0);
+    die $@ if $@;
+    if ($err && $err != EINPROGRESS() && $err != EWOULDBLOCK()) {
+        $! = $err;
+        die "tcp connect: $!\n";
+    }
+    while (1) {
+        my $remain = $deadline - Time::HiRes::time();
+        die "tcp timeout\n" if $remain <= 0;
+        if ($sock->connect()) {
+            last unless $!;
+            die "tcp connect: $!\n";
+        }
+        if ($!{EINPROGRESS} || $!{EWOULDBLOCK} || $!{EINTR}) {
+            io_wait_fd($sock, 1, $remain) or die "tcp timeout\n";
+            next;
+        }
+        die "tcp connect: $!\n";
+    }
+    $sock->blocking(0);
+    return $sock;
+}
+
+# IANA extension ids. Names match openssl s_client -tlsextdebug.
+# Stable extensions are stored as a hex dump. Key shares and verify
+# data are a fixed length but a new value every handshake, so only the
+# length is kept. Tickets and OCSP responses change length as well, so
+# those records name the extension and nothing else. The file then stays
+# the same until the client offer or the server selection changes.
+my %TLS_EXT_NAME = (
+    0     => 'server name',
+    1     => 'max fragment length',
+    5     => 'status request',
+    10    => 'supported groups',
+    11    => 'EC point formats',
+    13    => 'signature algorithms',
+    16    => 'application layer protocol negotiation',
+    18    => 'signed certificate timestamp',
+    21    => 'TLS padding',
+    22    => 'encrypt-then-mac',
+    23    => 'extended master secret',
+    35    => 'session ticket',
+    41    => 'pre shared key',
+    42    => 'early data',
+    43    => 'supported versions',
+    44    => 'cookie',
+    45    => 'PSK key exchange modes',
+    47    => 'certificate authorities',
+    49    => 'post handshake auth',
+    50    => 'signature algorithms cert',
+    51    => 'key share',
+    65281 => 'renegotiation info',
+);
+my %TLS_EXT_STABLE = map { $_ => 1 } (0, 1, 10, 11, 13, 16, 21, 22, 23, 43, 45, 47, 49, 50);
+my %TLS_EXT_OMIT_LEN = map { $_ => 1 } (5, 18, 35, 41, 42, 44);
+
+sub _tls_u8 {
+    my ($buf, $off) = @_;
+    return if $off + 1 > length $$buf;
+    return ($off + 1, ord(substr($$buf, $off, 1)));
+}
+
+sub _tls_u16 {
+    my ($buf, $off) = @_;
+    return if $off + 2 > length $$buf;
+    return ($off + 2, unpack('n', substr($$buf, $off, 2)));
+}
+
+sub _tls_u24 {
+    my ($buf, $off) = @_;
+    return if $off + 3 > length $$buf;
+    return ($off + 3, unpack('N', "\0" . substr($$buf, $off, 3)));
+}
+
+sub _bio_dump {
+    my $data = defined $_[0] ? "$_[0]" : '';
+    return '' if $data eq '';
+    my $trailing = 0;
+    while (length $data && (substr($data, -1, 1) eq "\0" || substr($data, -1, 1) eq ' ')) {
+        chop $data;
+        $trailing++;
+    }
+    my $out = '';
+    my $off = 0;
+    while ($off < length $data) {
+        my $row = substr($data, $off, 16);
+        my $take = length $row;
+        $out .= sprintf('%04x - ', $off);
+        my $ascii = '';
+        for my $i (0 .. $take - 1) {
+            my $c = substr($row, $i, 1);
+            $out .= sprintf('%02x%s', ord($c), $i == 7 ? '-' : ' ');
+            $ascii .= ($c =~ /[ -~]/) ? $c : '.';
+        }
+        $out .= ' ' x (3 * (16 - $take) + 2);
+        $out .= "$ascii\n";
+        $off += $take;
+    }
+    $out .= sprintf("%04x - <SPACES/NULS>\n", $off + $trailing) if $trailing;
+    return $out;
+}
+
+sub _tls_extensions {
+    my ($body, $off) = @_;
+    return if $off > length $body;
+    return () if $off == length $body;
+    my ($o, $elen) = _tls_u16(\$body, $off);
+    return unless defined $o;
+    return if $o + $elen > length $body;
+    my $end = $o + $elen;
+    my @ext;
+    while ($o + 4 <= $end) {
+        my ($o2, $type) = _tls_u16(\$body, $o);
+        last unless defined $o2;
+        my ($o3, $len) = _tls_u16(\$body, $o2);
+        last unless defined $o3 && $o3 + $len <= $end;
+        push @ext, [ $type, substr($body, $o3, $len) ];
+        $o = $o3 + $len;
+    }
+    return @ext;
+}
+
+sub _tls_hello_ext_off {
+    my ($body, $server) = @_;
+    return if length $body < 35;
+    my $o = 34;
+    my ($o2, $slen) = _tls_u8(\$body, $o);
+    return unless defined $o2;
+    $o = $o2 + $slen;
+    if ($server) {
+        return if $o + 3 > length $body;
+        return $o + 3;
+    }
+    my ($o3, $clen) = _tls_u16(\$body, $o);
+    return unless defined $o3;
+    $o = $o3 + $clen;
+    my ($o4, $complen) = _tls_u8(\$body, $o);
+    return unless defined $o4;
+    return $o4 + $complen;
+}
+
+sub _tls_ext_record {
+    my ($who, $id, $data) = @_;
+    my $name = $TLS_EXT_NAME{$id} // 'unknown';
+    if ($TLS_EXT_OMIT_LEN{$id}) {
+        return "TLS $who extension \"$name\" (id=$id)\nephemeral\n";
+    }
+    my $head = sprintf('TLS %s extension "%s" (id=%d), len=%d',
+        $who, $name, $id, length $data);
+    return "$head\nephemeral\n" unless $TLS_EXT_STABLE{$id};
+    my $dump = _bio_dump($data);
+    return $dump eq '' ? "$head\n" : "$head\n$dump";
+}
+
+# Handshake messages only. Certificate bytes are archived on their own.
+sub _tls_extension_lines {
+    my ($dir, $msg) = @_;
+    return unless defined $msg && length $msg >= 4;
+    my ($o, $type) = _tls_u8(\$msg, 0);
+    my ($o2, $hlen) = _tls_u24(\$msg, $o);
+    return unless defined $o2 && $o2 + $hlen <= length $msg;
+    my $body = substr($msg, $o2, $hlen);
+    my $off;
+    if ($type == 1) {
+        $off = _tls_hello_ext_off($body, 0);
+    } elsif ($type == 2) {
+        $off = _tls_hello_ext_off($body, 1);
+    } elsif ($type == 8) {
+        $off = 0;
+    } elsif ($type == 13) {
+        my ($c, $clen) = _tls_u8(\$body, 0);
+        return unless defined $c;
+        $off = $c + $clen;
+    } else {
+        return;
+    }
+    return unless defined $off;
+    my $who = $dir ? 'client' : 'server';
+    my @lines;
+    for my $ext (_tls_extensions($body, $off)) {
+        push @lines, _tls_ext_record($who, $ext->[0], $ext->[1]);
+    }
+    return @lines;
+}
+
+sub _tls_clear_callback {
+    my ($ssl) = @_;
+    return unless $ssl && $ssl->can('set_msg_callback');
+    eval { $ssl->set_msg_callback(undef) };
+}
+
+sub _save_hashed_file {
+    my ($kind, $host, $port, $body) = @_;
+    return unless defined $STATE_DIR && $STATE_DIR ne '';
+    return unless defined $body && $body ne '';
+    return unless defined $host && $host ne '' && defined $port && $port ne '';
+    my $label = "$host:$port";
+    $label =~ s{[\\/\0]}{_}g;
+    return if $label eq '';
+    my $year = (localtime)[5] + 1900;
+    my $hash = unpack('H*', sha1($body));
+    my $dir  = "$STATE_DIR/$kind/$year";
+    my $path = "$dir/$hash-$label";
+    return $path if -e $path;
+    make_path($dir, { mode => 0700 });
+    chmod 0700, "$STATE_DIR/$kind", $dir;
+    my $tmp = "$path.tmp.$$";
+    my $old = umask 077;
+    my $ok = open my $fh, '>', $tmp;
+    if (!$ok) {
+        umask $old;
+        log_error("tls save $path: $!");
+        return;
+    }
+    binmode $fh;
+    print $fh $body;
+    my $closed = close $fh;
+    umask $old;
+    if (!$closed) {
+        unlink $tmp;
+        log_error("tls save $path: $!");
+        return;
+    }
+    if (!rename($tmp, $path)) {
+        unlink $tmp if -e $path;
+        if (!-e $path) {
+            log_error("tls save $path: $!");
+            return;
+        }
+    }
+    chmod 0600, $path;
+    my $what = $kind eq 'certs' ? 'cert' : 'negotiation';
+    log_info("$label: tls $what $hash");
+    return $path;
+}
+
+sub _tls_cert_body {
+    my ($ssl) = @_;
+    my @chain = eval { $ssl->peer_certificates };
+    return unless @chain;
+    my @out = ("---\n", "Certificate chain\n");
+    for my $i (0 .. $#chain) {
+        my $cert = $chain[$i] or next;
+        my $subj = Net::SSLeay::X509_NAME_oneline(
+            Net::SSLeay::X509_get_subject_name($cert)) // '';
+        my $iss = Net::SSLeay::X509_NAME_oneline(
+            Net::SSLeay::X509_get_issuer_name($cert)) // '';
+        my $pem = Net::SSLeay::PEM_get_string_X509($cert) // '';
+        $pem .= "\n" if $pem ne '' && $pem !~ /\n\z/;
+        push @out, sprintf("%2d s:%s\n", $i, $subj);
+        push @out, "   i:$iss\n";
+        push @out, $pem if $pem ne '';
+    }
+    my $leaf = $chain[0];
+    my $subj = Net::SSLeay::X509_NAME_oneline(
+        Net::SSLeay::X509_get_subject_name($leaf)) // '';
+    my $iss = Net::SSLeay::X509_NAME_oneline(
+        Net::SSLeay::X509_get_issuer_name($leaf)) // '';
+    push @out, "---\n", "Server certificate\n", "subject=$subj\n", "issuer=$iss\n";
+    return join('', @out);
+}
+
+sub _tls_chain_lines {
+    my ($ssl) = @_;
+    my @chain = eval { $ssl->peer_certificates };
+    my @lines;
+    for my $i (0 .. $#chain) {
+        my $fp = eval { $ssl->get_fingerprint('SHA256', $chain[$i]) } // '';
+        push @lines, "chain $i: $fp\n";
+    }
+    my $bits = '';
+    if (@chain && $chain[0]) {
+        my $pkey = eval { Net::SSLeay::X509_get_pubkey($chain[0]) };
+        if ($pkey) {
+            $bits = eval { Net::SSLeay::EVP_PKEY_bits($pkey) } // '';
+            Net::SSLeay::EVP_PKEY_free($pkey);
+        }
+    }
+    return ($bits, @lines);
+}
+
+sub _save_tls_observation {
+    my ($ssl, $host, $port, $ext) = @_;
+    return unless $ssl;
+    my $obj = eval { $ssl->_get_ssl_object };
+    my @ciphers;
+    if ($obj) {
+        for (my $i = 0; $i < 256; $i++) {
+            my $c = Net::SSLeay::get_cipher_list($obj, $i);
+            last unless defined $c && $c ne '';
+            push @ciphers, $c;
+        }
+    }
+    my $ciphers = join(':', @ciphers);
+    # LibreSSL offers the same extensions in a different order on each
+    # handshake. Sort by side and id so the file changes only when an
+    # extension does.
+    my @ext = sort {
+        my ($aw, $aid) = $a =~ /^TLS (\S+) extension .*?\(id=(\d+)\)/;
+        my ($bw, $bid) = $b =~ /^TLS (\S+) extension .*?\(id=(\d+)\)/;
+        ($aw // '') cmp ($bw // '')
+            || ($aid // 0) <=> ($bid // 0)
+            || $a cmp $b;
+    } @{ $ext // [] };
+    my @client = grep { /^TLS client extension / } @ext;
+    my $offer = unpack('H*', sha1(join('', "ciphers $ciphers\n", @client)));
+    my $lib = Net::SSLeay::SSLeay_version(0) // '';
+    chomp $lib;
+    my $verify = ($obj && eval { Net::SSLeay::get_verify_mode($obj) }) // '';
+    my $min = ($obj && eval { Net::SSLeay::get_min_proto_version($obj) });
+    my $max = ($obj && eval { Net::SSLeay::get_max_proto_version($obj) });
+    $min = '' unless defined $min;
+    $max = '' unless defined $max;
+    my ($pkbits, @chain) = _tls_chain_lines($ssl);
+    my $version = eval { $ssl->get_sslversion } // '';
+    my $cipher  = eval { $ssl->get_cipher } // '';
+    my $bits = '';
+    if ($obj) {
+        my @got = eval { Net::SSLeay::get_cipher_bits($obj) };
+        $bits = $got[0] // '';
+    }
+    my $body = join('',
+        "library: $lib\n",
+        "sni: $host\n",
+        "verify mode: $verify\n",
+        "proto min: $min\n",
+        "proto max: $max\n",
+        "offered ciphers: $ciphers\n",
+        "offered sha1: $offer\n",
+        "\n",
+        @ext,
+        "---\n",
+        "version: $version\n",
+        "cipher: $cipher\n",
+        "cipher bits: $bits\n",
+        (defined $pkbits && $pkbits ne '' ? "server public key: $pkbits bit\n" : ()),
+        "compression: NONE\n",
+        @chain,
+    );
+    _save_hashed_file('tls-negotiations', $host, $port, $body);
+    my $certs = _tls_cert_body($ssl);
+    _save_hashed_file('certs', $host, $port, $certs) if defined $certs && $certs ne '';
+}
+
+sub _ssl_handshake {
+    my ($sock, $host, $port, $deadline) = @_;
+    my $ssl = IO::Socket::SSL->start_SSL(
+        $sock,
+        SSL_startHandshake => 0,
+        SSL_verify_mode    => SSL_VERIFY_NONE,
+        SSL_hostname       => $host,
+    );
+    die 'ssl: ' . (IO::Socket::SSL::errstr() // 'start failed') . "\n" unless $ssl;
+    $ssl->blocking(0);
+    my @tls_ext;
+    if ($ssl->can('set_msg_callback')) {
+        $ssl->set_msg_callback(sub {
+            my ($self, $dir, $ver, $ct, $buf, $len) = @_;
+            return unless defined $ct && $ct == 22 && defined $buf;
+            my $n = length $buf;
+            $n = $len if defined $len && $len >= 0 && $len < $n;
+            push @tls_ext, _tls_extension_lines($dir, substr($buf, 0, $n));
+        });
+    }
+    my $up = eval {
+        while (1) {
+            my $remain = $deadline - Time::HiRes::time();
+            die "ssl timeout\n" if $remain <= 0;
+            my $ok = eval { $ssl->connect_SSL() };
+            return 1 if $ok;
+            if ($ssl->want_read) {
+                io_wait_fd($ssl, 0, $remain) or die "ssl timeout\n";
+                next;
+            }
+            if ($ssl->want_write) {
+                io_wait_fd($ssl, 1, $remain) or die "ssl timeout\n";
+                next;
+            }
+            die 'ssl: ' . ($ssl->errstr // $!) . "\n";
+        }
+    };
+    my $boom = $@ unless $up;
+    _tls_clear_callback($ssl);
+    die $boom if $boom;
+    eval { _save_tls_observation($ssl, $host, $port, \@tls_ext) };
+    log_error('tls save: ' . scrub($@)) if $@;
+    return $ssl;
+}
+
+sub tcp_ssl_connect {
+    my ($host, $port) = @_;
+    my $deadline = Time::HiRes::time() + $IO_MAX;
+    my $sock = _tcp_connect($host, $port, $deadline);
+    my $ssl = _ssl_handshake($sock, $host, $port, $deadline);
+    cloexec($ssl);
+    $ssl->blocking(0);
+    return $ssl;
+}
+
+sub login_imap {
+    my ($name, $acc, $password) = @_;
+    my $socket = tcp_ssl_connect($acc->{server}, $acc->{port});
     cloexec($socket);
 
     my $fingerprint = $socket->get_fingerprint('SHA256');
@@ -761,34 +2142,278 @@ sub create_imap_connection {
             return xoauth2_initial($acc->{user}, $password);
         };
     }
-    my $imap = Mail::IMAPClient->new(%login);
+    $login{Timeout}        = $IO_MAX;
+    $login{Readmoremethod} = \&imap_read_more;
+    my $imap = ImapidleClient->new(%login);
+    $socket->blocking(0) if $socket && $socket->can('blocking');
     unless ($imap && $imap->IsAuthenticated) {
         my $err = _scrub_login(($imap ? $imap->LastError : $@), $acc, $password);
-        eval { $imap->logout } if $imap;
+        imap_logout($imap);
         $socket->close;
         die "IMAP login: $err";
     }
     cloexec($imap->Socket) if $imap->Socket;
+    return ($socket, $imap);
+}
 
+sub create_imap_connection {
+    my ($name, $acc, $folder, $password) = @_;
+    my ($socket, $imap) = login_imap($name, $acc, $password);
     unless ($imap->select($folder)) {
         my $err = _scrub_login($imap->LastError, $acc, $password);
-        eval { $imap->logout };
+        imap_logout($imap);
         $socket->close;
         die "SELECT $folder: $err";
     }
     return ($socket, $imap);
 }
 
-sub detect_server_version {
-    my ($imap) = @_;
-    my @resp = $imap->tag_and_run('ID NIL');
-    return 'unknown' unless @resp;
-    my $line = join ' ', @resp;
+sub readable_server_id {
+    my ($line) = @_;
+    return 'unknown' unless defined $line && $line ne '';
     if ($line =~ /dovecot/i) {
         return "dovecot-$1" if $line =~ /dovecot.*?(\d+\.\d+)/i;
         return 'dovecot-unknown';
     }
-    return $line =~ /cyrus/i ? 'cyrus' : 'other';
+    return 'cyrus' if $line =~ /cyrus/i;
+    return 'other';
+}
+
+sub detect_server_version {
+    my ($imap) = @_;
+    my @resp = $imap->tag_and_run(id_command());
+    return 'unknown' unless @resp;
+    return readable_server_id(join(' ', @resp));
+}
+
+sub _cmd_failed {
+    my (@lines) = @_;
+    return 1 unless @lines;
+    return 1 if @lines == 1 && !defined $lines[0];
+    my $last = $lines[-1] // '';
+    return 1 if $last =~ /(?:^|\s)(?:NO|BAD)(?:\s|$)/i && $last !~ /(?:^|\s)OK(?:\s|$)/i;
+    return 0;
+}
+
+sub id_is_due {
+    my ($row, $now) = @_;
+    $now //= time();
+    $row //= {};
+    if (($row->{id_status} // '') eq 'unsupported' && ($row->{id_next} // 0) > $now) {
+        return 0;
+    }
+    if (($row->{id_hash} // '') ne '' && ($row->{id_next} // 0) > $now) {
+        return 0;
+    }
+    return 1;
+}
+
+sub cap_is_due {
+    my ($server, $port, $now) = @_;
+    $now //= time();
+    return 0 unless defined $server && defined $port;
+    my %rows = load_learned();
+    my $host = "$server:$port";
+    my $row  = $rows{$host};
+    return 1 unless $row;
+    return 1 if $row->{cap_force};
+    if (defined $row->{cap_next} && $row->{cap_next} ne '' && $row->{cap_next} =~ /^\d+(?:\.\d+)?\z/) {
+        return ($row->{cap_next} + 0) <= $now ? 1 : 0;
+    }
+    if (($row->{notify} // '') =~ /^(absent|rejected|active)\z/) {
+        $row->{cap_next} = $now + ($track_cfg->{capability} // 604800);
+        $rows{$host} = $row;
+        save_learned(%rows);
+        return 0;
+    }
+    return 1;
+}
+
+sub apply_id_result {
+    my ($server, $port, $lines, $now) = @_;
+    $now //= time();
+    return unless defined $server && defined $port;
+    my $host = "$server:$port";
+    my %rows = load_learned();
+    my $row  = $rows{$host} // { notify => '', id => '' };
+    my $interval = ($row->{id_interval} // 0) + 0;
+    $interval = $track_cfg->{id} if $interval <= 0;
+    $lines //= [];
+
+    if (_cmd_failed(@$lines)) {
+        $row->{id_status}   = 'unsupported';
+        $row->{id_interval} = $interval;
+        $row->{id_next}     = $now + $interval;
+        $row->{id_quiet}    = 0;
+        $rows{$host} = $row;
+        save_learned(%rows);
+        log_info("$host: id unsupported");
+        return;
+    }
+
+    my $text = join(' ', grep { defined } @$lines);
+    my $hash = id_reply_hash($text);
+    my $prev = $row->{id_hash} // '';
+    my $readable = readable_server_id($text);
+    $row->{id} = $readable if defined $readable && $readable =~ /^[\w.-]+\z/ && $readable ne 'unknown' && $readable ne 'other';
+
+    if ($prev eq '') {
+        $row->{id_hash}        = $hash;
+        $row->{id_status}      = 'ok';
+        $row->{id_last_change} = int($now);
+        $row->{id_interval}    = $interval;
+        $row->{id_quiet}       = 0;
+        $row->{id_next}        = $now + $interval;
+        $rows{$host} = $row;
+        save_learned(%rows);
+        return;
+    }
+    if ($prev ne $hash) {
+        my $gap = $now - (($row->{id_last_change} // 0) + 0);
+        $gap = 0 if $gap < 0;
+        $row->{id_changes}     = ($row->{id_changes} // 0) + 1;
+        $row->{id_gap_total}   = ($row->{id_gap_total} // 0) + $gap;
+        $row->{id_last_change} = int($now);
+        $row->{id_hash}        = $hash;
+        $row->{id_quiet}       = 0;
+        $row->{id_status}      = 'ok';
+        $row->{id_interval}    = next_id_interval($interval, 1);
+        $row->{id_next}        = $now + $row->{id_interval};
+        $row->{cap_force}      = 1;
+        $row->{cap_next}       = 0;
+        $rows{$host} = $row;
+        save_learned(%rows);
+        my $n = $row->{id_changes};
+        my $avg = $n ? $row->{id_gap_total} / $n : 0;
+        log_info(sprintf('%s: id updated (x%d avg %.2fs)', $host, $n, $avg));
+        return;
+    }
+    $row->{id_quiet} = ($row->{id_quiet} // 0) + 1;
+    if ($row->{id_quiet} >= 3) {
+        $row->{id_interval} = next_id_interval($interval, 0);
+        $row->{id_quiet} = 0;
+    } else {
+        $row->{id_interval} = $interval;
+    }
+    $row->{id_status} = 'ok';
+    $row->{id_next}   = $now + $row->{id_interval};
+    $rows{$host} = $row;
+    save_learned(%rows);
+}
+
+sub consider_id {
+    my ($imap, $server, $port, $now) = @_;
+    $now //= time();
+    return 0 unless $imap && defined $server && defined $port;
+    my $row = learned_row($server, $port) // {};
+    return 0 unless id_is_due($row, $now);
+    my @resp = eval { $imap->tag_and_run(id_command()) };
+    if ($@ || !@resp) {
+        my %rows = load_learned();
+        my $host = "$server:$port";
+        my $kept = $rows{$host} // { notify => '', id => '' };
+        my $interval = ($kept->{id_interval} // 0) + 0;
+        $interval = $track_cfg->{initial} if $interval <= 0;
+        $kept->{id_next} = $now + $interval;
+        $rows{$host} = $kept;
+        save_learned(%rows);
+        return 0;
+    }
+    apply_id_result($server, $port, \@resp, $now);
+    return 1;
+}
+
+sub consider_capability {
+    my ($name, $imap, $server, $port, $folders, $now) = @_;
+    $now //= time();
+    return 0 unless $imap && defined $server && defined $port;
+    return 0 unless cap_is_due($server, $port, $now);
+    my @caps = eval { $imap->capability };
+    return 0 if $@ || !@caps;
+    my $hash = capability_hash(@caps);
+    my $has  = grep { uc($_) eq 'NOTIFY' } @caps;
+    my %rows = load_learned();
+    my $host = "$server:$port";
+    my $row  = $rows{$host} // { notify => '', id => '' };
+    $row->{cap_hash}  = $hash;
+    $row->{cap_force} = 0;
+    $row->{cap_next}  = $now + ($track_cfg->{capability} // 604800);
+    if ($has) {
+        $row->{cap_has_notify} = 1;
+        $rows{$host} = $row;
+        save_learned(%rows);
+        return 1;
+    }
+    delete $row->{cap_has_notify};
+    $rows{$host} = $row;
+    save_learned(%rows);
+    remember_discovery($name, $server, $port, 'absent', $row->{id}, $folders);
+    return 0;
+}
+
+sub _hot_folder_map {
+    my ($acc) = @_;
+    my %hot;
+    $hot{ $_->{name} } = 1 for @{ $acc->{folders} // [] };
+    return \%hot;
+}
+
+sub consider_list {
+    my ($name, $acc, $imap, $now) = @_;
+    return unless $acc && $imap;
+    my $channel = $acc->{mbsync_channel} // '';
+    return if $channel eq '';
+    $now //= time();
+    my $due = $list_next{$channel};
+    return if defined $due && $due > $now;
+    my $hot = _hot_folder_map($acc);
+    my $recs = eval { $imap->folders_hash };
+    if ($@ || !$recs || ref $recs ne 'ARRAY') {
+        apply_folder_list($channel, undef, $hot, 0, $now);
+        return 0;
+    }
+    my @names = folder_names_from_list($recs);
+    apply_folder_list($channel, \@names, $hot, 1, $now);
+    return 1;
+}
+
+sub _id_probe_needed {
+    my ($row) = @_;
+    return 1 unless $row;
+    return 0 if id_is_due($row) == 0;
+    return 1;
+}
+
+sub _clear_learned_key {
+    my ($server, $port, $key) = @_;
+    my %rows = load_learned();
+    my $host = "$server:$port";
+    return unless $rows{$host};
+    delete $rows{$host}{$key};
+    save_learned(%rows);
+}
+
+sub _request_list_refresh {
+    $list_next{$_} = 0 for keys %folder_lists;
+    for my $name (keys %accounts) {
+        my $ch = $accounts{$name}{mbsync_channel} // '';
+        $list_next{$ch} = 0 if $ch ne '';
+    }
+}
+
+sub probes_due {
+    my ($acc, $now) = @_;
+    return 0 unless $acc;
+    $now //= time();
+    my $row = learned_row($acc->{server}, $acc->{port}) // {};
+    return 1 if id_is_due($row, $now);
+    return 1 if cap_is_due($acc->{server}, $acc->{port}, $now);
+    my $ch = $acc->{mbsync_channel} // '';
+    if ($ch ne '') {
+        my $due = $list_next{$ch};
+        return 1 if !defined $due || $due <= $now;
+    }
+    return 0;
 }
 
 sub setup_notification {
@@ -796,23 +2421,34 @@ sub setup_notification {
     my $server = $acc->{server};
     my $port   = $acc->{port};
     my $known  = learned_row($server, $port);
-    if ($known && ($known->{notify} eq 'absent' || $known->{notify} eq 'rejected')) {
+    my $retry_notify = $known && $known->{cap_has_notify};
+    if ($known && (($known->{notify} // '') eq 'absent' || ($known->{notify} // '') eq 'rejected')
+        && !$retry_notify) {
         return 0;
     }
-    my $quiet = $known && $known->{notify} eq 'active';
+    my $quiet = $known && ($known->{notify} // '') eq 'active';
 
     if (!$quiet) {
-        my @caps = $imap->capability or return 0;
-        my $has_notify = grep { uc($_) eq 'NOTIFY' } @caps;
-        if (!$has_notify) {
-            remember_discovery($name, $server, $port, 'absent', undef, $folder_list);
-            return 0;
+        my $need_cap = !$known || ($known->{cap_hash} // '') eq '' || $known->{cap_force};
+        if ($need_cap) {
+            my @caps = $imap->capability or return 0;
+            my $has_notify = grep { uc($_) eq 'NOTIFY' } @caps;
+            if (!$has_notify) {
+                remember_discovery($name, $server, $port, 'absent', undef, $folder_list);
+                return 0;
+            }
         }
     }
 
-    my $server_id = ($quiet && ($known->{id} // '') ne '')
-        ? $known->{id}
-        : detect_server_version($imap);
+    my $server_id;
+    if ($quiet && ($known->{id} // '') ne '') {
+        $server_id = $known->{id};
+    } elsif (!$quiet && _id_probe_needed($known)) {
+        $server_id = detect_server_version($imap);
+    } else {
+        $server_id = ($known && $known->{id}) ? $known->{id} : '';
+    }
+    _clear_learned_key($server, $port, 'cap_has_notify') if $retry_notify;
     my $cmd = 'NOTIFY SET (personal (MessageNew MessageExpunge MessageFlags))';
     log_info("$name: NOTIFY $cmd") unless $quiet;
     # tag_and_run returns a single undef on failure, which is not a response line.
@@ -832,19 +2468,48 @@ sub setup_notification {
 
 sub register_conn {
     my ($conn) = @_;
+    $conn->{started} //= time();
     $conns{ $conn->{key} } = $conn;
     $sock_to_key{ $conn->{socket} } = $conn->{key};
     $select->add($conn->{socket});
 }
 
+# Mail::IMAPClient clucks a stack once it has marked the socket dead
+# and another command is sent. Skip DONE, IDLE, and LOGOUT then.
+sub imap_connected {
+    my ($imap) = @_;
+    return 0 unless $imap;
+    my $up = eval { $imap->IsConnected };
+    return $up ? 1 : 0;
+}
+
+sub imap_done {
+    my ($imap, $tag) = @_;
+    return () unless imap_connected($imap);
+    my @lines;
+    my $ok = eval { @lines = $imap->done($tag); 1 };
+    return () unless $ok;
+    return grep { defined && $_ ne '' } @lines;
+}
+
+sub imap_logout {
+    my ($imap) = @_;
+    return unless imap_connected($imap);
+    eval { $imap->logout };
+}
+
 sub close_session {
     my ($imap, $socket) = @_;
-    eval { $imap->logout if $imap };
+    imap_logout($imap);
     eval { $socket->close if $socket };
 }
 
 sub arm_idle {
     my ($name, $acc, $folder, $socket, $imap) = @_;
+    unless (imap_connected($imap)) {
+        close_session($imap, $socket);
+        die "IDLE on $folder->{name}: not connected";
+    }
     my $tag = $imap->idle();
     unless ($tag) {
         my $err = $imap->LastError // 'IDLE failed';
@@ -942,12 +2607,13 @@ sub drop_conn {
     $why = scrub($why);
     my $what = $key;
     $what =~ s/^\Q$name\E:// if $name ne '?';
-    log_warn("$name: dropping $what: $why");
-    eval {
-        if ($conn->{imap} && $conn->{mode} && $conn->{mode} eq 'IDLE' && $conn->{tag}) {
-            $conn->{imap}->done($conn->{tag});
-        }
-    };
+    my $secs = 0;
+    $secs = time() - $conn->{started} if defined $conn->{started};
+    my $avg = note_conn_time(_conn_time_key($conn), $secs);
+    $avg = '' unless defined $avg;
+    log_warn("$name: dropping $what: $why" . ($avg ne '' ? " $avg" : ''));
+    eval { imap_done($conn->{imap}, $conn->{tag})
+        if $conn->{imap} && ($conn->{mode} // '') eq 'IDLE' && $conn->{tag} };
     close_session($conn->{imap}, $conn->{socket});
     mark_retry($name) unless $no_retry;
 }
@@ -969,6 +2635,24 @@ sub connect_idle_folders {
     return $failed ? 0 : 1;
 }
 
+sub _account_primary {
+    my ($name) = @_;
+    for my $key (keys %conns) {
+        next unless index($key, "$name:") == 0;
+        return 1 if $conns{$key}{primary};
+    }
+    return 0;
+}
+
+sub _session_held {
+    my ($socket) = @_;
+    return 0 unless $socket;
+    for my $key (keys %conns) {
+        return 1 if $conns{$key}{socket} && $conns{$key}{socket} == $socket;
+    }
+    return 0;
+}
+
 sub connect_account {
     my ($name) = @_;
     my $acc = $accounts{$name} or return 0;
@@ -980,33 +2664,47 @@ sub connect_account {
 
     my $password = account_pass($name);
     if (!defined $password) {
-        mark_retry($name);
+        # account_pass already scheduled a pass_cmd failure. mark_retry
+        # would log a retry and, before the first monitor, disable it.
+        my $cmd = $acc->{pass_cmd};
+        mark_retry($name) unless defined $cmd && $cmd ne '';
         return 0;
     }
 
     my $partial = grep { index($_, "$name:") == 0 } keys %conns;
-    if ($partial) {
+    if ($partial && _account_primary($name)) {
         my $ok = connect_idle_folders($name, \@need, $password);
         $ok && account_covered($name) ? note_success($name) : mark_retry($name);
         return $ok;
     }
 
-    if (server_uses_idle($acc->{server}, $acc->{port})) {
-        my $idle_ok = eval {
-            connect_idle_folders($name, \@need, $password) or die 'IDLE failed';
+    my $ok = eval {
+        my ($socket, $imap) = login_imap($name, $acc, $password);
+        my $now = time();
+        my $held = eval {
+            consider_id($imap, $acc->{server}, $acc->{port}, $now);
+            consider_capability($name, $imap, $acc->{server}, $acc->{port}, $acc->{folders}, $now);
+            consider_list($name, $acc, $imap, $now);
+            my $notify = setup_notification($name, $acc, $imap, $acc->{folders});
+            if ($notify) {
+                adopt_notify($name, $acc, $socket, $imap);
+                $conns{"$name:NOTIFY"}{primary} = 1 if $conns{"$name:NOTIFY"};
+            } else {
+                my $folder = $need[0];
+                $imap->select($folder->{name})
+                    or die 'SELECT ' . $folder->{name} . ': ' . ($imap->LastError // '');
+                arm_idle($name, $acc, $folder, $socket, $imap);
+                my $key = "$name:$folder->{name}";
+                $conns{$key}{primary} = 1 if $conns{$key};
+                my @rest = @need[1 .. $#need];
+                connect_idle_folders($name, \@rest, $password) or die 'IDLE failed' if @rest;
+            }
             1;
         };
-        return _settle_account($name, $idle_ok, $@, $password);
-    }
-
-    my $ok = eval {
-        my ($socket, $imap) = create_imap_connection($name, $acc, $need[0]{name}, $password);
-        my $notify = setup_notification($name, $acc, $imap, $acc->{folders});
-        if ($notify) {
-            adopt_notify($name, $acc, $socket, $imap);
-        } else {
-            close_session($imap, $socket);
-            connect_idle_folders($name, \@need, $password) or die 'IDLE failed';
+        if (!$held) {
+            my $err = $@;
+            close_session($imap, $socket) unless _session_held($socket);
+            die $err || 'connect failed';
         }
         1;
     };
@@ -1034,9 +2732,15 @@ sub restart_idle {
     my ($conn) = @_;
     return 1 if !$conn || ($conn->{mode} // '') eq 'NOTIFY';
     return 0 unless $conn->{imap};
+    my $was = imap_connected($conn->{imap});
     my $ok = eval {
-        $conn->{imap}->done($conn->{tag}) if $conn->{tag};
-        $conn->{tag} = $conn->{imap}->idle() or die($conn->{imap}->LastError // 'IDLE failed');
+        imap_done($conn->{imap}, $conn->{tag}) if $conn->{tag} && $was;
+        unless (imap_connected($conn->{imap})) {
+            my $why = $was ? ($conn->{imap}->LastError // 'not connected') : 'not connected';
+            die $why;
+        }
+        my $tag = $conn->{imap}->idle() or die($conn->{imap}->LastError // 'IDLE failed');
+        $conn->{tag} = $tag;
         1;
     };
     if (!$ok) {
@@ -1079,48 +2783,103 @@ sub _time_secs {
     return $n < 0 ? 0 : $n;
 }
 
-sub format_time_stats {
-    my ($real, $ru) = @_;
-    $real //= 0;
-    $real = 0 if $real < 0;
+sub _rusage_numbers {
+    my ($ru) = @_;
     $ru = "\0" x 144 unless defined $ru && length($ru) >= 144;
     my ($u_sec, $u_usec, $s_sec, $s_usec, $maxrss, undef, undef, undef,
         $minflt, $majflt, undef, $inblock, $oublock, undef, undef,
         undef, $nvcsw, $nivcsw) = unpack('q18', $ru);
+    my $rss = $maxrss // 0;
+    $rss = 0 if $rss < 0;
+    return {
+        user    => _time_secs($u_sec, $u_usec),
+        sys     => _time_secs($s_sec, $s_usec),
+        rss     => $rss,
+        minflt  => _ru_count($minflt),
+        majflt  => _ru_count($majflt),
+        inblock => _ru_count($inblock),
+        oublock => _ru_count($oublock),
+        nvcsw   => _ru_count($nvcsw),
+        nivcsw  => _ru_count($nivcsw),
+    };
+}
+
+sub _ru_count {
+    my ($n) = @_;
+    $n //= 0;
+    $n = 0 if $n < 0;
+    return int($n);
+}
+
+sub format_time_stats {
+    my ($real, $ru) = @_;
+    $real //= 0;
+    $real = 0 if $real < 0;
+    my $n = _rusage_numbers($ru);
     return sprintf(
         '%.2f real %.2f user %.2f sys rss %dk minflt %d majflt %d inblock %d oublock %d nvcsw %d nivcsw %d',
         $real,
-        _time_secs($u_sec, $u_usec),
-        _time_secs($s_sec, $s_usec),
-        $maxrss // 0,
-        $minflt // 0,
-        $majflt // 0,
-        $inblock // 0,
-        $oublock // 0,
-        $nvcsw // 0,
-        $nivcsw // 0,
+        $n->{user},
+        $n->{sys},
+        $n->{rss},
+        $n->{minflt},
+        $n->{majflt},
+        $n->{inblock},
+        $n->{oublock},
+        $n->{nvcsw},
+        $n->{nivcsw},
     );
 }
 
-sub child_exit_summary {
-    my ($what, $pid, $status, $real, $ru) = @_;
-    my $how;
+sub exit_how {
+    my ($status) = @_;
+    $status //= 0;
     if ($status == 0) {
-        $how = 'exited 0';
+        return 'ret 0';
     } elsif ($status & 127) {
-        $how = 'signal ' . ($status & 127);
-    } else {
-        $how = 'exit ' . ($status >> 8);
+        return 'sig ' . ($status & 127);
     }
-    return "$what pid $pid $how  " . format_time_stats($real, $ru);
+    return 'ret ' . ($status >> 8);
+}
+
+sub _pair_secs {
+    my ($cur, $avg, $unit) = @_;
+    return sprintf('%.2f|%.2f%s', $cur, $avg, $unit);
+}
+
+sub _pair_int {
+    my ($cur, $avg, $unit) = @_;
+    return sprintf('%d|%d%s', int($cur), int($avg + 0.5), $unit);
+}
+
+# Number before the bar is this run. Number after it is the average.
+# The unit sits on the average. -v adds the fields that are always totaled.
+sub _format_run_tail {
+    my ($row, $cur) = @_;
+    my $n   = $row->{n} || 0;
+    my $avg = $n ? $row->{total} / $n : 0;
+    my $s   = sprintf('x%d %s', $n, _pair_secs($cur->{real}, $avg, 's'));
+    return $s unless ($row->{nr} // 0) > 0 && $cur->{have_ru};
+    my $nr   = $row->{nr};
+    my $user = _pair_secs($cur->{user}, $row->{user} / $nr, 'user');
+    my $sys  = _pair_secs($cur->{sys},  $row->{sys} / $nr,  'sys');
+    my $rss  = _pair_int($cur->{rss}, $row->{rss} / $nr, 'rss');
+    if ($VERBOSE) {
+        $s .= " $user $sys $rss";
+        for my $f (@RU_FIELDS) {
+            next if $f eq 'user' || $f eq 'sys' || $f eq 'rss';
+            $s .= ' ' . _pair_int($cur->{$f}, ($row->{$f} // 0) / $nr, $f);
+        }
+    } else {
+        $s .= " $rss";
+    }
+    return $s;
 }
 
 my $LAST_CHILD_EXIT = '';
 
-# Real seconds for one mbsync argv. The key is that command line.
-# n and total are kept, and the average is total/n after this run.
-my %MBSYNC_REAL;
-
+# Real seconds for one mbsync argv. The stored key is sha1 -b of that
+# command. n counts every run. nr counts runs that recorded rusage.
 sub mbsync_cli {
     my ($rec) = @_;
     return unless ref $rec eq 'HASH' && ref $rec->{args} eq 'ARRAY' && @{ $rec->{args} };
@@ -1128,13 +2887,30 @@ sub mbsync_cli {
 }
 
 sub note_mbsync_real {
-    my ($cli, $real) = @_;
-    return unless defined $cli && $cli ne '';
+    my ($cli, $real, $ru) = @_;
+    $cli = _memory_key($cli);
+    return unless defined $cli;
     $real = 0 if !defined $real || $real < 0;
     my $row = $MBSYNC_REAL{$cli} //= { n => 0, total => 0 };
     $row->{n}++;
     $row->{total} += $real;
-    return sprintf('(x%d avg %f)', $row->{n}, $row->{total} / $row->{n});
+    my $cur = { real => $real, have_ru => 0 };
+    if (defined $ru) {
+        my $got = ref $ru eq 'HASH' ? $ru : _rusage_numbers($ru);
+        $row->{nr} //= 0;
+        for my $f (@RU_FIELDS) {
+            my $v = $got->{$f} // 0;
+            $v = 0 if $v < 0;
+            $row->{$f} //= 0;
+            $row->{$f} += $v;
+            $cur->{$f} = $v;
+        }
+        $row->{nr}++;
+        $cur->{have_ru} = 1;
+    }
+    _stat_save($MBSYNC_REAL_FILE, \%MBSYNC_REAL)
+        if defined $MBSYNC_REAL_FILE && $MBSYNC_REAL_FILE ne '';
+    return _format_run_tail($row, $cur);
 }
 
 sub reset_mbsync_real_for_test { %MBSYNC_REAL = (); }
@@ -1151,14 +2927,23 @@ sub reap_children {
         last if $pid == 0;
         my $status = unpack('i', $statb);
         my $rec    = delete $children{$pid};
-        my $what   = mbsync_exit_what($rec);
         my $real   = 0;
         if (ref $rec eq 'HASH' && defined $rec->{started}) {
             $real = time() - $rec->{started};
         }
-        my $line = child_exit_summary($what, $pid, $status, $real, $ru);
-        my $avg  = note_mbsync_real(mbsync_cli($rec), $real);
-        $line .= " $avg" if defined $avg;
+        my $text = '';
+        if (ref $rec eq 'HASH' && $rec->{out_fh}) {
+            my $fh = $rec->{out_fh};
+            local $/;
+            $text = <$fh> // '';
+            close $fh;
+        }
+        my @args = _child_args($rec);
+        my $line = mbsync_job_line('stop', $pid, @args);
+        $line .= ' ' . exit_how($status);
+        my $cli  = mbsync_cli($rec);
+        my $tail = note_mbsync_real($cli, $real, $ru);
+        $line .= " $tail" if defined $tail && $tail ne '';
         $LAST_CHILD_EXIT = $line;
         if ($status == 0) {
             log_info($line);
@@ -1166,6 +2951,7 @@ sub reap_children {
             log_warn($line);
         }
         finish_pulse_channel($rec->{pulse}) if ref $rec eq 'HASH';
+        finish_track_job($rec, $status, $real, $text) if ref $rec eq 'HASH' && $rec->{track};
     }
 }
 
@@ -1180,10 +2966,20 @@ my %box_pending;
 my %box_wait;
 my %batch;
 
+sub _named_queued { return keys %batch ? 1 : 0; }
+
+sub named_sync_pending {
+    return 1 if _named_queued();
+    return 1 if _hot_running();
+    return 0;
+}
+
 sub _box_id {
     my ($channel, $folder) = @_;
     return $channel . "\0" . $folder;
 }
+
+my $NAMED_PRIMED = 0;
 
 sub reset_schedule_for_test {
     %box_gap      = ();
@@ -1191,6 +2987,7 @@ sub reset_schedule_for_test {
     %box_pending  = ();
     %box_wait     = ();
     %batch        = ();
+    $NAMED_PRIMED = 0;
 }
 
 sub forget_folder_schedule {
@@ -1224,6 +3021,55 @@ sub queue_folder {
     $batch{$channel}{deadline} = $deadline_if_new;
 }
 
+# folderN is queued once at startup. Reload does not queue it again.
+sub prime_named_folders {
+    my ($now) = @_;
+    $now //= time();
+    return if $NAMED_PRIMED;
+    $NAMED_PRIMED = 1;
+    for my $name (sort keys %accounts) {
+        my $acc = $accounts{$name} or next;
+        next if $acc->{config_disabled} || $acc->{disabled};
+        my $channel = $acc->{mbsync_channel} // '';
+        next if $channel eq '';
+        my @names;
+        for my $folder (@{ $acc->{folders} // [] }) {
+            my $box = $folder->{name};
+            next unless defined $box && $box ne '';
+            my $id = _box_id($channel, $box);
+            $box_gap{$id}     = $folder->{debounce} // 0;
+            $box_wait{$id}    = 0;
+            $box_pending{$id} = 0;
+            queue_folder($channel, $box, $now, $now);
+            push @names, $box;
+        }
+        log_info("$name: startup sync " . join(' ', @names)) if @names;
+    }
+}
+
+# Local clock time with microseconds after the seconds. OpenBSD strftime
+# has no %f, so the fraction is appended.
+sub _clock {
+    my ($when) = @_;
+    $when = 0 if !defined $when || $when < 0;
+    my $sec  = int($when);
+    my $frac = $when - $sec;
+    my $us   = int($frac * 1_000_000 + 0.5);
+    if ($us >= 1_000_000) {
+        $sec += int($us / 1_000_000);
+        $us  %= 1_000_000;
+    }
+    return POSIX::strftime('%Y%m%d %H:%M:%S', localtime($sec))
+        . sprintf('.%06d', $us);
+}
+
+sub _seconds_until {
+    my ($when, $now) = @_;
+    my $d = ($when // 0) - ($now // 0);
+    $d = 0 if $d < 0;
+    return int($d + 0.5);
+}
+
 sub note_mail_event {
     my ($channel, $folder, $gap, $wait, $now) = @_;
     return unless defined $channel && $channel ne '' && defined $folder && $folder ne '';
@@ -1236,11 +3082,15 @@ sub note_mail_event {
     $box_pending{$id}  = 1;
     my $last = $box_last_run{$id} // 0;
     if ($last && $now < $last + $gap) {
-        log_info("$channel: $folder event kept; next mbsync at " . ($last + $gap));
+        my $when = $last + $gap;
+        log_info("$channel: " . sprintf('%-5s %s next sync in %ds at %s',
+            'kept', $folder, _seconds_until($when, $now), _clock($when)));
         return;
     }
     queue_folder($channel, $folder, $now, $now + $COMBINE_SEC);
-    log_info("$channel: $folder ready; mbsync combines until " . $batch{$channel}{deadline});
+    my $when = $batch{$channel}{deadline};
+    log_info("$channel: " . sprintf('%-5s %s mbsync combines in %ds at %s',
+        'ready', $folder, _seconds_until($when, $now), _clock($when)));
 }
 
 sub promote_pending {
@@ -1253,13 +3103,15 @@ sub promote_pending {
         my $gap  = $box_gap{$id} // 0;
         next if $last && $now < $last + $gap;
         queue_folder($channel, $folder, $now, $now);
-        log_info("$channel: $folder minimum interval elapsed; mbsync scheduled");
+        log_info("$channel: " . sprintf('%-5s %s minimum interval elapsed; mbsync scheduled',
+            'due', $folder));
     }
 }
 
 sub take_due_batches {
-    my ($now) = @_;
+    my ($now, $limit) = @_;
     my @jobs;
+    return @jobs if defined $limit && $limit <= 0;
     for my $channel (sort keys %batch) {
         my $deadline = $batch{$channel}{deadline};
         next unless defined $deadline && $deadline <= $now;
@@ -1268,6 +3120,7 @@ sub take_due_batches {
         # A bare channel and channel:box are one mbsync. Leave the batch
         # until that process exits; the gap clock starts at the later spawn.
         next if channel_busy($channel);
+        last if defined $limit && @jobs >= $limit;
         my $wait = 0;
         for my $folder (@folders) {
             my $id = _box_id($channel, $folder);
@@ -1286,10 +3139,10 @@ sub take_due_batches {
 }
 
 sub due_mbsync_jobs {
-    my ($now) = @_;
+    my ($now, $limit) = @_;
     $now //= time();
     promote_pending($now);
-    return take_due_batches($now);
+    return take_due_batches($now, $limit);
 }
 
 sub next_schedule_delay {
@@ -1312,6 +3165,8 @@ sub next_schedule_delay {
         next unless defined $deadline;
         my $d = $deadline - $now;
         $d = 0 if $d < 0;
+        # No free slot: a due batch waits for a running mbsync to exit.
+        next if $d <= 0 && slots_for_hot($now) <= 0;
         $wait = $d if !defined $wait || $d < $wait;
     }
     return $wait;
@@ -1368,6 +3223,45 @@ sub channel_busy {
     return 0;
 }
 
+sub _child_args {
+    my ($rec) = @_;
+    if (ref $rec eq 'HASH' && ref $rec->{args} eq 'ARRAY' && @{ $rec->{args} }) {
+        return @{ $rec->{args} };
+    }
+    my $label = child_label($rec);
+    return () unless defined $label && $label =~ /^mbsync\s+(\S.*)\z/;
+    return split / /, $1;
+}
+
+# start and child are five letters. stop is four, so one pad lines the
+# hash up with start. The pid is five columns inside the brackets.
+sub mbsync_job_line {
+    my ($verb, $pid, @args) = @_;
+    $verb = 'stop' unless defined $verb && $verb ne '';
+    $pid  = 0 if !defined $pid || $pid !~ /^-?\d+$/ || $pid < 0;
+    my ($channel, @boxes);
+    my $one = @args ? 1 : 0;
+    for my $arg (@args) {
+        my ($ch, $box) = split /:/, $arg, 2;
+        if (!defined $ch || $ch eq '' || (defined $channel && $ch ne $channel)) {
+            $one = 0;
+            last;
+        }
+        $channel = $ch;
+        push @boxes, $box if defined $box && $box ne '';
+    }
+    if (!$one || !defined $channel || $channel eq '') {
+        my $shown = @args ? join(' ', @args) : '';
+        my $line  = sprintf('mbsync: %-5s [%5d]', $verb, $pid);
+        $line .= " $shown" if $shown ne '';
+        return $line;
+    }
+    my $hash = sha1_b(join("\0", @args));
+    my $line = sprintf('%s: %-5s %s[%5d]', $channel, $verb, $hash, $pid);
+    $line .= ' ' . join(',', @boxes) if @boxes;
+    return $line;
+}
+
 # One channel per process. The log names that channel once, then the
 # mailboxes, so every line about it starts with "channel: ".
 sub mbsync_phrase {
@@ -1386,26 +3280,11 @@ sub mbsync_phrase {
     return "$channel: $rest";
 }
 
-sub mbsync_exit_what {
-    my ($rec) = @_;
-    my @args;
-    if (ref $rec eq 'HASH' && ref $rec->{args} eq 'ARRAY' && @{ $rec->{args} }) {
-        @args = @{ $rec->{args} };
-    } else {
-        my $label = child_label($rec);
-        return $label unless $label =~ /^mbsync\s+(\S.*)\z/;
-        @args = split / /, $1;
-    }
-    return mbsync_phrase('mbsync', @args);
-}
-
 sub child_state_line {
     my ($pid, $rec) = @_;
-    my $what = mbsync_exit_what($rec);
-    if ($what =~ /^(\S+): mbsync(.*)\z/) {
-        return "$1: child pid $pid mbsync$2";
-    }
-    return "child pid $pid $what";
+    my @args = _child_args($rec);
+    return mbsync_job_line('child', $pid, @args) if @args;
+    return sprintf('child pid %d %s', $pid, child_label($rec));
 }
 
 sub trigger_mbsync {
@@ -1413,9 +3292,24 @@ sub trigger_mbsync {
     my ($wait, @args) = @_;
     $wait //= 0;
     return 0 unless @args;
+    if (ref $TRIGGER_HOOK eq 'CODE') {
+        return $TRIGGER_HOOK->($wait, [@args], $meta);
+    }
     my $shown = join(' ', @args);
+    my $capture = $meta->{capture};
+    my ($rd, $wr);
+    if ($capture) {
+        pipe($rd, $wr) or do {
+            log_error(mbsync_phrase('fork mbsync', @args) . " failed: $!");
+            return 0;
+        };
+    }
     my $pid = fork();
     if (!defined $pid) {
+        if ($capture) {
+            close $rd;
+            close $wr;
+        }
         log_error(mbsync_phrase('fork mbsync', @args) . " failed: $!");
         return 0;
     }
@@ -1426,21 +3320,37 @@ sub trigger_mbsync {
         $SIG{CHLD} = 'DEFAULT';
         $SIG{TERM} = 'DEFAULT';
         $SIG{INT}  = 'DEFAULT';
-        close_extra_fds();
-        open STDIN,  '<', '/dev/null';
-        open STDOUT, '>', '/dev/null';
-        open STDERR, '>', '/dev/null';
+        _restore_wake_mask();
+        if ($capture) {
+            close $rd;
+            open STDOUT, '>&', $wr or _exit(127);
+            close $wr;
+            close_extra_fds();
+            open STDIN,  '<', '/dev/null';
+            open STDERR, '>', '/dev/null';
+        } else {
+            close_extra_fds();
+            open STDIN,  '<', '/dev/null';
+            open STDOUT, '>', '/dev/null';
+            open STDERR, '>', '/dev/null';
+        }
         sleep $wait if $wait > 0;
-        exec '/usr/local/bin/mbsync', @args
+        exec $MBSYNC_BIN, @args
             or _exit(1);
+    }
+    if ($capture) {
+        close $wr;
+        cloexec($rd);
     }
     $children{$pid} = {
         label   => "mbsync $shown",
         args    => [@args],
-        pulse => $meta->{pulse},
+        pulse   => $meta->{pulse},
+        track   => $meta->{track},
+        out_fh  => $capture ? $rd : undef,
         started => time(),
     };
-    log_info(mbsync_phrase('forked mbsync', @args) . " (pid $pid)");
+    log_info(mbsync_job_line('start', $pid, @args));
     return $pid;
 }
 
@@ -1468,6 +3378,8 @@ sub finish_pulse_channel {
     return unless exists $pulse_next{$ch};
     my $sweep = $pulse_cfg->{sweep} // 3600;
     $pulse_next{$ch} = $now + $sweep;
+    $PULSE_LAST{$ch} = $now;
+    _pulse_last_save();
     log_info("$ch: pulse next in ${sweep}s");
 }
 
@@ -1476,6 +3388,7 @@ sub pump_pulse {
     $now //= time();
     return if $pulse_cfg->{disabled};
     for my $ch (due_pulse_channels($now)) {
+        last if slots_for_cold($now) <= 0;
         my $pid = trigger_mbsync(0, $ch, { pulse => $ch });
         if (!$pid) {
             my $sweep = $pulse_cfg->{sweep} // 3600;
@@ -1488,6 +3401,7 @@ sub pump_pulse {
 sub next_pulse_delay {
     my ($now) = @_;
     return if $pulse_cfg->{disabled};
+    return if slots_for_cold($now) <= 0;
     my $wait;
     for my $ch (@{ $pulse_cfg->{channels} // [] }) {
         next unless exists $pulse_next{$ch};
@@ -1499,12 +3413,205 @@ sub next_pulse_delay {
     return $wait;
 }
 
+sub _argv_real_avg {
+    my ($cli) = @_;
+    $cli = _memory_key($cli);
+    return unless defined $cli;
+    my $row = $MBSYNC_REAL{$cli} or return;
+    return unless $row->{n};
+    return $row->{total} / $row->{n};
+}
+
+sub tracked_deferred {
+    my ($channel, $box, $now) = @_;
+    return 1 if channel_busy($channel);
+    if (exists $batch{$channel} && defined $batch{$channel}{deadline}) {
+        return 1;
+    }
+    my $avg = _argv_real_avg("$channel:$box");
+    for my $id (keys %box_pending) {
+        next unless $box_pending{$id};
+        my ($ch) = split /\0/, $id, 2;
+        next if !defined $ch || $ch ne $channel;
+        return 1 unless defined $avg;
+        my $last = $box_last_run{$id} // 0;
+        my $gap  = $box_gap{$id} // 0;
+        return 1 if !$last || $now + $avg > $last + $gap;
+    }
+    return 0;
+}
+
+sub due_tracked {
+    my ($now) = @_;
+    $now //= time();
+    return () if $track_cfg->{disabled};
+    my @due;
+    for my $id (keys %track) {
+        my $rec = $track{$id} or next;
+        next if ($rec->{next} // 0) > $now;
+        my ($ch, $box) = split /\0/, $id, 2;
+        next if !defined $ch || !defined $box || $box eq '';
+        next if tracked_deferred($ch, $box, $now);
+        push @due, { id => $id, channel => $ch, box => $box, next => $rec->{next} // 0 };
+    }
+    return sort { $a->{next} <=> $b->{next} || $a->{box} cmp $b->{box} } @due;
+}
+
+sub finish_track_job {
+    my ($rec, $status, $real, $text, $now) = @_;
+    return unless ref $rec eq 'HASH' && defined $rec->{track};
+    my $id = $rec->{track};
+    $now //= time();
+    my ($channel, $box) = split /\0/, $id, 2;
+    $list_next{$channel} = 0 if defined $channel && $channel ne '' && $status;
+    my $row = $track{$id} or return;
+    my $msgs = mbsync_new_messages($text);
+    if (!defined $msgs) {
+        $row->{fails} = ($row->{fails} // 0) + 1;
+        if ($row->{fails} >= 3) {
+            my $old = $row->{interval} // $track_cfg->{initial};
+            my $span = $old * 3;
+            $row->{interval} = next_mailbox_interval($old, []);
+            $row->{samples}  = [];
+            $row->{fails}    = 0;
+            if ($row->{interval} != $old) {
+                log_info("$channel: track $box interval ${old}s -> $row->{interval}s "
+                    . "(0 new in ${span}s, sync 0s)");
+            }
+        }
+    } else {
+        my $old = $row->{interval} // $track_cfg->{initial};
+        push @{ $row->{samples} }, { msgs => $msgs, dur => $real, span => $old };
+        $row->{fails} = 0;
+        if (@{ $row->{samples} } >= 3) {
+            my ($sum_m, $sum_s, $sum_d, $n) = (0, 0, 0, 0);
+            for my $s (@{ $row->{samples} }) {
+                $sum_m += $s->{msgs} // 0;
+                $sum_s += $s->{span} // 0;
+                $sum_d += $s->{dur} // 0;
+                $n++;
+            }
+            $row->{interval} = next_mailbox_interval($old, $row->{samples});
+            $row->{samples} = [];
+            if ($row->{interval} != $old) {
+                my $sync = $n ? int($sum_d / $n + 0.5) : 0;
+                log_info("$channel: track $box interval ${old}s -> $row->{interval}s "
+                    . "($sum_m new in ${sum_s}s, sync ${sync}s)");
+            }
+        }
+    }
+    $row->{next} = $now + $row->{interval};
+}
+
+sub _shutdown_wanted {
+    return 1 if $SHUTDOWN;
+    return 1 if shutdown_path();
+    return 0;
+}
+
+sub shutdown_phase {
+    return '' unless _shutdown_wanted();
+    if (!$shutdown_reason) {
+        if (my $path = shutdown_path()) {
+            $shutdown_reason = "shutdown file $path detected, finishing mbsync";
+        } else {
+            my $sig = ($SHUTDOWN && $SHUTDOWN eq 'INT') ? 'INT' : 'TERM';
+            $shutdown_reason = "signal $sig, finishing mbsync";
+        }
+        log_info($shutdown_reason);
+    }
+    my $n = mbsync_running();
+    if ($n > 0) {
+        log_info("waiting on $n mbsync") unless $shutdown_waiting;
+        $shutdown_waiting = 1;
+        return 'wait';
+    }
+    return 'exit';
+}
+
+sub _conn_what {
+    my ($conn, $key) = @_;
+    my $name = $conn->{name} // '?';
+    my $what = $key // '';
+    $what =~ s/^\Q$name\E:// if $name ne '?';
+    return $what;
+}
+
+sub _disconnect_conn {
+    my ($key) = @_;
+    return unless defined $key && exists $conns{$key};
+    my $conn = delete $conns{$key};
+    drop_socket($conn->{socket});
+    my $name = $conn->{name} // '?';
+    my $what = _conn_what($conn, $key);
+    my $secs = 0;
+    $secs = time() - $conn->{started} if defined $conn->{started};
+    my $avg = note_conn_time(_conn_time_key($conn), $secs) // '';
+    log_info("$name: disconnecting $what" . ($avg ne '' ? " $avg" : ''));
+    eval { imap_done($conn->{imap}, $conn->{tag})
+        if $conn->{imap} && ($conn->{mode} // '') eq 'IDLE' && $conn->{tag} };
+    close_session($conn->{imap}, $conn->{socket});
+}
+
+sub _close_for_shutdown {
+    _disconnect_conn($_) for sort keys %conns;
+    save_stat_files();
+    my $dir = $STATE_DIR;
+    if (!defined $dir || $dir eq '') {
+        $dir = (defined $ENV{HOME} && $ENV{HOME} ne '') ? "$ENV{HOME}/.local/imapidle" : '.local/imapidle';
+    }
+    log_info("wrote $dir stats");
+    log_info('shutdown complete');
+    closelog() if $LOG_OPEN;
+    $LOG_OPEN = 0;
+}
+
+sub request_shutdown {
+    my ($sig) = @_;
+    $SHUTDOWN = (defined $sig && $sig eq 'INT') ? 'INT' : 'TERM';
+    _poke_info();
+}
+
+sub pump_tracked {
+    my ($now) = @_;
+    $now //= time();
+    return if $track_cfg->{disabled};
+    for my $job (due_tracked($now)) {
+        last if slots_for_cold($now) <= 0;
+        my $pid = trigger_mbsync(0, "$job->{channel}:$job->{box}", {
+            track   => $job->{id},
+            capture => 1,
+        });
+        if (!$pid) {
+            my $row = $track{ $job->{id} } or next;
+            $row->{next} = $now + ($track_cfg->{initial} // 1800);
+        }
+    }
+}
+
+sub _pause_gate {
+    if (my $path = pause_path()) {
+        log_info("pause file $path detected, idling operations") unless $pause_announced;
+        $pause_announced = 1;
+        return 1;
+    }
+    if ($pause_announced) {
+        log_info('pause cleared, mbsync resuming');
+        $pause_announced = 0;
+    }
+    return 0;
+}
+
 sub pump_schedule {
     my ($now) = @_;
     $now //= time();
-    for my $job (due_mbsync_jobs($now)) {
+    my $phase = shutdown_phase();
+    return if $phase;
+    return if _pause_gate();
+    for my $job (due_mbsync_jobs($now, slots_for_hot($now))) {
         trigger_mbsync($job->{wait}, @{ $job->{args} });
     }
+    pump_tracked($now);
     pump_pulse($now);
 }
 
@@ -1614,6 +3721,61 @@ sub handle_ready {
     process_notification($conn);
 }
 
+sub _queue_mail_lines {
+    my ($conn, @lines) = @_;
+    return unless $conn;
+    my @mail = grep { mail_event_line($_) } @lines;
+    return unless @mail;
+    for my $folder (folders_for_lines($conn, @mail)) {
+        note_mail_event(
+            $conn->{channel}, $folder,
+            gap_for_folder($conn, $folder),
+            $conn->{wait} // 0,
+        );
+    }
+}
+
+sub _issue_due {
+    my ($conn, $now) = @_;
+    my $acc = $accounts{ $conn->{name} } or return;
+    $now //= time();
+    consider_id($conn->{imap}, $acc->{server}, $acc->{port}, $now);
+    consider_capability($conn->{name}, $conn->{imap}, $acc->{server}, $acc->{port}, $acc->{folders}, $now);
+    consider_list($conn->{name}, $acc, $conn->{imap}, $now);
+}
+
+sub refresh_primary {
+    my ($conn, $now) = @_;
+    return 0 unless $conn && $conn->{primary} && $conn->{imap};
+    $now //= time();
+    my $ok = eval {
+        if (($conn->{mode} // '') eq 'IDLE') {
+            my $was = imap_connected($conn->{imap});
+            my @done = imap_done($conn->{imap}, $conn->{tag});
+            _queue_mail_lines($conn, @done);
+            unless (imap_connected($conn->{imap})) {
+                my $why = $was ? ($conn->{imap}->LastError // 'not connected') : 'not connected';
+                die $why;
+            }
+            _issue_due($conn, $now);
+            die($conn->{imap}->LastError // 'not connected')
+                unless imap_connected($conn->{imap});
+            my $tag = $conn->{imap}->idle() or die($conn->{imap}->LastError // 'IDLE failed');
+            $conn->{tag} = $tag;
+            $conn->{last_idle} = time();
+            note_idle_rearmed($conn->{name});
+        } else {
+            _issue_due($conn, $now);
+        }
+        1;
+    };
+    if (!$ok) {
+        log_warn("$conn->{name}: primary refresh failed: " . scrub($@));
+        return 0;
+    }
+    return 1;
+}
+
 sub housekeeping {
     my $now = time();
     for my $key (keys %conns) {
@@ -1637,12 +3799,18 @@ sub housekeeping {
             $accounts{ $conn->{name} }{backoff} = 5 if $accounts{ $conn->{name} };
             $conn->{last_success} = $now;
         }
+        my $acc = $accounts{ $conn->{name} };
+        if ($conn->{primary} && $conn->{imap} && $acc && probes_due($acc, $now)) {
+            drop_conn($key, 'primary refresh failed') unless refresh_primary($conn, $now);
+            next;
+        }
         if (($conn->{mode} // '') eq 'IDLE'
             && $now - ($conn->{last_idle} // 0) >= 30) {
             drop_conn($key, 'idle refresh failed') unless restart_idle($conn);
         }
     }
 
+    return if $shutdown_reason;
     for my $name (keys %accounts) {
         next if $accounts{$name}{disabled};
         next if account_covered($name);
@@ -1670,6 +3838,37 @@ sub loop_timeout {
     $wait = $sched if defined $sched && $sched < $wait;
     my $off = next_pulse_delay($now);
     $wait = $off if defined $off && $off < $wait;
+    my $track_wait = next_track_delay($now);
+    $wait = $track_wait if defined $track_wait && $track_wait < $wait;
+    return $wait;
+}
+
+sub next_track_delay {
+    my ($now) = @_;
+    $now //= time();
+    my $wait;
+    unless ($track_cfg->{disabled}) {
+        for my $id (keys %track) {
+            my $d = ($track{$id}{next} // 0) - $now;
+            $d = 0 if $d < 0;
+            $wait = $d if !defined $wait || $d < $wait;
+        }
+    }
+    for my $ch (keys %list_next) {
+        my $d = ($list_next{$ch} // 0) - $now;
+        $d = 0 if $d < 0;
+        $wait = $d if !defined $wait || $d < $wait;
+    }
+    my %rows = load_learned();
+    for my $row (values %rows) {
+        for my $k (qw(id_next cap_next)) {
+            my $when = $row->{$k};
+            next unless defined $when && $when =~ /^\d+(?:\.\d+)?\z/;
+            my $d = $when - $now;
+            $d = 0 if $d < 0;
+            $wait = $d if !defined $wait || $d < $wait;
+        }
+    }
     return $wait;
 }
 
@@ -1744,7 +3943,7 @@ sub reload_config_now {
         log_error('reload kept the previous config: no config file');
         return 'no config file';
     }
-    my ($fresh, $err, $off) = parse_config_file($file);
+    my ($fresh, $err, $off, $track) = parse_config_file($file);
     if ($err || !$fresh) {
         $err //= 'empty config';
         log_error("reload kept the previous config: $err");
@@ -1789,10 +3988,12 @@ sub reload_config_now {
             log_info("$name: reconnecting");
             next;
         }
-        $new->{backoff}  = $old->{backoff}  // 5;
-        $new->{next_try} = $old->{next_try} // 0;
-        $new->{fails}    = $old->{fails}    // 0;
-        $new->{up}       = $old->{up}       // 0;
+        $new->{backoff}     = $old->{backoff}     // 5;
+        $new->{next_try}    = $old->{next_try}    // 0;
+        $new->{fails}       = $old->{fails}       // 0;
+        $new->{up}          = $old->{up}          // 0;
+        $new->{secret_wait} = $old->{secret_wait} if defined $old->{secret_wait};
+        $new->{secret_said} = $old->{secret_said} if defined $old->{secret_said};
         if ($old->{disabled}) {
             $new->{disabled} = 0;
             $new->{fails}    = 0;
@@ -1811,6 +4012,8 @@ sub reload_config_now {
         }
     }
     install_pulse($off, 1);
+    install_track($track, 1);
+    _request_list_refresh();
     log_info('config reloaded');
     return '';
 }
@@ -1850,6 +4053,7 @@ sub install_info_signal {
     die "SIGINFO is not available\n" unless defined $sig;
     my $sa = POSIX::SigAction->new(\&_poke_info, POSIX::SigSet->new(), SA_RESTART);
     POSIX::sigaction($sig, $sa) or die "sigaction INFO: $!";
+    hold_wake_signals();
 }
 
 sub _drain_fd {
@@ -1883,13 +4087,14 @@ sub install_chld_signal {
     die "SIGCHLD is not available\n" unless defined $sig;
     my $sa = POSIX::SigAction->new(\&_poke_chld, POSIX::SigSet->new(), SA_RESTART);
     POSIX::sigaction($sig, $sa) or die "sigaction CHLD: $!";
+    hold_wake_signals();
 }
 
 sub info_lines {
     my $now = int($_[0] // time());
     my @kids = sort { $a <=> $b } keys %children;
     my @lines = (
-        sprintf('info pid %d accounts %d connections %d mbsync %d',
+        sprintf('imapidle: info %d accounts %d connections %d mbsync %d',
             $$, scalar keys %accounts, scalar keys %conns, scalar @kids),
     );
     for my $name (sort keys %accounts) {
@@ -1922,9 +4127,43 @@ sub info_lines {
             push @lines, _folder_info_line($name, $acc, $folder, $now);
         }
     }
+    push @lines, _track_info_lines($now);
     push @lines, _pulse_info_lines($now);
     for my $pid (@kids) {
         push @lines, child_state_line($pid, $children{$pid});
+    }
+    return @lines;
+}
+
+sub _track_info_lines {
+    my ($now) = @_;
+    return () unless $track_cfg && !$track_cfg->{disabled};
+    my %by;
+    for my $id (keys %track) {
+        my ($ch, $box) = split /\0/, $id, 2;
+        next if !defined $ch || !defined $box;
+        push @{ $by{$ch} }, { box => $box, rec => $track{$id} };
+    }
+    my @lines;
+    for my $ch (sort keys %by) {
+        my @boxes = sort {
+            ($a->{rec}{next} // 0) <=> ($b->{rec}{next} // 0) || $a->{box} cmp $b->{box}
+        } @{ $by{$ch} };
+        my $n = @boxes;
+        my $soon = $boxes[0];
+        my $in = int(($soon->{rec}{next} // 0) - $now);
+        $in = 0 if $in < 0;
+        my $word = $n == 1 ? 'box' : 'boxes';
+        push @lines, "$ch: track $n $word, next $soon->{box} in ${in}s";
+        next unless $VERBOSE;
+        for my $b (@boxes) {
+            my $rec = $b->{rec};
+            my $due = int(($rec->{next} // 0) - $now);
+            $due = 0 if $due < 0;
+            my $samples = scalar @{ $rec->{samples} // [] };
+            my $interval = $rec->{interval} // 0;
+            push @lines, "$ch: track $b->{box} interval ${interval}s samples $samples due ${due}s";
+        }
     }
     return @lines;
 }
@@ -1994,8 +4233,13 @@ sub one_iteration {
     _drain_fd($CHLD_R);
     reap_children();
     apply_reload();
-    pump_schedule();
-    my @ready = $select->can_read(loop_timeout());
+    my $phase = shutdown_phase();
+    if ($phase eq 'exit') {
+        _close_for_shutdown();
+        exit 0;
+    }
+    pump_schedule() unless $phase;
+    my @ready = _handles_ready(loop_timeout());
     # A HUP that arrived during select is delivered before this call.
     apply_reload();
     # Drain ready sockets before housekeeping sends DONE or NOOP.
@@ -2025,7 +4269,12 @@ sub one_iteration {
         report_info();
     }
     housekeeping();
-    pump_schedule();
+    $phase = shutdown_phase();
+    if ($phase eq 'exit') {
+        _close_for_shutdown();
+        exit 0;
+    }
+    pump_schedule() unless $phase;
 }
 
 sub daemonize {
@@ -2043,19 +4292,12 @@ sub daemonize {
     open STDOUT, '>', '/dev/null';
     open STDERR, '>', '/dev/null';
     $FOREGROUND = 0;
-    log_info("daemon pid $$");
+    log_info("imapidle: daemon $$");
 }
 
 sub graceful_shutdown {
     my ($sig) = @_;
-    log_info("signal $sig, shutting down");
-    for my $key (keys %conns) {
-        my $conn = $conns{$key} or next;
-        eval { $conn->{imap}->done($conn->{tag}) if $conn->{imap} && $conn->{tag}; };
-        close_session($conn->{imap}, $conn->{socket});
-    }
-    closelog() if $LOG_OPEN;
-    exit 0;
+    request_shutdown($sig);
 }
 
 sub main_loop {
@@ -2072,6 +4314,39 @@ sub main_loop {
         sleep 1;
         log_error("loop error persisted $failures times") if $failures == 10 || $failures % 100 == 0;
     }
+}
+
+sub open_state_dir {
+    if (!defined $STATE_DIR || $STATE_DIR eq '') {
+        if (defined $ENV{HOME} && $ENV{HOME} ne '') {
+            $STATE_DIR = "$ENV{HOME}/.local/imapidle";
+        } elsif (defined $CONFIG_DIR && $CONFIG_DIR ne '') {
+            $STATE_DIR = $CONFIG_DIR;
+        } else {
+            return;
+        }
+    }
+    make_path($STATE_DIR, { mode => 0700 });
+    $FOLDERS_DIR = "$STATE_DIR/folders"
+        if !defined $FOLDERS_DIR || $FOLDERS_DIR eq '';
+    $MBSYNC_REAL_FILE = "$STATE_DIR/mbsync-real"
+        if !defined $MBSYNC_REAL_FILE || $MBSYNC_REAL_FILE eq '';
+    $CONN_TIME_FILE = "$STATE_DIR/conn-time"
+        if !defined $CONN_TIME_FILE || $CONN_TIME_FILE eq '';
+    $PULSE_LAST_FILE = "$STATE_DIR/pulse-last"
+        if !defined $PULSE_LAST_FILE || $PULSE_LAST_FILE eq '';
+    my $known   = "$STATE_DIR/known_hosts";
+    my $learned = "$STATE_DIR/learned";
+    if (defined $CONFIG_DIR && $CONFIG_DIR ne '') {
+        adopt_state_file($known,   "$CONFIG_DIR/known_hosts");
+        adopt_state_file($learned, "$CONFIG_DIR/learned");
+    }
+    $KNOWN_HOSTS = $known;
+    $LEARNED     = $learned;
+    load_folder_files();
+    load_stat_files();
+    _pulse_last_load();
+    _apply_pulse_last();
 }
 
 sub startup_fail {
@@ -2096,27 +4371,27 @@ sub run {
         startup_fail('HOME is not set') unless defined $ENV{HOME} && $ENV{HOME} ne '';
         $CONFIG_FILE = "$ENV{HOME}/.config/imapidle/imapidle.conf";
     }
-    $CONFIG_DIR  = dirname($CONFIG_FILE);
-    $KNOWN_HOSTS = "$CONFIG_DIR/known_hosts";
-    $LEARNED     = "$CONFIG_DIR/learned";
+    $CONFIG_DIR = dirname($CONFIG_FILE);
 
     openlog('imapidle', 'cons,pid', 'mail');
     $LOG_OPEN = 1;
     $SIG{PIPE} = 'IGNORE';
     $SIG{HUP}  = \&request_reload;
-    $SIG{TERM} = \&graceful_shutdown;
-    $SIG{INT}  = \&graceful_shutdown;
+    $SIG{TERM} = \&request_shutdown;
+    $SIG{INT}  = \&request_shutdown;
     install_info_signal();
 
     make_path($CONFIG_DIR, { mode => 0700 }) unless -d $CONFIG_DIR;
     my $err = load_config($CONFIG_FILE);
     startup_fail($err) if $err;
+    open_state_dir();
 
     for my $name (sort keys %accounts) {
         eval { connect_account($name) };
         log_error("$name: startup: " . scrub($@)) if $@;
     }
 
+    prime_named_folders(time());
     daemonize() unless $FOREGROUND;
     install_chld_signal();
     main_loop();
@@ -2137,6 +4412,19 @@ sub conn_count { scalar keys %conns }
 sub account_next_try {
     my ($name) = @_;
     return $accounts{$name}{next_try} // 0;
+}
+
+sub secret_wait_for_test {
+    my ($name) = @_;
+    return 0 unless $accounts{$name};
+    return $accounts{$name}{secret_wait} // 0;
+}
+
+sub secret_said_for_test {
+    my ($name, $when) = @_;
+    return 0 unless $accounts{$name};
+    $accounts{$name}{secret_said} = $when if @_ > 1;
+    return $accounts{$name}{secret_said} // 0;
 }
 
 # Test helper: a selected socket whose IMAP object is already gone.
@@ -2210,6 +4498,14 @@ sub set_next_try_for_test {
     $accounts{$name}{next_try} = $when;
 }
 
+sub set_conn_imap_for_test {
+    my ($key, $imap, $tag) = @_;
+    my $conn = $conns{$key} or return;
+    $conn->{imap} = $imap;
+    $conn->{tag}  = $tag if @_ > 2;
+    return $conn;
+}
+
 sub plant_idle_for_test {
     my ($name, $folder, $debounce, $channel) = @_;
     my $key = "$name:$folder";
@@ -2240,12 +4536,191 @@ sub plant_notify_for_test {
     return $key;
 }
 
+sub set_state_dir_for_test {
+    my ($dir) = @_;
+    $STATE_DIR        = $dir;
+    $FOLDERS_DIR      = "$dir/folders";
+    $MBSYNC_REAL_FILE = "$dir/mbsync-real";
+    $CONN_TIME_FILE   = "$dir/conn-time";
+    $PULSE_LAST_FILE  = "$dir/pulse-last";
+    $KNOWN_HOSTS      = "$dir/known_hosts";
+    $LEARNED          = "$dir/learned";
+    _pulse_last_load();
+    _apply_pulse_last();
+}
+
+sub set_runtime_dir_for_test { $RUNTIME_DIR = $_[0]; }
+
+sub wake_holds_chld_for_test {
+    my $cur = POSIX::SigSet->new();
+    POSIX::sigprocmask(POSIX::SIG_BLOCK(), POSIX::SigSet->new(), $cur);
+    my $n = _signal_number('CHLD');
+    return 0 unless defined $n;
+    return $cur->ismember($n) ? 1 : 0;
+}
+
+sub chld_ready_for_test {
+    my ($timeout) = @_;
+    return 0 unless defined $CHLD_R && defined fileno($CHLD_R);
+    my $deadline = Time::HiRes::time() + ($timeout // 0);
+    while (1) {
+        my $left = $deadline - Time::HiRes::time();
+        return 0 if $left <= 0;
+        my ($rin, $win, $ein) = ('', '', '');
+        vec($rin, fileno($CHLD_R), 1) = 1;
+        my $n = _pselect($rin, $win, $ein, $left);
+        if (defined $n && $n > 0 && vec($rin, fileno($CHLD_R), 1)) {
+            _drain_fd($CHLD_R);
+            return 1;
+        }
+        next if $!{EINTR};
+        return 0;
+    }
+}
+
+sub reset_track_for_test {
+    %track            = ();
+    %folder_lists     = ();
+    %list_next        = ();
+    %colon_noted      = ();
+    $track_cfg        = _blank_track();
+    $pause_announced  = 0;
+    $shutdown_reason  = '';
+    $shutdown_waiting = 0;
+    $SHUTDOWN         = 0;
+}
+
+sub reset_conn_time_for_test { %CONN_TIME = (); }
+
+sub track_cfg_for_test { return { %$track_cfg }; }
+
+sub track_rows_for_test {
+    my @rows;
+    for my $id (sort keys %track) {
+        my ($ch, $box) = split /\0/, $id, 2;
+        my $rec = $track{$id};
+        push @rows, {
+            channel  => $ch,
+            box      => $box,
+            interval => $rec->{interval},
+            next     => $rec->{next},
+            fails    => $rec->{fails} // 0,
+            samples  => scalar @{ $rec->{samples} // [] },
+        };
+    }
+    return @rows;
+}
+
+sub set_track_due_for_test {
+    my ($channel, $box, $when) = @_;
+    my $id = _track_key($channel, $box);
+    $track{$id} //= {
+        interval => $track_cfg->{initial},
+        samples  => [],
+        fails    => 0,
+    };
+    $track{$id}{next} = $when;
+    return $id;
+}
+
+sub list_next_for_test {
+    return unless exists $list_next{ $_[0] };
+    return $list_next{ $_[0] };
+}
+
+sub folder_names_for_test {
+    my $st = $folder_lists{ $_[0] } or return ();
+    return sort keys %{ $st->{names} // {} };
+}
+
+sub io_timeout_for_test { return $IO_MAX; }
+
+sub set_io_timeout_for_test { $IO_MAX = $_[0]; }
+
+sub set_trigger_hook_for_test { $TRIGGER_HOOK = $_[0]; }
+
+sub hold_child_for_test {
+    my ($pid, $label) = @_;
+    note_child_for_test($pid, $label);
+    $children{$pid}{started} = time() if $children{$pid};
+    return $pid;
+}
+
+sub tag_child_for_test {
+    my ($pid, $key, $val) = @_;
+    return unless $children{$pid} && defined $key && $key ne '';
+    $children{$pid}{$key} = $val;
+}
+
+sub shutdown_step_for_test {
+    my $phase = shutdown_phase();
+    _close_for_shutdown() if $phase eq 'exit';
+    return $phase;
+}
+
+sub request_shutdown_for_test { $SHUTDOWN = $_[0] || 'TERM'; }
+
+sub stat_pair_for_test {
+    my ($which, $key) = @_;
+    my $id = _memory_key($key);
+    return unless defined $id;
+    my $src = ($which // '') eq 'conn' ? \%CONN_TIME : \%MBSYNC_REAL;
+    my $row = $src->{$id} or return;
+    return ($row->{n}, $row->{total}, $row->{nr} // 0);
+}
+
 sub conn_exists_for_test       { exists $conns{ $_[0] } }
 sub conn_debounce_for_test     { return unless $conns{ $_[0] }; $conns{ $_[0] }{debounce} }
 sub notify_folder_count_for_test {
     my $conn = $conns{"$_[0]:NOTIFY"} or return 0;
     return scalar @{ $conn->{folders} // [] };
 }
+
+package ImapidleClient;
+use Errno qw(EAGAIN EWOULDBLOCK EPIPE ECONNRESET EBADF);
+our @ISA = ('Mail::IMAPClient');
+
+# The library retries EAGAIN forever. A non-blocking write waits in the
+# shared poll instead, and gives up at the same 45s ceiling as a read.
+sub _send_bytes {
+    my ($self, $byteref) = @_;
+    my $total  = 0;
+    my $socket = $self->Socket;
+    return 0 unless $socket;
+    my $deadline = Time::HiRes::time() + main::io_timeout_for_test();
+    local $SIG{PIPE} = 'IGNORE';
+    while ($total < length $$byteref) {
+        if ($deadline - Time::HiRes::time() <= 0) {
+            $self->LastError('timeout waiting to write to server');
+            $self->State(Mail::IMAPClient::Unconnected());
+            return;
+        }
+        my $written = syswrite($socket, $$byteref, length($$byteref) - $total, $total);
+        if (defined $written && $written > 0) {
+            $total += $written;
+            next;
+        }
+        my $want_r = $socket->can('want_read')  && $socket->want_read;
+        my $want_w = $socket->can('want_write') && $socket->want_write;
+        if (!defined $written && ($! == EAGAIN || $! == EWOULDBLOCK || $want_r || $want_w)) {
+            my $left = $deadline - Time::HiRes::time();
+            if ($left <= 0 || !main::io_wait_fd($socket, $want_r ? 0 : 1, $left)) {
+                $self->LastError('timeout waiting to write to server');
+                $self->State(Mail::IMAPClient::Unconnected());
+                return;
+            }
+            next;
+        }
+        my $emsg = $! ? "$!" : 'no error caught';
+        $self->State(Mail::IMAPClient::Unconnected())
+            if $! == EPIPE || $! == ECONNRESET || $! == EBADF;
+        $self->LastError("Write failed '$emsg'");
+        return;
+    }
+    return $total;
+}
+
+package main;
 
 run(@ARGV) unless caller;
 1;

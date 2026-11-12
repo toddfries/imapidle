@@ -14,10 +14,13 @@
 
 use strict;
 use warnings;
-use File::Temp qw(tempfile);
+use File::Temp qw(tempfile tempdir);
 use Test::More;
 
 require './imapidle';
+
+my $run = tempdir('imapidle-run-XXXX', CLEANUP => 1, TMPDIR => 1);
+set_runtime_dir_for_test($run);
 
 sub write_conf {
     my ($text) = @_;
@@ -278,4 +281,199 @@ unlink $gone;
 unlink $edited;
 unlink $path;
 
+my $boot = write_conf(<<'EOF');
+[acct]
+server = imap.example.com
+user = a@example.com
+pass = secret
+mbsync_channel = fdc-main
+folder0 = INBOX
+folder1 = Archive
+
+[held]
+disabled = yes
+
+[pulse]
+channel0 = knf
+channel1 = other
+EOF
+is(load_config($boot), '', 'startup order fixture loads');
+reset_schedule_for_test();
+clear_children_for_test();
+my $cap = track_cfg_for_test();
+$cap->{connections} = 2;
+install_track($cap, 0);
+set_foreground_for_test(1);
+my $primed = capture(sub { prime_named_folders(2000); });
+my $again  = capture(sub { prime_named_folders(2001); });
+set_foreground_for_test(0);
+like($primed, qr/acct    : startup sync INBOX Archive/, 'startup names the account folders');
+unlike($primed, qr/held: startup/, 'a disabled account is not synced at startup');
+is($again, '', 'startup sync is queued once');
+
+my @forked;
+set_trigger_hook_for_test(sub {
+    my ($wait, $args, $meta) = @_;
+    push @forked, { wait => $wait, args => [@$args], pulse => $meta->{pulse} };
+    return hold_child_for_test(70000 + @forked, 'mbsync ' . join(' ', @$args));
+});
+queue_folder('hotb', 'INBOX', 2000, 2000);
+pump_schedule(2000);
+is_deeply(
+    [map { join(' ', @{ $_->{args} }) } @forked],
+    ['fdc-main:Archive fdc-main:INBOX', 'knf'],
+    'one slot stays with the named folders and pulse uses the other',
+);
+is($forked[0]{wait}, 0, 'startup sync does not wait out the event delay');
+ok(!defined $forked[0]{pulse}, 'the named sync is not a pulse job');
+is($forked[1]{pulse}, 'knf', 'the spare slot is a pulse channel');
+ok(defined schedule_deadline('hotb'), 'the next named channel stays queued');
+is_deeply([due_pulse_channels(2000)], ['other'], 'a pulse channel with no free slot stays due');
+@forked = ();
+pump_schedule(2000);
+is_deeply(\@forked, [], 'a full pair does not start another mbsync');
+
+clear_children_for_test();
+@forked = ();
+reset_schedule_for_test();
+set_pulse_next_for_test('knf', 10**12);
+set_pulse_next_for_test('other', 10**12);
+queue_folder('fdc-main', 'INBOX', 2000, 2000);
+queue_folder('hotb', 'INBOX', 2000, 2000);
+pump_schedule(2000);
+is_deeply(
+    [map { join(' ', @{ $_->{args} }) } @forked],
+    ['fdc-main:INBOX', 'hotb:INBOX'],
+    'named folders use every slot when pulse is not due',
+);
+
+clear_children_for_test();
+@forked = ();
+reset_schedule_for_test();
+$cap = track_cfg_for_test();
+$cap->{connections} = 1;
+install_track($cap, 0);
+set_pulse_next_for_test('knf', 0);
+set_pulse_next_for_test('other', 0);
+prime_named_folders(2000);
+pump_schedule(2000);
+is_deeply(
+    [map { join(' ', @{ $_->{args} }) } @forked],
+    ['fdc-main:Archive fdc-main:INBOX'],
+    'with one slot the named sync holds pulse',
+);
+is_deeply([due_pulse_channels(2000)], [qw(knf other)], 'pulse stays due on the only slot');
+clear_children_for_test();
+@forked = ();
+pump_schedule(2000);
+is_deeply(
+    [map { join(' ', @{ $_->{args} }) } @forked],
+    ['knf'],
+    'pulse starts once the only slot is free',
+);
+
+clear_children_for_test();
+@forked = ();
+reset_schedule_for_test();
+$cap = track_cfg_for_test();
+$cap->{connections} = 2;
+install_track($cap, 0);
+set_pulse_next_for_test('knf', 0);
+set_pulse_next_for_test('other', 0);
+queue_folder('fdc-main', 'INBOX', 2100, 2130);
+pump_schedule(2100);
+is_deeply(
+    [map { join(' ', @{ $_->{args} }) } @forked],
+    ['knf'],
+    'pulse uses the spare slot during a named-folder combine window',
+);
+is(next_schedule_delay(2100), 30, 'the named folder wakes the loop at its deadline');
+ok(!defined next_pulse_delay(2100), 'the held slot does not make the loop spin');
+is_deeply([due_pulse_channels(2100)], ['other'], 'the second pulse channel waits for a slot');
+
+reset_schedule_for_test();
+clear_children_for_test();
+$cap = track_cfg_for_test();
+$cap->{connections} = 1;
+install_track($cap, 0);
+queue_folder('fdc-main', 'INBOX', 3000, 3000);
+note_child_for_test(3, 'mbsync other:INBOX');
+ok(!defined next_schedule_delay(3000), 'a due named folder does not spin while every slot is taken');
+
+set_trigger_hook_for_test(undef);
+set_foreground_for_test(0);
+unlink $boot;
+
+my $saved = write_conf(<<'EOF');
+[acct]
+server = imap.example.com
+user = a@example.com
+pass = secret
+mbsync_channel = fdc-main
+folder0 = INBOX
+
+[pulse]
+sweep = 3600
+channel0 = gm-ctf
+channel1 = knf
+channel2 = knfmobile
+EOF
+my $pdir = tempdir('imapidle-pulse-XXXX', CLEANUP => 1, TMPDIR => 1);
+open my $pf, '>', "$pdir/pulse-last" or die "pulse-last: $!";
+print $pf "# channel\tlast\nknf\t1000\nknfmobile\t2000\n";
+close $pf;
+set_state_dir_for_test($pdir);
+is(load_config($saved), '', 'a fresh load reads pulse-last');
+is(pulse_snapshot_for_test()->{next}{knf}, 4600, 'knf waits sweep seconds after its saved exit');
+is(pulse_snapshot_for_test()->{next}{knfmobile}, 5600, 'knfmobile waits from its own saved exit');
+is(pulse_snapshot_for_test()->{next}{'gm-ctf'}, 0, 'a channel with no saved exit is due');
+is_deeply([due_pulse_channels(4500)], ['gm-ctf'], 'a recent exit is not due again after restart');
+is_deeply([due_pulse_channels(4600)], [qw(gm-ctf knf)], 'knf is due once its sweep has passed');
+clear_children_for_test();
+reset_schedule_for_test();
+set_trigger_hook_for_test(sub { return 0 });
+pump_pulse(4500);
+is(pulse_snapshot_for_test()->{next}{'gm-ctf'}, 8100, 'a failed start still waits out the sweep');
+unlike(slurp("$pdir/pulse-last"), qr/^gm-ctf\t/m, 'a failed start is not a saved exit');
+set_trigger_hook_for_test(undef);
+finish_pulse_channel('gm-ctf', 4500);
+is(pulse_snapshot_for_test()->{next}{'gm-ctf'}, 8100, 'an exit still starts the sweep wait');
+like(slurp("$pdir/pulse-last"), qr/^gm-ctf\t4500$/m, 'the exit is stored for the next start');
+like(slurp("$pdir/pulse-last"), qr/^knf\t1000$/m, 'another channel keeps its saved exit');
+set_state_dir_for_test($pdir);
+is(load_config($saved), '', 'a second start reads the exit just saved');
+is(pulse_snapshot_for_test()->{next}{'gm-ctf'}, 8100, 'restart does not run a channel still inside sweep');
+is_deeply([due_pulse_channels(8000)], [qw(knf knfmobile)], 'only channels past their sweep are due');
+open my $rew, '>', "$pdir/pulse-last" or die "rewrite pulse-last: $!";
+print $rew "# channel\tlast\nknf\t1\n";
+close $rew;
+is(reload_config_now($saved), '', 'reload does not reread pulse-last');
+is(pulse_snapshot_for_test()->{next}{knf}, 4600, 'reload keeps the clock already in memory');
+unlink $saved;
+
 done_testing;
+
+sub slurp {
+    my ($file) = @_;
+    open my $in, '<', $file or die "read $file: $!";
+    local $/;
+    return scalar <$in>;
+}
+
+sub capture {
+    my ($code) = @_;
+    my ($tfh, $path) = tempfile('imapidle-cap-XXXX', UNLINK => 1, TMPDIR => 1);
+    close $tfh;
+    open my $old, '>&', \*STDERR or die "dup stderr: $!";
+    open STDERR, '>', $path or die "redirect stderr: $!";
+    my $err;
+    eval { $code->(); 1 } or $err = $@;
+    open STDERR, '>&', $old or die "restore stderr: $!";
+    close $old;
+    open my $in, '<', $path or die "read stderr: $!";
+    local $/;
+    my $buf = <$in> // '';
+    close $in;
+    die $err if $err;
+    return $buf;
+}

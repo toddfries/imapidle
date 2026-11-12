@@ -29,7 +29,7 @@ my $first = capture(sub {
     is(remember_discovery('ma', 'outlook.example', 993, 'absent', undef, []), 'absent',
         'an absent server is recorded');
 });
-is($first, "imapidle: ma: server does not advertise NOTIFY, using IDLE\n",
+is($first, "imapidle: ma      : server does not advertise NOTIFY, using IDLE\n",
     'the first discovery is logged');
 ok(-f $path, 'learned was created');
 is((stat $path)[2] & 0777, 0600, 'learned mode is 0600');
@@ -48,7 +48,7 @@ my $idle_log = capture(sub {
     is(setup_notification('ma', $idle_host, bless({}, 'CapIdle'), []), 0,
         'a server without NOTIFY is IDLE');
 });
-is($idle_log, "imapidle: ma: server does not advertise NOTIFY, using IDLE\n",
+is($idle_log, "imapidle: ma      : server does not advertise NOTIFY, using IDLE\n",
     'the probe logs the discovery once');
 my $idle_again = capture(sub {
     is(setup_notification('ma', $idle_host, bless({}, 'CapBoom'), []), 0,
@@ -75,7 +75,7 @@ my @folders = ({ name => 'INBOX' }, { name => 'Archive' });
 my $active_log = capture(sub {
     remember_discovery('acct', 'new.example', 993, 'active', 'other', \@folders);
 });
-like($active_log, qr/acct: server identified as other/, 'a new active server is named');
+like($active_log, qr/acct    : server identified as other/, 'a new active server is named');
 like($active_log, qr/NOTIFY active \(2 folder\(s\) in the personal namespace\)/,
     'an active server counts its folders');
 ok(!server_uses_idle('new.example', 993), 'an active server is still armed');
@@ -149,7 +149,7 @@ package CapReject;
 sub capability { return qw(IMAP4rev1 NOTIFY); }
 sub tag_and_run {
     my (undef, $cmd) = @_;
-    return '* ID ("name" "Dovecot" "version" "2.2.36")' if $cmd eq 'ID NIL';
+    return '* ID ("name" "Dovecot" "version" "2.2.36")' if $cmd eq main::id_command();
     return 'A5 BAD Error in IMAP command NOTIFY: Invalid arguments.';
 }
 
@@ -157,7 +157,7 @@ package CapQuiet;
 sub capability { die "capability ran on a cached active server\n"; }
 sub tag_and_run {
     my (undef, $cmd) = @_;
-    die "ID NIL ran on a cached active server\n" if $cmd eq 'ID NIL';
+    die "ID ran on a cached active server\n" if defined $cmd && $cmd =~ /^ID\b/;
     return 'A9 OK NOTIFY completed.';
 }
 
@@ -165,6 +165,6 @@ package CapDrop;
 sub capability { die "capability ran on a cached active server\n"; }
 sub tag_and_run {
     my (undef, $cmd) = @_;
-    die "ID NIL ran on a cached active server\n" if $cmd eq 'ID NIL';
+    die "ID ran on a cached active server\n" if defined $cmd && $cmd =~ /^ID\b/;
     return 'A9 BAD NOTIFY unavailable.';
 }
