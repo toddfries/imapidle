@@ -159,6 +159,7 @@ is($poller->State, Mail::IMAPClient::Unconnected(), 'an idle poll does not mark 
 my ($cfh, $cpath) = tempfile(UNLINK => 1);
 print $cfh <<'EOF';
 [acct]
+type = idle
 server = 127.0.0.1
 user = a@example.com
 pass = secret

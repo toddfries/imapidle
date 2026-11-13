@@ -29,6 +29,7 @@ set_runtime_dir_for_test($dir);
 
 my $plain = write_conf(<<'EOF');
 [acct]
+type = idle
 server = imap.example.com
 user = a@example.com
 pass = secret
@@ -49,6 +50,7 @@ ok((!grep { $_ eq 'track' } account_names()), 'track is not an account');
 
 my $over = write_conf(<<'EOF');
 [acct]
+type = idle
 server = imap.example.com
 user = a@example.com
 pass = secret
@@ -56,6 +58,7 @@ mbsync_channel = ch
 folder0 = INBOX
 
 [track]
+type = global
 min = 120
 connections = 3
 disabled = yes
@@ -70,45 +73,53 @@ is_deeply([account_names()], ['acct'], 'the track section is not connected');
 
 like(load_config(write_conf(<<'EOF')), qr/\[track\] bad min/, 'min below 60 is rejected');
 [acct]
+type = idle
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
 folder0 = INBOX
 [track]
+type = global
 min = 10
 EOF
 
 like(load_config(write_conf(<<'EOF')), qr/\[track\] bad max/, 'max below min is rejected');
 [acct]
+type = idle
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
 folder0 = INBOX
 [track]
+type = global
 max = 100
 EOF
 
 like(load_config(write_conf(<<'EOF')), qr/\[track\] capability below id/, 'capability shorter than id is rejected');
 [acct]
+type = idle
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
 folder0 = INBOX
 [track]
+type = global
 capability = 3600
 EOF
 
 like(load_config(write_conf(<<'EOF')), qr/\[track\] bad messages/, 'messages must be at least 1');
 [acct]
+type = idle
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
 folder0 = INBOX
 [track]
+type = global
 messages = 0
 EOF
 
@@ -355,12 +366,14 @@ is(list_next_for_test('fdc'), 0, 'a non-zero tracked exit asks for LIST');
 
 is(load_config(write_conf(<<'EOF')), '', 'queue fixture loads');
 [acct]
+type = idle
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
 folder0 = INBOX
 [pulse]
+type = pulse
 channel0 = knf
 EOF
 my $cap = track_cfg_for_test();

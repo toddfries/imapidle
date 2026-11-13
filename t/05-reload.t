@@ -29,6 +29,7 @@ sub write_conf {
 
 my $one = write_conf(<<'EOF');
 [acct]
+type = idle
 server = imap.example.com
 user = a@example.com
 pass = secret
@@ -45,6 +46,7 @@ ok($due > time(), 'account is waiting out a retry');
 
 my $more = write_conf(<<'EOF');
 [acct]
+type = idle
 server = imap.example.com
 user = a@example.com
 pass = secret
@@ -66,6 +68,7 @@ is(account_next_try('acct'), 0, 'a new IDLE folder is due to connect');
 
 my $bad = write_conf(<<'EOF');
 [acct]
+type = idle
 server = imap.example.com
 user = a@example.com
 mbsync_channel = ch
@@ -77,6 +80,7 @@ ok(conn_exists_for_test('acct:INBOX'), 'the open connection stays after a bad fi
 
 my $moved = write_conf(<<'EOF');
 [acct]
+type = idle
 server = other.example.com
 user = a@example.com
 pass = secret
@@ -101,6 +105,7 @@ is(account_next_try('acct'), $notify_due, 'NOTIFY does not reconnect for a new f
 
 my $gone = write_conf(<<'EOF');
 [other]
+type = idle
 server = imap.example.com
 user = b@example.com
 pass = secret

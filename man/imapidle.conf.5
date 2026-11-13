@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 11 2026 $
+.Dd $Mdocdate: November 12 2026 $
 .Dt IMAPIDLE.CONF 5
 .Os
 .Sh NAME
@@ -30,15 +30,41 @@ which IMAP accounts to watch and which
 .Sy mbsync
 channel to run when mail changes.
 The file is INI.
-One section is one account.
+Every section has a
+.Va type
+of
+.Cm global ,
+.Cm pulse ,
+.Cm idle ,
+or
+.Cm passonly .
+The comparison ignores case.
 The section name is a label used in log lines.
-The name
-.Pa pulse
-is reserved for channels that are not IMAP accounts.
-The name
-.Pa track
-is reserved for mailboxes that are not in
-.Va folderN .
+At most one
+.Cm global
+section and one
+.Cm pulse
+section are allowed.
+A missing
+.Va type ,
+an unknown
+.Va type ,
+or a second
+.Cm global
+or
+.Cm pulse
+section rejects the file.
+.Cm idle
+watches mailboxes.
+.Cm passonly
+holds credentials and does not open
+.Cm IDLE
+or
+.Cm NOTIFY .
+.Cm pulse
+names channels that are swept on a timer.
+.Cm global
+holds the limits and the tunnel switch.
 See
 .Sx PULSE CHANNELS
 and
@@ -60,7 +86,11 @@ or
 are comments.
 Text after a value is not a comment.
 .Pp
-Each account requires
+An
+.Cm idle
+or
+.Cm passonly
+section requires
 .Va server ,
 .Va user ,
 .Va mbsync_channel ,
@@ -75,9 +105,9 @@ and
 a bad port, an empty
 .Va folderN ,
 or a bad
-.Pa [pulse]
+.Cm pulse
 or
-.Pa [track]
+.Cm global
 section
 is written to standard error.
 .Nm imapidle
@@ -96,6 +126,14 @@ and
 are not accepted.
 .Sh KEYS
 .Bl -tag -width "mbsync_channel"
+.It Va type
+.Cm global ,
+.Cm pulse ,
+.Cm idle ,
+or
+.Cm passonly .
+Required.
+The comparison ignores case.
 .It Va disabled
 Set to
 .Cm yes
@@ -159,8 +197,13 @@ Required.
 It must match a channel in the
 .Sy mbsync
 configuration.
-.Nm imapidle
-does not read that file.
+While
+.Va tunnel
+is off, that file is not read.
+While
+.Va tunnel
+is on, it is read so matching accounts can be pointed at the
+helper.
 .It Va wait
 Seconds to sleep inside the
 .Sy mbsync
@@ -180,9 +223,16 @@ A missing priority is 5.
 .It Va folder
 Used only when no
 .Va folderN
-key is present.
+key is present, and only for
+.Cm idle .
 The default mailbox is
 .Cm INBOX .
+A
+.Cm passonly
+section ignores
+.Va folder
+and
+.Va folderN .
 .It Va priority
 Used only with
 .Va folder ,
@@ -248,11 +298,19 @@ A batch uses the largest
 .Va wait
 among its folders.
 .Sh PULSE CHANNELS
-The optional
-.Pa [pulse]
-section names
+A section with
+.Va type
+.Cm pulse
+names
 .Sy mbsync
 channels that are not IMAP accounts.
+The section may use any name.
+Each non-disabled
+.Cm passonly
+channel is added to this list when it is not already there.
+With no pulse section, and at least one passonly account, a pulse
+is assumed: enabled, sweep 3600, and those channels.
+A disabled pulse section does not run them.
 .Nm
 runs each one as
 .Pa mbsync channel
@@ -315,13 +373,13 @@ Changing
 .Va sweep
 applies the next time a run exits.
 .Sh TRACKED MAILBOXES
-The optional
-.Pa [track]
-section is not an account.
-The name
-.Pa track
-is reserved.
-With no section, the defaults below are in force and tracking is on.
+A section with
+.Va type
+.Cm global
+is not an account.
+The section may use any name.
+With no global section, the defaults below are in force and tracking
+is on.
 A present section overrides only the keys it sets.
 .Va disabled
 set to
@@ -351,7 +409,7 @@ and
 .Va connections
 must be at least 1.
 A bad value rejects the file.
-.Bl -tag -width "connections"
+.Bl -tag -width "tunnel_timeout"
 .It Va min
 Minimum seconds between tracked syncs.
 The default is 600.
@@ -403,6 +461,39 @@ With one slot, pulse waits until that named sync is done.
 When no pulse channel is due, hot folders may use every slot.
 Tracked mailboxes and pulse channels leave one free when this is
 above 1 and no named sync is using it.
+.It Va tunnel
+.Cm yes
+or
+.Cm no .
+The default is
+.Cm no .
+.Cm yes
+runs
+.Sy mbsync
+through a helper that has already logged in.
+See
+.Sy imapidle(1) .
+This is independent of
+.Va disabled .
+.It Va tunnel_timeout
+Whole seconds for the helper login and for the generated
+.Sy mbsync
+.Cm Timeout .
+The default is 3600.
+A value below 1 is rejected.
+.It Va mbsyncrc
+Path of the
+.Sy mbsync
+configuration to copy when
+.Va tunnel
+is on.
+Empty uses
+.Pa $XDG_CONFIG_HOME/isyncrc
+when that file exists, otherwise
+.Pa ~/.mbsyncrc .
+.Ev XDG_CONFIG_HOME
+defaults to
+.Pa ~/.config .
 .El
 .Pp
 Every three finished syncs of one mailbox replace its interval.
@@ -508,6 +599,7 @@ Count and total connected seconds for each IMAP session.
 A password stored in the file, with a hot inbox and a lazy archive:
 .Bd -literal -offset indent
 [personal]
+type = idle
 server = imap.example.com
 port = 993
 user = you@example.com
@@ -522,6 +614,7 @@ The same shape when a command prints the password.
 is only an example of such a command:
 .Bd -literal -offset indent
 [work]
+type = idle
 server = imap.example.com
 user = you@work.example
 pass_cmd = pizauth show work
@@ -530,20 +623,38 @@ folder = INBOX
 priority = 3
 .Ed
 .Pp
+A channel that is synced on the pulse clock, with no
+.Cm IDLE
+session.
+Its
+.Va mbsync_channel
+is added to the pulse list:
+.Bd -literal -offset indent
+[lists]
+type = passonly
+server = imap.example.com
+user = you@lists.example
+pass = secret
+mbsync_channel = lists
+.Ed
+.Pp
 Channels that are not watched over IMAP:
 .Bd -literal -offset indent
 [pulse]
+type = pulse
 sweep = 3600
 channel0 = lists
 channel1 = archive
 .Ed
 .Pp
-Leaving out
-.Pa [track]
-uses these values.
-Writing the section overrides only the keys that are set:
+Leaving out the global section uses these values.
+Writing the section overrides only the keys that are set.
+.Va tunnel
+stays off until it is set to
+.Cm yes :
 .Bd -literal -offset indent
 [track]
+type = global
 min = 600
 messages = 5
 initial = 1800
@@ -552,6 +663,8 @@ list = 259200
 id = 604800
 capability = 604800
 connections = 2
+tunnel = no
+tunnel_timeout = 3600
 .Ed
 .Sh SEE ALSO
 .Xr syslog 3 ,

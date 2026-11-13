@@ -22,6 +22,7 @@ require './imapidle';
 my ($fh, $path) = tempfile('imapidle-XXXX', SUFFIX => '.conf', TMPDIR => 1);
 print $fh <<'EOF';
 [acct]
+type = idle
 server = imap.example.com
 user = a@example.com
 pass = secret
@@ -159,6 +160,7 @@ sub write_conf {
 
 my $on = write_conf(<<'EOF');
 [acct]
+type = idle
 server = imap.example.com
 user = a@example.com
 pass = secret
@@ -167,6 +169,7 @@ folder0 = INBOX
 EOF
 my $off = write_conf(<<'EOF');
 [acct]
+type = idle
 disabled = yes
 server = imap.example.com
 user = a@example.com

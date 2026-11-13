@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 11 2026 $
+.Dd $Mdocdate: November 12 2026 $
 .Dt IMAPIDLE 1
 .Os
 .Sh NAME
@@ -23,6 +23,9 @@
 .Sh SYNOPSIS
 .Nm imapidle
 .Op Fl dv
+.Op Fl c Ar file
+.Nm imapidle
+.Fl -tunnel Ar section
 .Op Fl c Ar file
 .Sh DESCRIPTION
 .Nm
@@ -147,17 +150,45 @@ The flag applies when the process is a daemon and with
 An unknown certificate is stored in
 .Pa known_hosts
 and the connection continues.
-The first look at a host logs
+The first look at a host logs one line named
+.Ql [tls] .
+The name is padded so its colon lines up with other messages.
+The text gives the host number, as
+.Ql 01.cert ,
+then the host and port, the TLS version, the cipher, the cipher
+length in bits
+.Pq ci ,
+the leaf public-key length in bits
+.Pq skey ,
+.Cm comp
+and 0 or 1, then
+.Cm fp
+and
 .Cm match ,
 .Cm new ,
 or
 .Cm change .
+.Cm comp
+is 1 when that TLS session is using compression.
+The record is one log line.
+Broken to fit this page, it looks like:
+.Bd -literal -offset indent
+[tls]   : 01.cert mail.example:993 TLSv1.2
+    ECDHE-RSA-AES256-GCM-SHA384 ci 256b skey 4096b
+    comp 0 fp match
+.Ed
+.Pp
+The spaces before the colon are that padding.
+With no accounts loaded the name column is eight characters, so
+.Ql [tls]
+has three spaces before the colon.
+A longer account or channel name widens the column.
 .Cm new
-adds a line beginning with
-.Ql +
+adds
+.Ql [tls]: NN.cert +
 and the fingerprint.
 .Cm change
-adds that line and a line beginning with
+adds that line and one beginning with
 .Ql -
 and the previous fingerprint.
 A later connection to the same host does not repeat them.
@@ -209,6 +240,64 @@ Folders of the same channel that become ready together are one process:
 .Bd -literal -offset indent
 mbsync channel:INBOX channel:Archive
 .Ed
+.Pp
+.Va tunnel
+in the global section is a second way to run that command.
+The default is
+.Cm no ,
+and
+.Sy mbsync
+is executed as above.
+.Cm yes
+writes a mode 0600 copy of the
+.Sy mbsync
+configuration under
+.Pa ~/.local/imapidle/tunnel/
+and runs
+.Sy mbsync Fl c
+on that copy.
+The copy is removed when that process exits.
+For each account this program can log into, the copy drops the host,
+port, user, password, and TLS settings, and adds a
+.Cm Tunnel
+command,
+.Cm TLSType None ,
+and a
+.Cm Timeout
+of
+.Va tunnel_timeout
+seconds.
+The default timeout is 3600.
+.Sy mbsync
+runs the command through
+.Pa /bin/sh Fl c .
+The command is this program,
+.Fl -tunnel Ar section ,
+and the same
+.Fl c
+file.
+That process opens its own TLS session, logs in, writes
+.Ql * PREAUTH ,
+and copies bytes until one side closes.
+Nothing else is written to that stream.
+A channel with no matching section keeps its original account,
+including its password.
+If the copy cannot be built, the log says so and
+.Sy mbsync
+runs on its own configuration.
+Turning
+.Va tunnel
+off, or back on, takes effect on the next
+.Dv SIGHUP .
+.Pp
+.Fl -tunnel
+reads one
+.Cm idle
+or
+.Cm passonly
+section, logs in, and exits.
+It does not watch other accounts and it does not become a daemon.
+Standard output is the IMAP stream.
 .Pp
 A ready event starts a 5 second wait on that channel.
 Other ready events for the same channel during those 5 seconds join the
@@ -456,6 +545,15 @@ sends
 .Dv SIGTERM .
 .It Pa ~/.local/imapidle/
 State directory, mode 0700.
+.It Pa ~/.local/imapidle/tunnel/
+Mode 0600 copies of the
+.Sy mbsync
+configuration, one per run, while
+.Va tunnel
+is on.
+The file is removed when that
+.Sy mbsync
+exits.
 .It Pa ~/.local/imapidle/known_hosts
 SHA256 certificate fingerprints.
 A current line is

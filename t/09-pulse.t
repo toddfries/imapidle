@@ -37,6 +37,7 @@ sub jobs {
 
 my $bad_sweep = write_conf(<<'EOF');
 [pulse]
+type = pulse
 sweep = soon
 channel0 = gm-ctf
 EOF
@@ -45,6 +46,7 @@ unlink $bad_sweep;
 
 my $gap = write_conf(<<'EOF');
 [pulse]
+type = pulse
 channel0 = gm-ctf
 channel2 = knf
 EOF
@@ -53,6 +55,7 @@ unlink $gap;
 
 my $empty = write_conf(<<'EOF');
 [pulse]
+type = pulse
 channel0 =
 EOF
 like(load_config($empty), qr/\[pulse\] empty channel0/, 'an empty channel is rejected');
@@ -60,6 +63,7 @@ unlink $empty;
 
 my $colon = write_conf(<<'EOF');
 [pulse]
+type = pulse
 channel0 = gm:ctf
 EOF
 like(load_config($colon), qr/\[pulse\] bad channel0/, 'a colon in a channel name is rejected');
@@ -67,6 +71,7 @@ unlink $colon;
 
 my $dash = write_conf(<<'EOF');
 [pulse]
+type = pulse
 channel0 = -a
 EOF
 like(load_config($dash), qr/\[pulse\] bad channel0/, 'a channel name may not be an mbsync flag');
@@ -74,6 +79,7 @@ unlink $dash;
 
 my $dup = write_conf(<<'EOF');
 [pulse]
+type = pulse
 channel0 = gm-ctf
 channel1 = gm-ctf
 EOF
@@ -82,6 +88,7 @@ unlink $dup;
 
 my $held = write_conf(<<'EOF');
 [pulse]
+type = pulse
 disabled = yes
 sweep = no
 EOF
@@ -93,6 +100,7 @@ unlink $held;
 
 my $only = write_conf(<<'EOF');
 [pulse]
+type = pulse
 channel0 = gm-ctf
 channel1 = knf
 EOF
@@ -119,6 +127,7 @@ unlink $only;
 
 my $path = write_conf(<<'EOF');
 [acct]
+type = idle
 server = imap.example.com
 user = a@example.com
 pass = secret
@@ -126,6 +135,7 @@ mbsync_channel = fdc-main
 folder0 = INBOX
 
 [pulse]
+type = pulse
 sweep = 3600
 channel0 = gm-ctf
 channel1 = knf
@@ -206,6 +216,7 @@ is_deeply(
 
 my $edited = write_conf(<<'EOF');
 [acct]
+type = idle
 server = imap.example.com
 user = a@example.com
 pass = secret
@@ -213,6 +224,7 @@ mbsync_channel = fdc-main
 folder0 = INBOX
 
 [pulse]
+type = pulse
 sweep = 60
 channel0 = gm-ctf
 channel1 = archive
@@ -229,6 +241,7 @@ is(pulse_snapshot_for_test()->{next}{'gm-ctf'}, 5060, 'the new sweep applies whe
 
 my $bad = write_conf(<<'EOF');
 [acct]
+type = idle
 server = imap.example.com
 EOF
 isnt(reload_config_now($bad), '', 'a bad file is rejected');
@@ -242,6 +255,7 @@ unlink $bad;
 
 my $off = write_conf(<<'EOF');
 [acct]
+type = idle
 server = imap.example.com
 user = a@example.com
 pass = secret
@@ -249,6 +263,7 @@ mbsync_channel = fdc-main
 folder0 = INBOX
 
 [pulse]
+type = pulse
 disabled = YES
 channel0 = gm-ctf
 EOF
@@ -268,6 +283,7 @@ is_deeply(
 
 my $gone = write_conf(<<'EOF');
 [acct]
+type = idle
 server = imap.example.com
 user = a@example.com
 pass = secret
@@ -283,6 +299,7 @@ unlink $path;
 
 my $boot = write_conf(<<'EOF');
 [acct]
+type = idle
 server = imap.example.com
 user = a@example.com
 pass = secret
@@ -291,9 +308,11 @@ folder0 = INBOX
 folder1 = Archive
 
 [held]
+type = idle
 disabled = yes
 
 [pulse]
+type = pulse
 channel0 = knf
 channel1 = other
 EOF
@@ -406,6 +425,7 @@ unlink $boot;
 
 my $saved = write_conf(<<'EOF');
 [acct]
+type = idle
 server = imap.example.com
 user = a@example.com
 pass = secret
@@ -413,6 +433,7 @@ mbsync_channel = fdc-main
 folder0 = INBOX
 
 [pulse]
+type = pulse
 sweep = 3600
 channel0 = gm-ctf
 channel1 = knf

@@ -38,6 +38,7 @@ unlike($sasl, qr/\n/, 'the initial response is one line');
 my ($fh, $path) = tempfile('imapidle-XXXX', SUFFIX => '.conf', TMPDIR => 1);
 print $fh <<'EOF';
 [good]
+type = idle
 server = imap.example.com
 user = a@example.com
 pass = secret
@@ -46,6 +47,7 @@ folder0 = INBOX;priority=1
 folder1 = Archive
 
 [cmd]
+type = idle
 server = imap.example.com
 user = b@example.com
 pass_cmd = printf '%s\n' tok
@@ -57,6 +59,8 @@ close $fh;
 
 my $err = load_config($path);
 is($err, '', 'valid file loads') or diag($err);
+is(track_cfg_for_test()->{tunnel}, 0, 'tunnel defaults off');
+is(track_cfg_for_test()->{tunnel_timeout}, 3600, 'tunnel timeout defaults to 3600');
 is_deeply([account_names()], [qw(cmd good)], 'both accounts load');
 
 my $good = loaded_account('good');
@@ -90,6 +94,7 @@ sub write_conf {
 
 my $old = write_conf(<<'EOF');
 [old]
+type = idle
 server = imap.example.com
 user = a@example.com
 password = secret
@@ -102,12 +107,14 @@ unlink $old;
 
 my $bad = write_conf(<<'EOF');
 [good]
+type = idle
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = personal
 
 [broken]
+type = idle
 server = imap.example.com
 user = b@example.com
 pass = x
@@ -115,6 +122,7 @@ pass_cmd = true
 mbsync_channel = no
 
 [short]
+type = idle
 server = imap.example.com
 EOF
 $err = load_config($bad);
@@ -132,6 +140,7 @@ unlink $bad;
 
 my $held = write_conf(<<'EOF');
 [live]
+type = idle
 server = imap.example.com
 user = a@example.com
 pass = secret
@@ -139,9 +148,11 @@ mbsync_channel = personal
 folder = INBOX
 
 [park]
+type = idle
 disabled = yes
 
 [off]
+type = idle
 disabled = Yes
 server = imap.example.com
 user = b@example.com
@@ -168,6 +179,7 @@ unlink $held;
 
 my $no = write_conf(<<'EOF');
 [nope]
+type = idle
 disabled = no
 EOF
 like(load_config($no), qr/\[nope\] missing server, user, mbsync_channel/, 'no does not skip required keys');
@@ -175,6 +187,7 @@ unlink $no;
 
 my $xo = write_conf(<<'EOF');
 [ma]
+type = idle
 server = outlook.example.com
 user = a@example.com
 pass_cmd = printf '%s\n' tok
@@ -191,6 +204,7 @@ unlink $xo;
 
 my $bogus = write_conf(<<'EOF');
 [bad]
+type = idle
 server = imap.example.com
 user = a@example.com
 pass = secret
@@ -199,5 +213,152 @@ mbsync_channel = ch
 EOF
 like(load_config($bogus), qr/\[bad\] auth must be login or xoauth2/, 'unknown auth is rejected');
 unlink $bogus;
+
+my $missing_type = write_conf(<<'EOF');
+[acct]
+server = imap.example.com
+user = a@example.com
+pass = secret
+mbsync_channel = ch
+EOF
+like(load_config($missing_type), qr/\[acct\] missing type/, 'a section requires type');
+unlink $missing_type;
+
+my $bad_type = write_conf(<<'EOF');
+[acct]
+type = weird
+server = imap.example.com
+user = a@example.com
+pass = secret
+mbsync_channel = ch
+EOF
+like(load_config($bad_type), qr/\[acct\] bad type/, 'an unknown type is rejected');
+unlink $bad_type;
+
+my $two_global = write_conf(<<'EOF');
+[one]
+type = global
+
+[two]
+type = global
+
+[acct]
+type = idle
+server = imap.example.com
+user = a@example.com
+pass = secret
+mbsync_channel = ch
+EOF
+like(load_config($two_global), qr/\[two\] second global section/, 'a second global section is rejected');
+unlink $two_global;
+
+my $two_pulse = write_conf(<<'EOF');
+[a]
+type = pulse
+channel0 = one
+
+[b]
+type = pulse
+channel0 = two
+EOF
+like(load_config($two_pulse), qr/\[b\] second pulse section/, 'a second pulse section is rejected');
+unlink $two_pulse;
+
+my $idle_case = write_conf(<<'EOF');
+[acct]
+type = IDLE
+server = imap.example.com
+user = a@example.com
+pass = secret
+mbsync_channel = ch
+EOF
+is(load_config($idle_case), '', 'type comparison ignores case');
+is(loaded_account('acct')->{role}, 'idle', 'IDLE is an idle account');
+unlink $idle_case;
+
+my $passonly = write_conf(<<'EOF');
+[box]
+type = passonly
+server = imap.example.com
+user = a@example.com
+pass = secret
+mbsync_channel = lists
+folder0 = INBOX
+
+[slow]
+type = pulse
+sweep = 10
+channel0 = other
+EOF
+is(load_config($passonly), '', 'a passonly section loads');
+is_deeply(loaded_account('box')->{folders}, [], 'passonly ignores folder keys');
+is(loaded_account('box')->{role}, 'passonly', 'role is passonly');
+is(connect_account('box'), 1, 'passonly does not connect');
+is(conn_count(), 0, 'passonly opens no socket');
+is_deeply(pulse_snapshot_for_test()->{channels}, [qw(other lists)], 'passonly joins the pulse list');
+my @po = info_lines(time());
+ok((grep { $_ eq 'box: passonly server imap.example.com channel lists' } @po),
+    'state names a passonly account');
+ok(!grep(/box: down/, @po), 'passonly is not down');
+unlink $passonly;
+
+my $solo = write_conf(<<'EOF');
+[box]
+type = passonly
+server = imap.example.com
+user = a@example.com
+pass = secret
+mbsync_channel = lists
+EOF
+is(load_config($solo), '', 'passonly without pulse still loads');
+is(pulse_snapshot_for_test()->{disabled}, 0, 'a blank pulse is enabled');
+is(pulse_snapshot_for_test()->{sweep}, 3600, 'that pulse waits 3600s');
+is_deeply(pulse_snapshot_for_test()->{channels}, ['lists'], 'the channel is scheduled');
+unlink $solo;
+
+my $held_po = write_conf(<<'EOF');
+[box]
+type = passonly
+disabled = yes
+mbsync_channel = lists
+
+[slow]
+type = pulse
+channel0 = other
+EOF
+is(load_config($held_po), '', 'a disabled passonly section loads');
+is_deeply(pulse_snapshot_for_test()->{channels}, ['other'], 'a disabled passonly is not scheduled');
+like((grep { /^box: / } info_lines(time()))[0], qr/^box: disabled/, 'a disabled passonly stays disabled');
+unlink $held_po;
+
+my $bad_tunnel = write_conf(<<'EOF');
+[track]
+type = global
+tunnel = maybe
+
+[acct]
+type = idle
+server = imap.example.com
+user = a@example.com
+pass = secret
+mbsync_channel = ch
+EOF
+like(load_config($bad_tunnel), qr/\[track\] bad tunnel/, 'tunnel must be yes or no');
+unlink $bad_tunnel;
+
+my $bad_to = write_conf(<<'EOF');
+[track]
+type = global
+tunnel_timeout = 0
+
+[acct]
+type = idle
+server = imap.example.com
+user = a@example.com
+pass = secret
+mbsync_channel = ch
+EOF
+like(load_config($bad_to), qr/\[track\] bad tunnel_timeout/, 'tunnel timeout must be at least 1');
+unlink $bad_to;
 
 done_testing;

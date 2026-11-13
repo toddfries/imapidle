@@ -18,7 +18,9 @@ use strict;
 use warnings;
 use Config;
 use Config::Tiny;
-use Errno qw(EINPROGRESS EWOULDBLOCK EINTR);
+use Cwd qw(abs_path);
+use Errno qw(EINPROGRESS EWOULDBLOCK EINTR EPIPE EAGAIN);
+use Socket qw(SHUT_WR);
 use Fcntl;
 use File::Basename qw(dirname);
 use File::Path qw(make_path);
@@ -34,6 +36,7 @@ use Time::HiRes qw(time);
 
 my $CONFIG_DIR;
 my $CONFIG_FILE;
+my $SELF_PATH = abs_path($0) // $0;
 my $STATE_DIR;
 my $FOLDERS_DIR;
 my $MBSYNC_REAL_FILE;
@@ -69,6 +72,7 @@ my $MBSYNC_BIN = '/usr/local/bin/mbsync';
 my $TRIGGER_HOOK;
 my $select = IO::Select->new();
 my $IO_MAX = 45;
+my $TUNNEL_SEQ = 0;
 my $IO_DEPTH = 0;
 my $INFO_R;
 my $INFO_W;
@@ -139,6 +143,7 @@ sub log_error { log_line(LOG_ERR,     $_[0]); }
 
 sub usage {
     print STDERR "usage: imapidle [-dv] [-c file]\n";
+    print STDERR "       imapidle --tunnel section [-c file]\n";
     exit 1;
 }
 
@@ -243,21 +248,74 @@ sub save_known_hosts {
     umask $old;
 }
 
+sub _tls_version_label {
+    my ($v) = @_;
+    return '' unless defined $v && $v ne '';
+    return 'TLSv1.0' if $v eq 'TLSv1';
+    $v =~ s/^TLSv(\d+)_(\d+)\z/TLSv$1.$2/;
+    return $v;
+}
+
+sub _tls_session_facts {
+    my ($ssl) = @_;
+    return {} unless $ssl;
+    my $version = _tls_version_label(eval { $ssl->get_sslversion } // '');
+    my $cipher  = eval { $ssl->get_cipher } // '';
+    my $cbits;
+    my $obj = eval { $ssl->_get_ssl_object };
+    if ($obj) {
+        my @got = eval { Net::SSLeay::get_cipher_bits($obj) };
+        $cbits = $got[0] if defined $got[0] && $got[0] ne '';
+    }
+    my $skey;
+    my $cert = eval { $ssl->peer_certificate };
+    if ($cert) {
+        my $pk = eval { Net::SSLeay::X509_get_pubkey($cert) };
+        if ($pk) {
+            $skey = eval { Net::SSLeay::EVP_PKEY_bits($pk) };
+            Net::SSLeay::EVP_PKEY_free($pk);
+        }
+    }
+    my $comp = 0;
+    if ($obj) {
+        my $c = eval { Net::SSLeay::get_current_compression($obj) };
+        $comp = 1 if $c;
+    }
+    return {
+        version => $version,
+        cipher  => $cipher,
+        cbits   => $cbits,
+        skey    => $skey,
+        comp    => $comp,
+    };
+}
+
 sub _announce_cert {
-    my ($hostkey, $kind, $fp, $old) = @_;
+    my ($hostkey, $kind, $fp, $old, $tls) = @_;
     if (exists $CERT_SEEN{$hostkey} && $CERT_SEEN{$hostkey} eq $fp) {
         return;
     }
     $CERT_SEEN{$hostkey} = $fp;
     $CERT_INDEX{$hostkey} //= ++$CERT_SEQ;
     my $n = sprintf('%02d', $CERT_INDEX{$hostkey});
-    log_info("[cert] $n: $hostkey tls fp $kind");
-    log_info("[cert] $n: +$fp") if $kind eq 'new' || $kind eq 'change';
-    log_info("[cert] $n: -$old") if $kind eq 'change';
+    my $extra = '';
+    if (ref $tls eq 'HASH') {
+        my @bits;
+        push @bits, $tls->{version} if defined $tls->{version} && $tls->{version} ne '';
+        push @bits, $tls->{cipher}  if defined $tls->{cipher}  && $tls->{cipher} ne '';
+        push @bits, "ci $tls->{cbits}b" if defined $tls->{cbits} && $tls->{cbits} ne '';
+        push @bits, "skey $tls->{skey}b" if defined $tls->{skey} && $tls->{skey} ne '';
+        my $comp = defined $tls->{comp} ? $tls->{comp} : 0;
+        push @bits, "comp $comp";
+        $extra = join(' ', @bits) . ' ' if @bits;
+    }
+    log_info("[tls]: $n.cert $hostkey ${extra}fp $kind");
+    log_info("[tls]: $n.cert +$fp") if $kind eq 'new' || $kind eq 'change';
+    log_info("[tls]: $n.cert -$old") if $kind eq 'change';
 }
 
 sub approve_fingerprint {
-    my ($server, $port, $fingerprint) = @_;
+    my ($server, $port, $fingerprint, $tls) = @_;
     my $hostkey = "$server:$port";
     if (!defined $fingerprint || $fingerprint eq '') {
         log_error("Certificate fingerprint missing for $hostkey");
@@ -267,13 +325,13 @@ sub approve_fingerprint {
     my $cur   = _current_cert($certs{$hostkey});
     my $old   = $cur ? $cur->{fp} : '';
     if ($old eq $fingerprint) {
-        _announce_cert($hostkey, 'match', $fingerprint, '');
+        _announce_cert($hostkey, 'match', $fingerprint, '', $tls);
         return 1;
     }
     if ($old eq '') {
         push @{ $certs{$hostkey} }, { fp => $fingerprint, expired => '' };
         save_known_hosts(%certs);
-        _announce_cert($hostkey, 'new', $fingerprint, '');
+        _announce_cert($hostkey, 'new', $fingerprint, '', $tls);
         return 1;
     }
     my $stamp = _cert_stamp();
@@ -282,7 +340,7 @@ sub approve_fingerprint {
     }
     push @{ $certs{$hostkey} }, { fp => $fingerprint, expired => '' };
     save_known_hosts(%certs);
-    _announce_cert($hostkey, 'change', $fingerprint, $old);
+    _announce_cert($hostkey, 'change', $fingerprint, $old, $tls);
     return 1;
 }
 
@@ -449,14 +507,15 @@ sub _pulse_usable {
 
 # [pulse] is not an account. A bad value is pushed onto @$problems.
 sub _parse_pulse_section {
-    my ($row, $problems) = @_;
+    my ($name, $row, $problems) = @_;
     my $empty = _blank_pulse();
     return $empty unless ref $row eq 'HASH';
+    $name = 'pulse' if !defined $name || $name eq '';
     if (_config_disabled($row->{disabled})) {
         return { disabled => 1, sweep => 3600, channels => [] };
     }
 
-    my $bad = sub { push @$problems, "[pulse] $_[0]"; };
+    my $bad = sub { push @$problems, "[$name] $_[0]"; };
     my $sweep = 3600;
     if (exists $row->{sweep}) {
         if (!defined $row->{sweep} || $row->{sweep} !~ /^\d+$/) {
@@ -499,15 +558,18 @@ sub _parse_pulse_section {
 
 sub _blank_track {
     return {
-        disabled    => 0,
-        min         => 600,
-        messages    => 5,
-        initial     => 1800,
-        max         => 21600,
-        list        => 259200,
-        id          => 604800,
-        capability  => 604800,
-        connections => 2,
+        disabled       => 0,
+        min            => 600,
+        messages       => 5,
+        initial        => 1800,
+        max            => 21600,
+        list           => 259200,
+        id             => 604800,
+        capability     => 604800,
+        connections    => 2,
+        tunnel         => 0,
+        tunnel_timeout => 3600,
+        mbsyncrc       => '',
     };
 }
 
@@ -515,10 +577,11 @@ $track_cfg = _blank_track();
 
 # [track] is not an account. Missing section means these defaults.
 sub _parse_track_section {
-    my ($row, $problems) = @_;
+    my ($name, $row, $problems) = @_;
     my $cfg = _blank_track();
     return $cfg unless ref $row eq 'HASH';
-    my $bad = sub { push @$problems, "[track] $_[0]"; };
+    $name = 'global' if !defined $name || $name eq '';
+    my $bad = sub { push @$problems, "[$name] $_[0]"; };
     $cfg->{disabled} = 1 if _config_disabled($row->{disabled});
 
     for my $key (qw(min messages initial max list id capability connections)) {
@@ -537,16 +600,47 @@ sub _parse_track_section {
     $bad->('bad connections') if $cfg->{connections} < 1;
     $bad->('bad max')         if $cfg->{max} < $cfg->{min};
     $bad->('capability below id') if $cfg->{capability} < $cfg->{id};
+    if (exists $row->{tunnel}) {
+        my $v = lc($row->{tunnel} // '');
+        if ($v eq 'yes') {
+            $cfg->{tunnel} = 1;
+        } elsif ($v eq 'no') {
+            $cfg->{tunnel} = 0;
+        } else {
+            $bad->('bad tunnel');
+        }
+    }
+    if (exists $row->{tunnel_timeout}) {
+        if (!defined $row->{tunnel_timeout}
+            || $row->{tunnel_timeout} !~ /^\d+$/
+            || $row->{tunnel_timeout} < 1) {
+            $bad->('bad tunnel_timeout');
+        } else {
+            $cfg->{tunnel_timeout} = $row->{tunnel_timeout} + 0;
+        }
+    }
+    if (defined $row->{mbsyncrc} && $row->{mbsyncrc} ne '') {
+        $cfg->{mbsyncrc} = $row->{mbsyncrc};
+    }
     return $cfg;
 }
 
 sub install_track {
-    my ($new, $reload) = @_;
+    my ($new, $reload, $quiet) = @_;
     $new //= _blank_track();
     my $old = $track_cfg // _blank_track();
     if ($reload) {
         log_info('track: disabled') if $new->{disabled} && !$old->{disabled};
         log_info('track: enabled')  if !$new->{disabled} && $old->{disabled};
+        my $was = $old->{tunnel} ? 1 : 0;
+        my $now = $new->{tunnel} ? 1 : 0;
+        log_info('tunnel: on')  if $now && !$was;
+        log_info('tunnel: off') if $was && !$now;
+        if ($now && ($old->{tunnel_timeout} // 0) != ($new->{tunnel_timeout} // 0)) {
+            log_info('tunnel: timeout ' . $new->{tunnel_timeout});
+        }
+    } elsif (!$quiet && $new->{tunnel}) {
+        log_info('tunnel: on, timeout ' . ($new->{tunnel_timeout} // 3600));
     }
     $track_cfg = { %$new };
 }
@@ -1076,27 +1170,71 @@ sub basename_file {
     return $path;
 }
 
+# A passonly channel joins the pulse clock. It does not open IMAP.
+sub _merge_passonly_channels {
+    my ($accounts, $pulse) = @_;
+    return unless $pulse && !$pulse->{disabled};
+    my %seen = map { $_ => 1 } @{ $pulse->{channels} // [] };
+    for my $name (sort keys %{$accounts}) {
+        my $acc = $accounts->{$name} or next;
+        next if ($acc->{role} // '') ne 'passonly';
+        next if $acc->{config_disabled};
+        my $ch = $acc->{mbsync_channel} // '';
+        next if $ch eq '' || $seen{$ch};
+        $seen{$ch} = 1;
+        push @{ $pulse->{channels} }, $ch;
+    }
+}
+
 # Returns (hashref, '') or (undef, error). Does not touch %accounts.
-# The third value is the pulse section. The fourth is track defaults.
+# The third value is the pulse section. The fourth is the global section.
 sub parse_config_file {
     my ($file) = @_;
     my $cfg = Config::Tiny->read($file)
       or return (undef, "Cannot read $file: " . (Config::Tiny->errstr // $!));
 
     my (%fresh, @problems);
-    my $pulse = _parse_pulse_section($cfg->{pulse}, \@problems);
-    my $track = _parse_track_section($cfg->{track}, \@problems);
+    my ($pulse_name, $pulse_row, $global_name, $global_row);
     for my $section (sort keys %{$cfg}) {
-        next if $section eq '_' || $section eq 'pulse' || $section eq 'track';
+        next if $section eq '_';
         my $row = $cfg->{$section};
         next unless ref $row eq 'HASH';
+
+        my $type = lc($row->{type} // '');
+        $type =~ s/^\s+|\s+$//g;
+        if ($type eq '') {
+            push @problems, "[$section] missing type";
+            next;
+        }
+        if ($type eq 'pulse') {
+            if ($pulse_row) {
+                push @problems, "[$section] second pulse section";
+                next;
+            }
+            $pulse_name = $section;
+            $pulse_row  = $row;
+            next;
+        }
+        if ($type eq 'global') {
+            if ($global_row) {
+                push @problems, "[$section] second global section";
+                next;
+            }
+            $global_name = $section;
+            $global_row  = $row;
+            next;
+        }
+        if ($type ne 'idle' && $type ne 'passonly') {
+            push @problems, "[$section] bad type";
+            next;
+        }
 
         my $bad = sub {
             push @problems, "[$section] $_[0]";
         };
 
         if (_config_disabled($row->{disabled})) {
-            $fresh{$section} = _held_account($row);
+            $fresh{$section} = _held_account($row, $type);
             next;
         }
 
@@ -1127,35 +1265,37 @@ sub parse_config_file {
         }
 
         my @folders;
-        my $i          = 0;
-        my $bad_folder = 0;
-        while (exists $row->{"folder$i"}) {
-            my $folder = parse_folder_spec($row->{"folder$i"});
-            unless ($folder) {
-                $bad->("empty folder$i");
-                $bad_folder = 1;
-                last;
+        if ($type eq 'idle') {
+            my $i          = 0;
+            my $bad_folder = 0;
+            while (exists $row->{"folder$i"}) {
+                my $folder = parse_folder_spec($row->{"folder$i"});
+                unless ($folder) {
+                    $bad->("empty folder$i");
+                    $bad_folder = 1;
+                    last;
+                }
+                push @folders, $folder;
+                $i++;
             }
-            push @folders, $folder;
-            $i++;
-        }
-        if ($bad_folder) {
-            next;
-        }
-
-        if (!@folders && !@missing) {
-            my $spec = $row->{folder};
-            $spec = 'INBOX' unless defined $spec && $spec ne '';
-            my $folder = parse_folder_spec($spec);
-            unless ($folder) {
-                $bad->('bad folder');
+            if ($bad_folder) {
                 next;
             }
-            my $priority = $row->{priority} // $folder->{priority};
-            $priority = 5 unless $priority =~ /^-?\d+$/;
-            $folder->{priority} = $priority + 0;
-            $folder->{debounce} = calculate_debounce($folder->{priority});
-            push @folders, $folder;
+
+            if (!@folders && !@missing) {
+                my $spec = $row->{folder};
+                $spec = 'INBOX' unless defined $spec && $spec ne '';
+                my $folder = parse_folder_spec($spec);
+                unless ($folder) {
+                    $bad->('bad folder');
+                    next;
+                }
+                my $priority = $row->{priority} // $folder->{priority};
+                $priority = 5 unless $priority =~ /^-?\d+$/;
+                $folder->{priority} = $priority + 0;
+                $folder->{debounce} = calculate_debounce($folder->{priority});
+                push @folders, $folder;
+            }
         }
 
         my $wait = $row->{wait} // 0;
@@ -1171,6 +1311,7 @@ sub parse_config_file {
             pass_cmd       => $has_cmd ? $row->{pass_cmd} : undef,
             mbsync_channel => $row->{mbsync_channel},
             auth           => $auth,
+            role           => $type,
             folders        => \@folders,
             wait           => $wait + 0,
             backoff        => 5,
@@ -1180,6 +1321,10 @@ sub parse_config_file {
             disabled       => 0,
         };
     }
+
+    my $pulse = _parse_pulse_section($pulse_name, $pulse_row, \@problems);
+    my $track = _parse_track_section($global_name, $global_row, \@problems);
+    _merge_passonly_channels(\%fresh, $pulse);
 
     if (@problems) {
         return (undef, join("\n", @problems));
@@ -1210,7 +1355,7 @@ sub xoauth2_initial {
 }
 
 sub _held_account {
-    my ($row) = @_;
+    my ($row, $role) = @_;
     my $port = $row->{port} // 993;
     $port = 993 unless $port =~ /^\d+$/ && $port >= 1 && $port <= 65535;
     my $has_pw  = defined $row->{pass}     && $row->{pass} ne '';
@@ -1223,6 +1368,7 @@ sub _held_account {
         pass_cmd        => $has_cmd ? $row->{pass_cmd} : undef,
         mbsync_channel  => $row->{mbsync_channel} // '',
         auth            => _auth_name($row->{auth}),
+        role            => ($role && $role eq 'passonly') ? 'passonly' : 'idle',
         folders         => [],
         wait            => 0,
         backoff         => 5,
@@ -1243,7 +1389,7 @@ sub reset_pulse_state {
 # $reload keeps the clock of a channel that is still listed.
 # A new channel is due immediately. The sweep wait starts at exit.
 sub install_pulse {
-    my ($new, $reload) = @_;
+    my ($new, $reload, $quiet) = @_;
     $new //= _blank_pulse();
     my $old = $pulse_cfg // _blank_pulse();
     if ($new->{disabled}) {
@@ -1272,7 +1418,7 @@ sub install_pulse {
         if ($had && ($old->{sweep} // 3600) != $new->{sweep}) {
             log_info("pulse: sweep $new->{sweep}");
         }
-    } elsif (@{ $new->{channels} }) {
+    } elsif (!$quiet && @{ $new->{channels} }) {
         log_info('pulse: sweep ' . $new->{sweep} . ': ' . join(' ', @{ $new->{channels} }));
     }
     %pulse_next = %keep;
@@ -1333,7 +1479,7 @@ sub _apply_pulse_last {
 }
 
 sub load_config {
-    my ($file) = @_;
+    my ($file, $quiet) = @_;
     my ($fresh, $err, $off, $track) = parse_config_file($file);
     %accounts = ();
     if ($err || !$fresh) {
@@ -1343,9 +1489,11 @@ sub load_config {
         return 'empty config';
     }
     %accounts = %$fresh;
-    install_pulse($off, 0);
-    install_track($track, 0);
-    _log_loaded_account($_) for sort keys %accounts;
+    install_pulse($off, 0, $quiet);
+    install_track($track, 0, $quiet);
+    if (!$quiet) {
+        _log_loaded_account($_) for sort keys %accounts;
+    }
     return '';
 }
 
@@ -1354,6 +1502,10 @@ sub _log_loaded_account {
     my $acc = $accounts{$section} or return;
     if ($acc->{config_disabled}) {
         log_info("$section: disabled");
+        return;
+    }
+    if (($acc->{role} // '') eq 'passonly') {
+        log_info("$section: passonly, mbsync $acc->{mbsync_channel}");
         return;
     }
     my $how = defined $acc->{pass_cmd} && $acc->{pass_cmd} ne '' ? 'pass_cmd' : 'pass';
@@ -1485,10 +1637,10 @@ sub note_secret_recovered {
 }
 
 sub account_pass {
-    my ($name) = @_;
+    my ($name, $timeout) = @_;
     my $acc = $accounts{$name} or return;
     if (defined $acc->{pass_cmd}) {
-        my $pw = capture_pass_cmd($acc->{pass_cmd});
+        my $pw = capture_pass_cmd($acc->{pass_cmd}, $timeout);
         if (!defined $pw) {
             note_secret_failure($name);
             return;
@@ -2446,7 +2598,8 @@ sub login_imap {
     cloexec($socket);
 
     my $fingerprint = $socket->get_fingerprint('SHA256');
-    if (!approve_fingerprint($acc->{server}, $acc->{port}, $fingerprint)) {
+    if (!approve_fingerprint($acc->{server}, $acc->{port}, $fingerprint,
+            _tls_session_facts($socket))) {
         $socket->close;
         die 'Certificate fingerprint missing';
     }
@@ -3015,6 +3168,7 @@ sub connect_account {
     my ($name) = @_;
     my $acc = $accounts{$name} or return 0;
     return 0 if $acc->{disabled};
+    return 1 if ($acc->{role} // '') eq 'passonly';
     return 1 if account_covered($name);
 
     my @need = grep { !$conns{"$name:$_->{name}"} } @{ $acc->{folders} };
@@ -3285,6 +3439,7 @@ sub reap_children {
         last if $pid == 0;
         my $status = unpack('i', $statb);
         my $rec    = delete $children{$pid};
+        _unlink_tunnel_cfg($rec);
         my $real   = 0;
         if (ref $rec eq 'HASH' && defined $rec->{started}) {
             $real = time() - $rec->{started};
@@ -3718,6 +3873,642 @@ sub child_state_line {
     return sprintf('child pid %d %s', $pid, child_label($rec));
 }
 
+# mbsync runs this string as /bin/sh -c. Each argument is shell-quoted.
+sub _sh_sq {
+    my ($s) = @_;
+    $s //= '';
+    $s =~ s/'/'\\''/g;
+    return "'$s'";
+}
+
+# One mbsync config argument. Backslash and double quote are escaped.
+sub _mbsync_dq {
+    my ($s) = @_;
+    $s //= '';
+    $s =~ s/([\\"])/\\$1/g;
+    return qq{"$s"};
+}
+
+sub tunnel_shell {
+    my ($section) = @_;
+    return join(' ',
+        _sh_sq($^X),
+        _sh_sq($SELF_PATH // ''),
+        _sh_sq('--tunnel'),
+        _sh_sq($section // ''),
+        _sh_sq('-c'),
+        _sh_sq($CONFIG_FILE // ''),
+    );
+}
+
+sub _mbsync_tokens {
+    my ($line) = @_;
+    return () if !defined $line || $line =~ /^\s*#/;
+    my @tok;
+    my $i = 0;
+    my $n = length $line;
+    while ($i < $n) {
+        my $c = substr($line, $i, 1);
+        if ($c =~ /\s/) {
+            $i++;
+            next;
+        }
+        if ($c eq '"') {
+            $i++;
+            my $s = '';
+            while ($i < $n) {
+                my $ch = substr($line, $i, 1);
+                if ($ch eq '\\') {
+                    $i++;
+                    $s .= substr($line, $i, 1) if $i < $n;
+                    $i++ if $i < $n;
+                    next;
+                }
+                if ($ch eq '"') {
+                    $i++;
+                    last;
+                }
+                $s .= $ch;
+                $i++;
+            }
+            push @tok, $s;
+            next;
+        }
+        my $s = '';
+        while ($i < $n && substr($line, $i, 1) !~ /\s/) {
+            $s .= substr($line, $i, 1);
+            $i++;
+        }
+        push @tok, $s;
+    }
+    return @tok;
+}
+
+my %_MBSYNC_DROP = map { $_ => 1 } qw(
+    host port user usercmd pass passcmd authmechs
+    tlstype tlsversions certificatefile systemcertificates
+    pipelinedepth timeout tunnel cipherstring
+    ssltype sslversions requiressl useimaps
+);
+
+my %_MBSYNC_START = map { $_ => 1 } qw(
+    imapaccount imapstore maildirstore channel group
+);
+
+sub _parse_mbsync_rc {
+    my ($text) = @_;
+    $text = '' unless defined $text;
+    $text =~ s/\r\n/\n/g;
+    $text =~ s/\r/\n/g;
+    my @lines = split /\n/, $text, -1;
+    pop @lines if @lines && $lines[-1] eq '';
+    my (@pre, @secs, $cur);
+    for my $line (@lines) {
+        if ($line =~ /^\s*$/) {
+            if ($cur) {
+                push @secs, $cur;
+                $cur = undef;
+            } else {
+                push @pre, $line;
+            }
+            next;
+        }
+        if (!$cur && $line !~ /^\s*#/) {
+            my @tok = _mbsync_tokens($line);
+            if (@tok && $_MBSYNC_START{ lc $tok[0] }) {
+                $cur = {
+                    kw    => $tok[0],
+                    name  => $tok[1] // '',
+                    lines => [$line],
+                };
+                next;
+            }
+        }
+        if ($cur) {
+            push @{ $cur->{lines} }, $line;
+        } else {
+            push @pre, $line;
+        }
+    }
+    push @secs, $cur if $cur;
+    return (\@pre, \@secs);
+}
+
+sub _emit_mbsync_rc {
+    my ($pre, $secs) = @_;
+    my $out = '';
+    $out .= join("\n", @$pre) . "\n" if @$pre;
+    for my $sec (@$secs) {
+        $out .= join("\n", @{ $sec->{lines} }) . "\n\n";
+    }
+    return $out;
+}
+
+sub _mbsync_named {
+    my ($secs, $kw) = @_;
+    my %h;
+    for my $sec (@$secs) {
+        next unless lc($sec->{kw}) eq $kw;
+        next if ($sec->{name} // '') eq '';
+        $h{ $sec->{name} } = $sec;
+    }
+    return \%h;
+}
+
+sub _chan_base {
+    my ($tok) = @_;
+    return '' unless defined $tok && $tok ne '';
+    $tok =~ s/:.*//s;
+    return $tok;
+}
+
+sub _group_members {
+    my ($group) = @_;
+    my @out;
+    my $header = 1;
+    for my $line (@{ $group->{lines} }) {
+        next if $line =~ /^\s*#/;
+        my @tok = _mbsync_tokens($line);
+        next unless @tok;
+        if ($header) {
+            $header = 0;
+            push @out, map { _chan_base($_) } @tok[ 2 .. $#tok ];
+            next;
+        }
+        my $k = lc $tok[0];
+        next unless $k eq 'channel' || $k eq 'channels';
+        push @out, map { _chan_base($_) } @tok[ 1 .. $#tok ];
+    }
+    return grep { $_ ne '' } @out;
+}
+
+sub _imap_targets_for_channel {
+    my ($ch, $stores, $iaccts) = @_;
+    my @hits;
+    for my $line (@{ $ch->{lines} }) {
+        next if $line =~ /^\s*#/;
+        my @tok = _mbsync_tokens($line);
+        next unless @tok >= 2;
+        my $k = lc $tok[0];
+        next unless $k eq 'far' || $k eq 'near';
+        next unless $tok[1] =~ /^:([^:]*):/;
+        my $store = $stores->{$1} or next;
+        next unless lc($store->{kw}) eq 'imapstore';
+        my ($acct_name, $inline);
+        for my $sl (@{ $store->{lines} }) {
+            next if $sl =~ /^\s*#/;
+            my @st = _mbsync_tokens($sl);
+            next unless @st;
+            if (lc($st[0]) eq 'account' && defined $st[1] && $st[1] ne '') {
+                $acct_name = $st[1];
+            }
+            $inline = 1 if $_MBSYNC_DROP{ lc $st[0] };
+        }
+        if (defined $acct_name && $iaccts->{$acct_name}) {
+            push @hits, $iaccts->{$acct_name};
+        } elsif (!defined $acct_name && $inline) {
+            push @hits, $store;
+        }
+    }
+    return @hits;
+}
+
+# Prefer the section whose mbsync channel is the invoked name.
+# Otherwise the section name, or its channel, is the IMAPAccount name.
+sub _idle_section_for {
+    my ($channel, $acct_obj) = @_;
+    my $acct_name = $acct_obj->{name} // '';
+    my @names = sort keys %accounts;
+    for my $name (@names) {
+        my $acc = $accounts{$name} or next;
+        next if $acc->{config_disabled};
+        my $role = $acc->{role} // 'idle';
+        next if $role ne 'idle' && $role ne 'passonly';
+        return $name if ($acc->{mbsync_channel} // '') eq $channel;
+    }
+    for my $name (@names) {
+        my $acc = $accounts{$name} or next;
+        next if $acc->{config_disabled};
+        my $role = $acc->{role} // 'idle';
+        next if $role ne 'idle' && $role ne 'passonly';
+        return $name if $name eq $acct_name;
+        return $name if ($acc->{mbsync_channel} // '') eq $acct_name;
+    }
+    return;
+}
+
+sub _rewrite_account_lines {
+    my ($sec, $idle_name, $timeout) = @_;
+    my @keep;
+    for my $line (@{ $sec->{lines} }) {
+        if ($line =~ /^\s*#/) {
+            push @keep, $line;
+            next;
+        }
+        my @tok = _mbsync_tokens($line);
+        next if @tok && $_MBSYNC_DROP{ lc $tok[0] };
+        push @keep, $line;
+    }
+    push @keep, 'Tunnel ' . _mbsync_dq(tunnel_shell($idle_name));
+    push @keep, 'TLSType None';
+    push @keep, 'Timeout ' . ($timeout + 0);
+    $sec->{lines} = \@keep;
+}
+
+# Rewritten mbsyncrc text, or undef when no account is taken over.
+# The caller falls back to mbsync's own file in that case.
+sub tunnel_rewrite {
+    my ($text, @args) = @_;
+    return unless defined $text;
+    my ($pre, $secs) = _parse_mbsync_rc($text);
+    my $channels = _mbsync_named($secs, 'channel');
+    my $groups   = _mbsync_named($secs, 'group');
+    my $stores   = _mbsync_named($secs, 'imapstore');
+    my $iaccts   = _mbsync_named($secs, 'imapaccount');
+    my @chans;
+    for my $arg (@args) {
+        my $base = _chan_base($arg);
+        next if $base eq '';
+        if (my $group = $groups->{$base}) {
+            push @chans, _group_members($group);
+            next;
+        }
+        push @chans, $base if $channels->{$base};
+    }
+    my (%plan, @order);
+    for my $chname (@chans) {
+        my $ch = $channels->{$chname} or next;
+        for my $obj (_imap_targets_for_channel($ch, $stores, $iaccts)) {
+            my $idle = _idle_section_for($chname, $obj);
+            next unless defined $idle;
+            my $key = "$obj";
+            if (exists $plan{$key} && $plan{$key}{idle} ne $idle) {
+                log_warn('tunnel: ' . ($obj->{name} // '') . ' matches more than one section');
+                return;
+            }
+            next if exists $plan{$key};
+            $plan{$key} = { obj => $obj, idle => $idle };
+            push @order, $key;
+        }
+    }
+    return unless @order;
+    my $timeout = $track_cfg->{tunnel_timeout} // 3600;
+    $timeout = 3600 if !$timeout || $timeout < 1;
+    for my $key (@order) {
+        _rewrite_account_lines($plan{$key}{obj}, $plan{$key}{idle}, $timeout);
+    }
+    return _emit_mbsync_rc($pre, $secs);
+}
+
+sub _mbsyncrc_path {
+    my $set = $track_cfg->{mbsyncrc} // '';
+    return $set if $set ne '';
+    my $home = $ENV{HOME} // '';
+    my $xdg  = $ENV{XDG_CONFIG_HOME};
+    $xdg = "$home/.config" if !defined $xdg || $xdg eq '';
+    my $xdg_rc = "$xdg/isyncrc";
+    return $xdg_rc if $xdg ne '' && -f $xdg_rc;
+    return "$home/.mbsyncrc" if $home ne '';
+    return '';
+}
+
+sub _tunnel_on {
+    return $track_cfg && $track_cfg->{tunnel} ? 1 : 0;
+}
+
+sub prepare_tunnel_config {
+    my (@args) = @_;
+    return unless _tunnel_on();
+    return unless @args;
+    my $src = _mbsyncrc_path();
+    if (!defined $src || $src eq '' || !-r $src) {
+        log_warn('tunnel: cannot read config');
+        return;
+    }
+    open my $fh, '<', $src or do {
+        log_warn('tunnel: cannot read config');
+        return;
+    };
+    my $text = do { local $/; <$fh> };
+    close $fh;
+    my $out = tunnel_rewrite($text // '', @args);
+    if (!defined $out) {
+        log_warn('tunnel: no match');
+        return;
+    }
+    if (!defined $STATE_DIR || $STATE_DIR eq '') {
+        log_warn('tunnel: cannot write config');
+        return;
+    }
+    my $dir = "$STATE_DIR/tunnel";
+    my $made = eval { make_path($dir, { mode => 0700 }); 1 };
+    if (!$made) {
+        log_warn('tunnel: cannot write config');
+        return;
+    }
+    $TUNNEL_SEQ++;
+    my $path = "$dir/$$-$TUNNEL_SEQ.rc";
+    my $old  = umask 0177;
+    my $ok   = open my $outfh, '>', $path;
+    if (!$ok) {
+        umask $old;
+        log_warn('tunnel: cannot write config');
+        return;
+    }
+    print {$outfh} $out;
+    close $outfh;
+    umask $old;
+    chmod 0600, $path;
+    return $path;
+}
+
+sub _arm_tunnel {
+    my (@args) = @_;
+    return unless _tunnel_on();
+    my $path = prepare_tunnel_config(@args);
+    if ($path) {
+        log_info('tunnel: ' . join(' ', @args));
+        return $path;
+    }
+    log_warn('tunnel: plain ' . join(' ', @args));
+    return;
+}
+
+sub _unlink_tunnel_cfg {
+    my ($rec) = @_;
+    return unless ref $rec eq 'HASH';
+    my $path = $rec->{tunnel_cfg} // '';
+    return if $path eq '';
+    unlink $path;
+    delete $rec->{tunnel_cfg};
+}
+
+sub mbsync_exec_argv {
+    my ($cfg, @args) = @_;
+    my @cmd = ($MBSYNC_BIN);
+    push @cmd, '-c', $cfg if defined $cfg && $cfg ne '';
+    push @cmd, @args;
+    return @cmd;
+}
+
+sub _nb_fh {
+    my ($fh) = @_;
+    my $flags = fcntl($fh, F_GETFL, 0);
+    return unless defined $flags;
+    fcntl($fh, F_SETFL, $flags | O_NONBLOCK);
+}
+
+sub _write_all {
+    my ($fh, $buf) = @_;
+    my $off = 0;
+    while ($off < length $buf) {
+        my $n = syswrite($fh, $buf, length($buf) - $off, $off);
+        if (!defined $n) {
+            next if $!{EINTR};
+            return 0;
+        }
+        return 0 if $n == 0;
+        $off += $n;
+    }
+    return 1;
+}
+
+sub _ssl_want {
+    my ($sock) = @_;
+    return '' unless $sock && eval { $sock->can('want_read') };
+    return 'r' if $sock->want_read;
+    return 'w' if $sock->want_write;
+    return '';
+}
+
+sub _tunnel_drain_pending {
+    my ($sock) = @_;
+    return '' unless $sock && eval { $sock->can('pending') };
+    my $buf = '';
+    while (1) {
+        my $n = eval { $sock->pending } // 0;
+        last if !$n || $n < 0;
+        my $chunk;
+        my $take = $n > 16384 ? 16384 : $n;
+        my $got  = sysread($sock, $chunk, $take);
+        last if !defined $got || $got == 0;
+        $buf .= $chunk;
+        last if length($buf) > 1048576;
+    }
+    return $buf;
+}
+
+sub _tunnel_half_close {
+    my ($sock) = @_;
+    return unless $sock;
+    my $obj;
+    $obj = eval { $sock->_get_ssl_object } if eval { $sock->can('_get_ssl_object') };
+    if ($obj) {
+        eval { Net::SSLeay::shutdown($obj) };
+        return;
+    }
+    eval { shutdown($sock, SHUT_WR) };
+}
+
+# Bytes from STDIN go to the server. Bytes from the server go to STDOUT.
+# STDIN EOF stops the server-bound writes. Server EOF ends the splice
+# once those bytes have been written.
+sub _tunnel_splice {
+    my ($sock) = @_;
+    binmode STDIN;
+    binmode STDOUT;
+    _nb_fh(\*STDIN);
+    _nb_fh(\*STDOUT);
+    _nb_fh($sock);
+    eval { $sock->blocking(0) if $sock->can('blocking') };
+
+    my $up     = '';
+    my $down   = _tunnel_drain_pending($sock);
+    my $in_eof = 0;
+    my $sk_eof = 0;
+    my $out_ok = 1;
+    my $stopped = 0;
+    my $hold   = '';
+
+    while ($out_ok && !($sk_eof && $down eq '')) {
+        if ($in_eof && $up eq '' && !$stopped && !$sk_eof) {
+            $stopped = 1;
+            _tunnel_half_close($sock);
+        }
+        my $rs = IO::Select->new();
+        my $ws = IO::Select->new();
+        $rs->add(\*STDIN)  if !$in_eof && length($up) < 65536;
+        $ws->add(\*STDOUT) if length $down;
+        if (!$sk_eof) {
+            if ($hold eq 'w') {
+                $ws->add($sock);
+            } elsif ($hold eq 'r') {
+                $rs->add($sock);
+            } else {
+                $rs->add($sock) if length($down) < 65536;
+                $ws->add($sock) if length($up) && !$stopped;
+            }
+        }
+        last if !$rs->count && !$ws->count;
+
+        my ($rr, $ww) = IO::Select::select($rs, $ws, undef, undef);
+        if (!defined $rr) {
+            next if $!{EINTR};
+            die "tunnel splice: $!\n";
+        }
+        my %rd     = map { fileno($_) => 1 } @$rr;
+        my %wd     = map { fileno($_) => 1 } @$ww;
+        my $in_fd  = fileno(STDIN);
+        my $out_fd = fileno(STDOUT);
+        my $sk_fd  = fileno($sock);
+
+        if ($wd{$out_fd} && length $down) {
+            my $n = syswrite(STDOUT, $down);
+            if (!defined $n) {
+                if ($! == EPIPE) {
+                    $out_ok = 0;
+                    $down   = '';
+                } elsif ($! != EINTR && $! != EWOULDBLOCK && $! != EAGAIN) {
+                    $out_ok = 0;
+                    $down   = '';
+                }
+            } elsif ($n == 0) {
+                $out_ok = 0;
+                $down   = '';
+            } else {
+                substr($down, 0, $n, '');
+            }
+        }
+
+        if (!$in_eof && $rd{$in_fd}) {
+            my $chunk;
+            my $n = sysread(STDIN, $chunk, 8192);
+            if (!defined $n) {
+                die "tunnel splice: stdin: $!\n"
+                    unless $!{EINTR} || $!{EWOULDBLOCK} || $!{EAGAIN};
+            } elsif ($n == 0) {
+                $in_eof = 1;
+            } else {
+                $up .= $chunk;
+            }
+        }
+
+        next if $sk_eof || !$sk_fd || (!$rd{$sk_fd} && !$wd{$sk_fd});
+        my $wrote = 0;
+        if (length $up && !$stopped && $hold ne 'r'
+            && ($hold eq 'w' || $wd{$sk_fd})) {
+            my $n = syswrite($sock, $up);
+            $wrote = 1;
+            if (!defined $n) {
+                my $why = _ssl_want($sock);
+                if ($why eq 'r' || $why eq 'w') {
+                    $hold = $why;
+                } elsif ($!{EINTR} || $!{EWOULDBLOCK} || $!{EAGAIN}) {
+                    $hold = 'w';
+                } else {
+                    $sk_eof = 1;
+                    $hold   = '';
+                }
+            } elsif ($n == 0) {
+                $sk_eof = 1;
+                $hold   = '';
+            } else {
+                substr($up, 0, $n, '');
+                $hold = '';
+            }
+        }
+        if (!$sk_eof && $hold ne 'w' && ($hold eq 'r' || (!$wrote && $rd{$sk_fd}))) {
+            my $chunk;
+            my $n = sysread($sock, $chunk, 8192);
+            if (!defined $n) {
+                my $why = _ssl_want($sock);
+                if ($why eq 'r' || $why eq 'w') {
+                    $hold = $why;
+                } elsif ($!{EINTR} || $!{EWOULDBLOCK} || $!{EAGAIN}) {
+                    $hold = 'r';
+                } else {
+                    $sk_eof = 1;
+                    $hold   = '';
+                }
+            } elsif ($n == 0) {
+                $sk_eof = 1;
+                $hold   = '';
+            } else {
+                $down .= $chunk;
+                $hold = '';
+            }
+        }
+    }
+    return 1;
+}
+
+# Log in on our own TLS session and hand mbsync a PREAUTH greeting.
+# Stdout is the IMAP byte stream after that greeting.
+sub tunnel_session {
+    my ($section) = @_;
+    $SIG{PIPE} = 'IGNORE';
+    my $acc = $accounts{$section};
+    die "tunnel $section: unknown section\n" unless $acc;
+    die "tunnel $section: disabled\n" if $acc->{config_disabled} || $acc->{disabled};
+    my $role = $acc->{role} // '';
+    if ($role ne 'idle' && $role ne 'passonly') {
+        die "tunnel $section: not an account\n";
+    }
+    my $limit = $track_cfg->{tunnel_timeout} // 3600;
+    $limit = 3600 if !$limit || $limit < 1;
+    my $password = account_pass($section, $limit);
+    die "tunnel $section: no password\n" unless defined $password;
+
+    my $saved = $IO_MAX;
+    $IO_MAX = $limit;
+    my ($socket, $imap);
+    my $ok = eval { ($socket, $imap) = login_imap($section, $acc, $password); 1 };
+    my $err = $@;
+    $IO_MAX = $saved;
+    if (!$ok) {
+        chomp $err;
+        $err = scrub($err, $password);
+        die "tunnel $section: $err\n";
+    }
+    if ($imap) {
+        delete $imap->{Socket};
+        delete $imap->{RawSocket};
+        undef $imap;
+    }
+    binmode STDIN;
+    binmode STDOUT;
+    _write_all(\*STDOUT, "* PREAUTH ready\r\n")
+        or die "tunnel $section: greeting: $!\n";
+    _tunnel_splice($socket);
+    eval { $socket->close } if $socket;
+    return 1;
+}
+
+sub _split_tunnel_argv {
+    my (@argv) = @_;
+    my @rest;
+    my $section;
+    for (my $i = 0; $i < @argv; $i++) {
+        if (($argv[$i] // '') eq '--tunnel') {
+            my $name = $argv[ ++$i ];
+            usage() if !defined $name || $name eq '' || $name =~ /^-/;
+            usage() if defined $section;
+            $section = $name;
+            next;
+        }
+        push @rest, $argv[$i];
+    }
+    return ($section, @rest);
+}
+
+sub _abs_config {
+    my ($path) = @_;
+    return $path unless defined $path && $path ne '';
+    my $abs = abs_path($path);
+    return $abs if defined $abs && $abs ne '';
+    return $path;
+}
+
 sub trigger_mbsync {
     my $meta = (ref($_[-1]) eq 'HASH') ? pop @_ : {};
     my ($wait, @args) = @_;
@@ -3726,17 +4517,20 @@ sub trigger_mbsync {
     if (ref $TRIGGER_HOOK eq 'CODE') {
         return $TRIGGER_HOOK->($wait, [@args], $meta);
     }
+    my $tunnel_cfg = _arm_tunnel(@args);
     my $shown = join(' ', @args);
     my $capture = $meta->{capture};
     my ($rd, $wr);
     if ($capture) {
         pipe($rd, $wr) or do {
+            _unlink_tunnel_cfg({ tunnel_cfg => $tunnel_cfg });
             log_error(mbsync_phrase('fork mbsync', @args) . " failed: $!");
             return 0;
         };
     }
     my $pid = fork();
     if (!defined $pid) {
+        _unlink_tunnel_cfg({ tunnel_cfg => $tunnel_cfg });
         if ($capture) {
             close $rd;
             close $wr;
@@ -3766,8 +4560,8 @@ sub trigger_mbsync {
             open STDERR, '>', '/dev/null';
         }
         sleep $wait if $wait > 0;
-        exec $MBSYNC_BIN, @args
-            or _exit(1);
+        my @cmd = mbsync_exec_argv($tunnel_cfg, @args);
+        exec @cmd or _exit(1);
     }
     if ($capture) {
         close $wr;
@@ -3778,9 +4572,10 @@ sub trigger_mbsync {
         args    => [@args],
         slot    => alloc_mbsync_slot(),
         pulse   => $meta->{pulse},
-        track   => $meta->{track},
-        out_fh  => $capture ? $rd : undef,
-        started => time(),
+        track      => $meta->{track},
+        tunnel_cfg => $tunnel_cfg,
+        out_fh     => $capture ? $rd : undef,
+        started    => time(),
     };
     log_info(mbsync_job_line('start', $pid, @args));
     return $pid;
@@ -4340,6 +5135,7 @@ sub _session_key {
         $acc->{pass_cmd}       // '',
         $acc->{auth}           // 'login',
         $acc->{mbsync_channel} // '',
+        $acc->{role}           // 'idle',
     );
 }
 
@@ -4560,6 +5356,13 @@ sub info_lines {
             $line .= " server $acc->{server}" if ($acc->{server} // '') ne '';
             $line .= " channel $acc->{mbsync_channel}"
                 if ($acc->{mbsync_channel} // '') ne '';
+            $line .= ' auth xoauth2' if ($acc->{auth} // '') eq 'xoauth2';
+            push @lines, $line;
+            next;
+        }
+        if (($acc->{role} // '') eq 'passonly') {
+            my $line = "$name: passonly server $acc->{server}"
+                . " channel $acc->{mbsync_channel}";
             $line .= ' auth xoauth2' if ($acc->{auth} // '') eq 'xoauth2';
             push @lines, $line;
             next;
@@ -4817,18 +5620,20 @@ sub startup_fail {
 
 sub run {
     my (@argv) = @_;
-    local @ARGV = @argv;
+    my ($tunnel_section, @rest) = _split_tunnel_argv(@argv);
+    local @ARGV = @rest;
     my %opt;
     getopts('dvc:', \%opt) or usage();
     usage() if @ARGV;
 
     $FOREGROUND = $opt{d} ? 1 : 0;
+    $FOREGROUND = 0 if defined $tunnel_section;
     $VERBOSE    = $opt{v} ? 1 : 0;
     if (defined $opt{c}) {
-        $CONFIG_FILE = $opt{c};
+        $CONFIG_FILE = _abs_config($opt{c});
     } else {
         startup_fail('HOME is not set') unless defined $ENV{HOME} && $ENV{HOME} ne '';
-        $CONFIG_FILE = "$ENV{HOME}/.config/imapidle/imapidle.conf";
+        $CONFIG_FILE = _abs_config("$ENV{HOME}/.config/imapidle/imapidle.conf");
     }
     $CONFIG_DIR = dirname($CONFIG_FILE);
 
@@ -4841,9 +5646,22 @@ sub run {
     install_info_signal();
 
     make_path($CONFIG_DIR, { mode => 0700 }) unless -d $CONFIG_DIR;
-    my $err = load_config($CONFIG_FILE);
+    my $err = load_config($CONFIG_FILE, defined $tunnel_section);
     startup_fail($err) if $err;
     open_state_dir();
+
+    if (defined $tunnel_section) {
+        my $ran = eval { tunnel_session($tunnel_section); 1 };
+        if (!$ran) {
+            my $msg = scrub($@);
+            chomp $msg;
+            $msg = "tunnel $tunnel_section: failed" if $msg eq '';
+            log_error($msg);
+            print STDERR "imapidle: $msg\n";
+            exit 1;
+        }
+        exit 0;
+    }
 
     for my $name (sort keys %accounts) {
         eval { connect_account($name) };
@@ -4919,6 +5737,8 @@ sub install_broken_conn_for_test {
 
 sub clear_conns_for_test { %conns = (); %sock_to_key = (); }
 sub set_foreground_for_test { $FOREGROUND = $_[0] ? 1 : 0; }
+sub set_self_path_for_test   { $SELF_PATH = $_[0]; }
+sub set_config_file_for_test { $CONFIG_FILE = $_[0]; }
 sub set_verbose_for_test    { $VERBOSE    = $_[0] ? 1 : 0; }
 sub last_child_exit_for_test { $LAST_CHILD_EXIT }
 sub set_known_hosts_for_test { $KNOWN_HOSTS = $_[0]; }
