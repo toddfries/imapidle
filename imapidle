@@ -19,7 +19,7 @@ use warnings;
 use Config;
 use Config::Tiny;
 use Cwd qw(abs_path);
-use Errno qw(EINPROGRESS EWOULDBLOCK EINTR EPIPE EAGAIN);
+use Errno qw(EINPROGRESS EWOULDBLOCK EINTR EPIPE EAGAIN ECHILD);
 use Socket qw(SHUT_WR);
 use Fcntl;
 use File::Basename qw(dirname);
@@ -3434,6 +3434,10 @@ sub reap_children {
         my $pid   = syscall($SYS_wait4, -1, $statb, WNOHANG, $ru);
         if (!defined $pid || $pid < 0) {
             next if $!{EINTR};
+            # No child of this process. Entries left in the hash were
+            # reparented to init, usually because they were forked by the
+            # starter before daemonize. They will never be ours to reap.
+            _drop_orphaned_children() if $!{ECHILD};
             last;
         }
         last if $pid == 0;
@@ -3466,6 +3470,21 @@ sub reap_children {
         }
         finish_pulse_channel($rec->{pulse}) if ref $rec eq 'HASH';
         finish_track_job($rec, $status, $real, $text) if ref $rec eq 'HASH' && $rec->{track};
+    }
+}
+
+sub _drop_orphaned_children {
+    return unless %children;
+    for my $pid (sort { $a <=> $b } keys %children) {
+        my $rec  = delete $children{$pid};
+        _unlink_tunnel_cfg($rec);
+        my @args = _child_args($rec);
+        my $slot = ref $rec eq 'HASH' ? $rec->{slot} : undef;
+        my $line = mbsync_job_line('stop', $pid, { slot => $slot }, @args);
+        $line .= ' gone';
+        $LAST_CHILD_EXIT = $line;
+        log_warn($line);
+        finish_pulse_channel($rec->{pulse}) if ref $rec eq 'HASH';
     }
 }
 
@@ -4842,8 +4861,15 @@ sub _pause_gate {
     return 0;
 }
 
+# mbsync has to be a child of the process that stays. The starter exits
+# at daemonize, and a child it forked is reparented to init.
+my $LIVE = 1;
+
+sub set_live_for_test { $LIVE = $_[0] ? 1 : 0; }
+
 sub pump_schedule {
     my ($now) = @_;
+    return unless $LIVE;
     $now //= time();
     my $phase = shutdown_phase();
     return if $phase;
@@ -5501,7 +5527,11 @@ sub one_iteration {
         exit 0;
     }
     pump_schedule() unless $phase;
-    my @ready = _handles_ready(loop_timeout());
+    my $wait = loop_timeout();
+    # A due folder makes the timeout 0. During shutdown that busy-loops
+    # while the only thing left is to notice a child exit.
+    $wait = 1 if $phase eq 'wait' && (!defined $wait || $wait < 1);
+    my @ready = _handles_ready($wait);
     # A HUP that arrived during select is delivered before this call.
     apply_reload();
     # Drain ready sockets before housekeeping sends DONE or NOOP.
@@ -5730,6 +5760,9 @@ sub run {
         exit 0;
     }
 
+    # Login waits on the network. The scheduler would fork mbsync in
+    # this process, and daemonize would leave those children to init.
+    $LIVE = 0 unless $FOREGROUND;
     for my $name (sort keys %accounts) {
         eval { connect_account($name) };
         log_error("$name: startup: " . scrub($@)) if $@;
@@ -5737,6 +5770,7 @@ sub run {
 
     prime_named_folders(time());
     daemonize() unless $FOREGROUND;
+    $LIVE = 1;
     install_chld_signal();
     main_loop();
 }

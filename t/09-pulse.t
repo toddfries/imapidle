@@ -336,6 +336,10 @@ set_trigger_hook_for_test(sub {
     push @forked, { wait => $wait, args => [@$args], pulse => $meta->{pulse} };
     return hold_child_for_test(70000 + @forked, 'mbsync ' . join(' ', @$args));
 });
+set_live_for_test(0);
+pump_schedule(2000);
+is_deeply(\@forked, [], 'mbsync waits until this process is the one that stays');
+set_live_for_test(1);
 queue_folder('hotb', 'INBOX', 2000, 2000);
 pump_schedule(2000);
 is_deeply(

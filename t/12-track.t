@@ -573,6 +573,21 @@ my $sig = capture(sub { shutdown_step_for_test(); });
 set_foreground_for_test(0);
 like($sig, qr/signal TERM, finishing mbsync/, 'SIGTERM uses the signal line');
 
+clear_children_for_test();
+hold_child_for_test(424242, 'mbsync knf');
+reap_children();
+like(last_child_exit_for_test(), qr/gone\z/, 'a child this process cannot reap is logged gone');
+is(mbsync_running(), 0, 'that child is forgotten');
+unlink $stop;
+open $fh, '>', $stop or die "shutdown: $!";
+close $fh;
+set_foreground_for_test(1);
+my $ghost = capture(sub {
+    is(shutdown_step_for_test(), 'exit', 'shutdown exits once a ghost child is gone');
+});
+set_foreground_for_test(0);
+like($ghost, qr/shutdown complete/, 'a ghost child does not hold the exit');
+
 set_trigger_hook_for_test(undef);
 set_verbose_for_test(0);
 set_foreground_for_test(0);

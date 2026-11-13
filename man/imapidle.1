@@ -93,6 +93,10 @@ In-flight
 .Sy mbsync
 processes finish, the state files are written, and the process
 exits 0.
+A child this process cannot reap is logged
+.Ql gone
+and does not hold that exit.
+That wait is at least one second.
 .Dv SIGHUP
 re-reads the configuration file on the next wake of the loop,
 within about 30 seconds, and does not exit.
@@ -243,10 +247,15 @@ is executed as
 followed by one
 .Ar channel:box
 argument per folder in the batch.
-Folders of the same channel that become ready together are one process:
+Folders of the same channel that become ready together are one process.
 .Bd -literal -offset indent
 mbsync channel:INBOX channel:Archive
 .Ed
+.Pp
+The process is started only after
+.Nm
+is the process that stays.
+A child of the starter would be adopted by init.
 .Pp
 .Va tunnel
 in the global section is a second way to run that command.
