@@ -5539,22 +5539,89 @@ sub one_iteration {
     pump_schedule() unless $phase;
 }
 
+# One line from the process that is leaving: "-> <pid>". The pid is the
+# grandchild that remains. No colon, so the name column leaves it alone.
+my $HANDOFF_SINK;
+
+sub set_handoff_sink_for_test { $HANDOFF_SINK = $_[0]; }
+
+sub _handoff_note {
+    my ($level, $msg) = @_;
+    if (defined $HANDOFF_SINK && $HANDOFF_SINK ne '') {
+        open my $fh, '>>', $HANDOFF_SINK or _exit(1);
+        print $fh "$$ $level $msg\n";
+        close $fh;
+        return;
+    }
+    log_info($msg)  if $level eq 'info';
+    log_error($msg) if $level eq 'err';
+}
+
+sub _read_handoff {
+    my ($fh) = @_;
+    my $buf = '';
+    while (length($buf) < 256) {
+        my $n = sysread($fh, my $chunk, 256);
+        if (!defined $n) {
+            next if $! == EINTR;
+            return (undef, 'fork failed');
+        }
+        last if $n == 0;
+        $buf .= $chunk;
+        last if index($buf, "\n") >= 0;
+    }
+    return ($1, '') if $buf =~ /^(\d+)\n/;
+    return (undef, $1) if $buf =~ /^fail (.+)\n/;
+    return (undef, 'fork failed');
+}
+
+sub _handoff_fail {
+    my ($why) = @_;
+    $why = 'fork failed' if !defined $why || $why eq '';
+    _handoff_note('err', $why);
+    _exit(1);
+}
+
 sub daemonize {
-    log_info('daemonizing');
-    chdir '/' or die "chdir /: $!";
+    chdir '/' or die "chdir /: $!\n";
+    pipe(my $rd, my $wr) or _handoff_fail("fork failed: $!");
+    my $mid = fork();
+    _handoff_fail("fork failed: $!") if !defined $mid;
+    if ($mid) {
+        close $wr;
+        my ($daemon, $why) = _read_handoff($rd);
+        close $rd;
+        while (waitpid($mid, 0) < 0) {
+            next if $! == EINTR;
+            last;
+        }
+        _handoff_fail($why) if !defined $daemon;
+        _handoff_note('info', "-> $daemon");
+        _exit(0);
+    }
+    close $rd;
+    setsid() or do {
+        syswrite($wr, "fail setsid failed: $!\n");
+        close $wr;
+        _exit(1);
+    };
     my $pid = fork();
-    die "first fork failed: $!" unless defined $pid;
-    exit 0 if $pid;
-    setsid() or die "setsid: $!";
-    $pid = fork();
-    die "second fork failed: $!" unless defined $pid;
-    exit 0 if $pid;
+    if (!defined $pid) {
+        syswrite($wr, "fail fork failed: $!\n");
+        close $wr;
+        _exit(1);
+    }
+    if ($pid) {
+        syswrite($wr, "$pid\n");
+        close $wr;
+        _exit(0);
+    }
+    close $wr;
     umask 077;
     open STDIN,  '<', '/dev/null';
     open STDOUT, '>', '/dev/null';
     open STDERR, '>', '/dev/null';
     $FOREGROUND = 0;
-    log_info("imapidle: daemon $$");
 }
 
 sub graceful_shutdown {

@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 12 2026 $
+.Dd $Mdocdate: November 13 2026 $
 .Dt IMAPIDLE 1
 .Os
 .Sh NAME
@@ -36,6 +36,13 @@ for the matching channel.
 itself runs once and exits.
 .Nm
 is the long-running side of that pair.
+Without
+.Fl d
+the starting process logs
+.Ql -> pid
+and exits.
+The pid in that line is the process that keeps running.
+A failed fork is one error line from the starting process.
 .Pp
 Each account is independent.
 A bad password, a refused certificate, a dead server, or a broken
