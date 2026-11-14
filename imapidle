@@ -1839,6 +1839,11 @@ sub io_wait_fd {
     my ($sock, $write, $timeout) = @_;
     $timeout = $IO_MAX if !defined $timeout || $timeout > $IO_MAX;
     $timeout = 0 if $timeout < 0;
+    # A login already in progress must not run on into IDLE.
+    if (_shutdown_wanted()) {
+        shutdown_phase();
+        return 0;
+    }
     if ($timeout <= 0 || $IO_DEPTH) {
         return _fd_ready($sock, $write, $timeout) > 0 ? 1 : 0;
     }
@@ -1849,15 +1854,18 @@ sub io_wait_fd {
         my $slice = _wait_slice($left);
         if ($slice <= 0) {
             _io_service();
+            return 0 if _shutdown_wanted();
             my $hint = $track_cfg ? eval { loop_timeout() } : undef;
             $slice = (defined $hint && $hint > 0 && $hint < $left) ? $hint : ($left < 0.2 ? $left : 0.2);
         }
         my $rc = _io_select($sock, $write, $slice);
         _io_service();
+        return 0 if _shutdown_wanted();
         return 1 if $rc > 0;
         return 0 if $rc < 0;
     }
     _io_service();
+    return 0 if _shutdown_wanted();
     return 0;
 }
 
@@ -3134,11 +3142,17 @@ sub connect_idle_folders {
     my $acc = $accounts{$name} or return 0;
     my $failed = 0;
     for my $folder (@$folders) {
+        _abandon_startup();
         my $ok = eval {
             my ($socket, $imap) = create_imap_connection($name, $acc, $folder->{name}, $password);
+            if (_shutdown_wanted()) {
+                close_session($imap, $socket);
+                _abandon_startup();
+            }
             arm_idle($name, $acc, $folder, $socket, $imap);
             1;
         };
+        _abandon_startup();
         next if $ok;
         $failed = 1;
         log_error("$name: $folder->{name}: " . scrub($@, $password));
@@ -3166,6 +3180,7 @@ sub _session_held {
 
 sub connect_account {
     my ($name) = @_;
+    _abandon_startup();
     my $acc = $accounts{$name} or return 0;
     return 0 if $acc->{disabled};
     return 1 if ($acc->{role} // '') eq 'passonly';
@@ -3186,12 +3201,17 @@ sub connect_account {
     my $partial = grep { index($_, "$name:") == 0 } keys %conns;
     if ($partial && _account_primary($name)) {
         my $ok = connect_idle_folders($name, \@need, $password);
+        _abandon_startup();
         $ok && account_covered($name) ? note_success($name) : mark_retry($name);
         return $ok;
     }
 
     my $ok = eval {
         my ($socket, $imap) = login_imap($name, $acc, $password);
+        if (_shutdown_wanted()) {
+            close_session($imap, $socket);
+            _abandon_startup();
+        }
         my $now = time();
         my $held = eval {
             consider_id($imap, $acc->{server}, $acc->{port}, $now);
@@ -3220,6 +3240,7 @@ sub connect_account {
         }
         1;
     };
+    _abandon_startup();
     return _settle_account($name, $ok, $@, $password);
 }
 
@@ -4825,6 +4846,25 @@ sub _close_for_shutdown {
     $LOG_OPEN = 0;
 }
 
+# Startup must not open another mailbox or daemonize once a shutdown
+# file is present. An mbsync this process already forked may finish.
+my $ABANDON_EXIT;
+
+sub set_abandon_exit_for_test { $ABANDON_EXIT = $_[0]; }
+
+sub _abandon_startup {
+    my $phase = shutdown_phase();
+    return if $phase eq '';
+    while ($phase eq 'wait') {
+        reap_children();
+        _handles_ready(1);
+        $phase = shutdown_phase();
+    }
+    _close_for_shutdown();
+    $ABANDON_EXIT->() if $ABANDON_EXIT;
+    exit 0;
+}
+
 sub request_shutdown {
     my ($sig) = @_;
     $SHUTDOWN = (defined $sig && $sig eq 'INT') ? 'INT' : 'TERM';
@@ -5763,12 +5803,15 @@ sub run {
     # Login waits on the network. The scheduler would fork mbsync in
     # this process, and daemonize would leave those children to init.
     $LIVE = 0 unless $FOREGROUND;
+    _abandon_startup();
     for my $name (sort keys %accounts) {
         eval { connect_account($name) };
         log_error("$name: startup: " . scrub($@)) if $@;
     }
 
+    _abandon_startup();
     prime_named_folders(time());
+    _abandon_startup();
     daemonize() unless $FOREGROUND;
     $LIVE = 1;
     install_chld_signal();

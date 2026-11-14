@@ -15,6 +15,7 @@
 use strict;
 use warnings;
 use File::Temp qw(tempdir tempfile);
+use POSIX qw(_exit);
 use Test::More;
 
 require './imapidle';
@@ -587,6 +588,33 @@ my $ghost = capture(sub {
 });
 set_foreground_for_test(0);
 like($ghost, qr/shutdown complete/, 'a ghost child does not hold the exit');
+
+my $slog = "$dir/startup-stop.log";
+my $stopper = fork();
+die "fork: $!" unless defined $stopper;
+if ($stopper == 0) {
+    Test::More->builder->no_ending(1);
+    set_foreground_for_test(1);
+    reset_track_for_test();
+    open STDERR, '>', $slog or _exit(4);
+    select STDERR;
+    $| = 1;
+    select STDOUT;
+    # exit would run File::Temp cleanup in this child and remove $dir.
+    set_abandon_exit_for_test(sub { _exit(0) });
+    connect_account('not-an-account');
+    _exit(3);
+}
+local $SIG{ALRM} = sub { kill 'KILL', $stopper };
+alarm 3;
+waitpid($stopper, 0);
+my $stop_status = $?;
+alarm 0;
+is($stop_status, 0, 'a shutdown file stops startup before a mailbox is opened');
+my $stop_log = slurp($slog);
+like($stop_log, qr/shutdown file \Q$stop\E detected, finishing mbsync/, 'startup names the shutdown file');
+like($stop_log, qr/shutdown complete/, 'startup says shutdown is done');
+unlike($stop_log, qr/IDLE|daemonizing|-> /, 'startup does not open IDLE or daemonize');
 
 set_trigger_hook_for_test(undef);
 set_verbose_for_test(0);

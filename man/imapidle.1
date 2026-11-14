@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 13 2026 $
+.Dd $Mdocdate: November 14 2026 $
 .Dt IMAPIDLE 1
 .Os
 .Sh NAME
@@ -97,6 +97,16 @@ A child this process cannot reap is logged
 .Ql gone
 and does not hold that exit.
 That wait is at least one second.
+A shutdown file present at startup stops the process
+before it opens a mailbox and before it daemonizes.
+The same check runs again before each account and
+before each further mailbox.
+An IMAP wait ends when the file is present, so a login
+already started does not run on into
+.Sy IDLE .
+An
+.Sy mbsync
+this process already started still finishes.
 .Dv SIGHUP
 re-reads the configuration file on the next wake of the loop,
 within about 30 seconds, and does not exit.

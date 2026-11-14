@@ -183,4 +183,15 @@ cmp_ok(time() - $t0, '<', 2, 'the shared wait stays inside its timeout');
 is_deeply(\@hit, ['ch:INBOX'], 'a due mbsync starts while a socket waits');
 set_trigger_hook_for_test(undef);
 
+my $stop = "$run/shutdown";
+open my $sfh, '>', $stop or die "shutdown: $!";
+close $sfh;
+my ($sd, $sdw) = pair();
+print $sdw "ready\n" or die "write: $!";
+$t0 = time();
+ok(!io_wait_fd($sd, 0, 5), 'a shutdown file ends the IMAP wait');
+cmp_ok(time() - $t0, '<', 1, 'that wait does not sit out its timeout');
+unlink $stop;
+reset_track_for_test();
+
 done_testing;
