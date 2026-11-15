@@ -453,6 +453,10 @@ A count above zero, or a changed
 runs
 .Sy mbsync
 and then follows the interval above.
+A failed
+.Cm STATUS
+closes that connection and syncs the mailbox
+instead of asking again immediately.
 A name containing a colon is remembered and not synced: the command
 splits on the first colon.
 A folder the server no longer lists is not tried again until a later

@@ -3006,6 +3006,36 @@ sub imap_done {
     return grep { defined && $_ ne '' } @lines;
 }
 
+# DONE is legal only while this process still has the server in IDLE.
+# A second DONE is an unknown command and the server drops the session.
+sub _leave_idle {
+    my ($conn) = @_;
+    return (1) unless $conn && $conn->{idling};
+    $conn->{idling} = 0;
+    my $imap = $conn->{imap};
+    return (0) unless imap_connected($imap);
+    my @lines;
+    my $ok = eval { @lines = $imap->done($conn->{tag}); 1 };
+    @lines = grep { defined && $_ ne '' } @lines;
+    return (0, @lines) if !$ok || !imap_connected($imap);
+    return (0, @lines) if !@lines || grep { /\b(?:BAD|BYE)\b/i } @lines;
+    return (1, @lines);
+}
+
+sub _note_idle {
+    my ($conn, $tag) = @_;
+    return 0 unless $conn && defined $tag && $tag ne '';
+    $conn->{tag}       = $tag;
+    $conn->{idling}    = 1;
+    $conn->{last_idle} = time();
+    return 1;
+}
+
+sub _probe_ready {
+    my ($conn) = @_;
+    return $conn && imap_connected($conn->{imap}) ? 1 : 0;
+}
+
 sub imap_logout {
     my ($imap) = @_;
     return unless imap_connected($imap);
@@ -3037,6 +3067,7 @@ sub arm_idle {
         imap         => $imap,
         tag          => $tag,
         mode         => 'IDLE',
+        idling       => 1,
         debounce     => $folder->{debounce},
         socket       => $socket,
         channel      => $acc->{mbsync_channel},
@@ -3162,8 +3193,7 @@ sub drop_conn {
     my $avg = note_conn_time(_conn_time_key($conn), $secs);
     $avg = '' unless defined $avg;
     log_warn("$name: dropping $what: $why" . ($avg ne '' ? " $avg" : ''));
-    eval { imap_done($conn->{imap}, $conn->{tag})
-        if $conn->{imap} && ($conn->{mode} // '') eq 'IDLE' && $conn->{tag} };
+    eval { _leave_idle($conn) };
     close_session($conn->{imap}, $conn->{socket});
     mark_retry($name) unless $no_retry;
 }
@@ -3296,22 +3326,26 @@ sub restart_idle {
     my ($conn) = @_;
     return 1 if !$conn || ($conn->{mode} // '') eq 'NOTIFY';
     return 0 unless $conn->{imap};
-    my $was = imap_connected($conn->{imap});
     my $ok = eval {
-        imap_done($conn->{imap}, $conn->{tag}) if $conn->{tag} && $was;
-        unless (imap_connected($conn->{imap})) {
-            my $why = $was ? ($conn->{imap}->LastError // 'not connected') : 'not connected';
-            die $why;
+        if ($conn->{idling}) {
+            my $was = imap_connected($conn->{imap});
+            my ($left) = _leave_idle($conn);
+            unless ($left) {
+                my $why = $was
+                    ? ($conn->{imap}->LastError || 'DONE failed')
+                    : 'not connected';
+                die $why;
+            }
         }
+        die 'not connected' unless imap_connected($conn->{imap});
         my $tag = $conn->{imap}->idle() or die($conn->{imap}->LastError // 'IDLE failed');
-        $conn->{tag} = $tag;
+        _note_idle($conn, $tag);
         1;
     };
     if (!$ok) {
         log_warn("$conn->{name}: idle re-arm failed: " . scrub($@));
         return 0;
     }
-    $conn->{last_idle} = time();
     note_idle_rearmed($conn->{name});
     return 1;
 }
@@ -4850,8 +4884,7 @@ sub _disconnect_conn {
     $secs = time() - $conn->{started} if defined $conn->{started};
     my $avg = note_conn_time(_conn_time_key($conn), $secs) // '';
     log_info("$name: disconnecting $what" . ($avg ne '' ? " $avg" : ''));
-    eval { imap_done($conn->{imap}, $conn->{tag})
-        if $conn->{imap} && ($conn->{mode} // '') eq 'IDLE' && $conn->{tag} };
+    eval { _leave_idle($conn) };
     close_session($conn->{imap}, $conn->{socket});
 }
 
@@ -4930,6 +4963,35 @@ sub _due_unprobed {
     return sort @ids;
 }
 
+# A dead primary must not stay in the table. The next lap would send
+# DONE again, and the server answers BAD until it closes the socket.
+sub _park_reconnect {
+    my ($name) = @_;
+    my $acc = $accounts{$name} or return;
+    my $soon = time() + 60;
+    $acc->{next_try} = $soon if ($acc->{next_try} // 0) < $soon;
+}
+
+sub _drop_idle_conn {
+    my ($conn, $why) = @_;
+    return unless $conn && $conn->{key} && exists $conns{ $conn->{key} };
+    $conn->{idling} = 0;
+    my $name = $conn->{name};
+    drop_conn($conn->{key}, $why, 1);
+    _park_reconnect($name);
+}
+
+sub _mark_probe_fallback {
+    my ($channel, $now, @extra) = @_;
+    my %seen;
+    for my $id (@extra, _due_unprobed($channel, $now)) {
+        next if !defined $id || $seen{$id}++;
+        my $rec = $track{$id} or next;
+        next if ($rec->{next} // 0) > $now;
+        $rec->{await_sync} = 1;
+    }
+}
+
 # Ask the primary connection before spending an mbsync on a mailbox
 # that has nothing in it. One IDLE gap covers a batch, then IDLE resumes.
 sub _probe_channel {
@@ -4938,16 +5000,22 @@ sub _probe_channel {
     return unless @ids;
     my $limit = 40;
     @ids = @ids[0 .. $limit - 1] if @ids > $limit;
-    my $imap = $conn->{imap} or return;
+    my $imap = $conn->{imap};
     my $idle = ($conn->{mode} // '') eq 'IDLE';
+    unless ($imap && imap_connected($imap)) {
+        log_warn("$conn->{name}: STATUS probe: not connected");
+        _mark_probe_fallback($channel, $now, @ids);
+        _drop_idle_conn($conn, 'STATUS probe failed');
+        return;
+    }
     my $empty_n = 0;
     my $sync_n  = 0;
     my $gap = $track_cfg->{empty} // 86400;
     my $ok = eval {
         if ($idle) {
-            my @done = imap_done($imap, $conn->{tag});
+            my ($left, @done) = _leave_idle($conn);
             _queue_mail_lines($conn, @done);
-            die($imap->LastError // 'not connected') unless imap_connected($imap);
+            die($imap->LastError || 'DONE failed') unless $left;
         }
         for my $id (@ids) {
             my $rec = $track{$id} or next;
@@ -4980,22 +5048,19 @@ sub _probe_channel {
         1;
     };
     my $err = $@;
-    if ($idle && imap_connected($imap)) {
+    if ($ok && $idle && imap_connected($imap)) {
         my $tag = eval { $imap->idle() };
-        if ($tag) {
-            $conn->{tag}       = $tag;
-            $conn->{last_idle} = time();
-        } else {
+        unless (_note_idle($conn, $tag)) {
             log_warn("$conn->{name}: IDLE after STATUS failed: " . scrub($@));
+            _drop_idle_conn($conn, 'IDLE after STATUS failed');
         }
+    } elsif ($ok && $idle) {
+        _drop_idle_conn($conn, 'IDLE after STATUS failed');
     }
     if (!$ok) {
         log_warn("$conn->{name}: STATUS probe: " . scrub($err));
-        for my $id (@ids) {
-            my $rec = $track{$id} or next;
-            next if ($rec->{next} // 0) > $now;
-            $rec->{await_sync} = 1;
-        }
+        _mark_probe_fallback($channel, $now, @ids);
+        _drop_idle_conn($conn, 'STATUS probe failed');
         return;
     }
     my $n = $empty_n + $sync_n;
@@ -5221,19 +5286,14 @@ sub refresh_primary {
     $now //= time();
     my $ok = eval {
         if (($conn->{mode} // '') eq 'IDLE') {
-            my $was = imap_connected($conn->{imap});
-            my @done = imap_done($conn->{imap}, $conn->{tag});
+            my ($left, @done) = _leave_idle($conn);
             _queue_mail_lines($conn, @done);
-            unless (imap_connected($conn->{imap})) {
-                my $why = $was ? ($conn->{imap}->LastError // 'not connected') : 'not connected';
-                die $why;
-            }
+            die($conn->{imap}->LastError // 'not connected') unless $left;
             _issue_due($conn, $now);
             die($conn->{imap}->LastError // 'not connected')
                 unless imap_connected($conn->{imap});
             my $tag = $conn->{imap}->idle() or die($conn->{imap}->LastError // 'IDLE failed');
-            $conn->{tag} = $tag;
-            $conn->{last_idle} = time();
+            _note_idle($conn, $tag);
             note_idle_rearmed($conn->{name});
         } else {
             _issue_due($conn, $now);
@@ -5338,6 +5398,10 @@ sub next_track_delay {
                 my ($ch, $box) = split /\0/, $id, 2;
                 next if !defined $ch || !defined $box || $box eq '';
                 next if tracked_deferred($ch, $box, $now);
+                # The primary is still listed but cannot take STATUS.
+                # Asking it again is what pegged the CPU.
+                my $primary = _primary_for_channel($ch);
+                next if _needs_probe($id, $now) && !_probe_ready($primary);
             }
             $d = 0 if $d < 0;
             $wait = $d if !defined $wait || $d < $wait;
@@ -6130,6 +6194,7 @@ sub plant_idle_for_test {
         name     => $name,
         folder   => $folder,
         mode     => 'IDLE',
+        idling   => 1,
         debounce => $debounce,
         channel  => $channel,
         wait     => 0,
@@ -6252,6 +6317,7 @@ sub set_primary_for_test {
         primary => 1,
         mode    => $mode // 'NOTIFY',
         tag     => 'A1',
+        idling  => (($mode // 'NOTIFY') eq 'IDLE' ? 1 : 0),
     };
     return $key;
 }

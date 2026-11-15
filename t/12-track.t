@@ -490,6 +490,52 @@ set_trigger_hook_for_test(undef);
 clear_children_for_test();
 clear_conns_for_test();
 
+# A DONE the server rejects must not be sent again, and the lap must sleep.
+{
+    package BadDoneIMAP;
+    sub new { bless { done => 0, idle => 0, cmds => [], up => 1 }, shift }
+    sub IsConnected { $_[0]->{up} }
+    sub LastError { 'DONE BAD Error in IMAP command : Unknown command' }
+    sub done {
+        my ($self) = @_;
+        $self->{done}++;
+        return 'DONE BAD Error in IMAP command : Unknown command';
+    }
+    sub idle { $_[0]->{idle}++; return 'A9' }
+    sub tag_and_run {
+        my ($self, $cmd) = @_;
+        push @{ $self->{cmds} }, $cmd;
+        return ();
+    }
+    sub logout { }
+}
+package main;
+reset_track_for_test();
+set_connections_for_test(8);
+my $bad_now = time();
+for my $n (0 .. 44) {
+    set_track_due_for_test('fdc', sprintf('M%02d', $n), $bad_now - 1);
+}
+my $bad_imap = BadDoneIMAP->new;
+set_primary_for_test('probeacct', 'fdc', $bad_imap, 'IDLE');
+my @bad_forked;
+set_trigger_hook_for_test(sub {
+    my ($wait, $args, $meta) = @_;
+    push @bad_forked, $args->[0];
+    return hold_child_for_test(74000 + @bad_forked, 'mbsync ' . $args->[0]);
+});
+pump_tracked($bad_now);
+pump_tracked($bad_now);
+is($bad_imap->{done}, 1, 'a rejected DONE is not sent again');
+is($bad_imap->{idle}, 0, 'IDLE is not resumed after a rejected DONE');
+is(scalar @{ $bad_imap->{cmds} }, 0, 'STATUS is not sent after a rejected DONE');
+my $bad_delay = next_track_delay($bad_now);
+ok(!defined $bad_delay || $bad_delay > 0, 'a failed STATUS does not busy-poll');
+set_trigger_hook_for_test(undef);
+clear_children_for_test();
+clear_conns_for_test();
+reset_track_for_test();
+
 # --- queue, pause, shutdown ---
 
 is(load_config(write_conf(<<'EOF')), '', 'queue fixture loads');

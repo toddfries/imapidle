@@ -242,7 +242,7 @@ sub close { $_[0]{closed} = 1 }
 package main;
 
 my $dead = DeadIMAP->new;
-my $dead_conn = { name => 'acct', mode => 'IDLE', tag => '40', imap => $dead };
+my $dead_conn = { name => 'acct', mode => 'IDLE', tag => '40', idling => 1, imap => $dead };
 set_foreground_for_test(1);
 my $dead_log = stderr_of(sub {
     ok(!restart_idle($dead_conn), 'a dead IDLE session does not re-arm');
@@ -254,7 +254,7 @@ unlike($dead_log, qr/Trying command when NOT connected|IMAPClient\.pm/,
     'a dead re-arm does not dump the library stack');
 
 my $drop = DropIMAP->new;
-my $drop_conn = { name => 'acct', mode => 'IDLE', tag => '40', imap => $drop };
+my $drop_conn = { name => 'acct', mode => 'IDLE', tag => '40', idling => 1, imap => $drop };
 my $drop_log = stderr_of(sub {
     ok(!restart_idle($drop_conn), 'a DONE that loses the socket does not send IDLE');
 });
@@ -267,7 +267,7 @@ is_deeply($drop->{calls}, ['done'], 'LOGOUT is not sent on a dead session');
 is($sock->{closed}, 1, 'the local socket is still closed');
 
 my $live = LiveIMAP->new;
-my $live_conn = { name => 'acct', mode => 'IDLE', tag => '40', imap => $live };
+my $live_conn = { name => 'acct', mode => 'IDLE', tag => '40', idling => 1, imap => $live };
 ok(restart_idle($live_conn), 'a live session re-arms');
 is_deeply($live->{calls}, [qw(done idle)], 'a live re-arm sends DONE then IDLE');
 is($live_conn->{tag}, 41, 'the new IDLE tag is kept');
