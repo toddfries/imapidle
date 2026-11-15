@@ -5474,6 +5474,9 @@ sub loop_timeout {
     $wait = $off if defined $off && $off < $wait;
     my $track_wait = next_track_delay($now);
     $wait = $track_wait if defined $track_wait && $track_wait < $wait;
+    # Pause holds the pumps that would clear a due folder. A 0 here
+    # busy-polls until that file is removed.
+    $wait = 1 if pause_path() && $wait < 1;
     return $wait;
 }
 

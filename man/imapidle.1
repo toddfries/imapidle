@@ -387,6 +387,8 @@ A pause file stops new
 .Sy mbsync
 processes until it is removed.
 IMAP keeps running.
+The loop sleeps a second while that file is present,
+so a due mailbox does not busy-poll.
 A shutdown file uses the same finish path as
 .Dv SIGTERM .
 .Pp

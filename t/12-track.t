@@ -767,6 +767,17 @@ my $pause = "$run/pause.mail";
 open $fh, '>', $pause or die "pause: $!";
 print $fh "hold\n";
 close $fh;
+set_next_try_for_test($_, time() + 10000) for account_names();
+{
+    my $ps = pulse_snapshot_for_test();
+    set_pulse_next_for_test($_, time() + 10000) for @{ $ps->{channels} // [] };
+}
+set_connections_for_test(4);
+clear_children_for_test();
+set_track_due_for_test('fdc', 'Held', time() - 1);
+cmp_ok(loop_timeout(), '>=', 1, 'a pause does not busy-poll a due folder');
+cmp_ok(loop_timeout(), '<=', 1, 'a pause is rechecked within a second');
+reset_track_for_test();
 queue_folder('ch', 'INBOX', $now, $now);
 set_foreground_for_test(1);
 my $held = capture(sub { pump_schedule($now); });
