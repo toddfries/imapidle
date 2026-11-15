@@ -1,0 +1,81 @@
+.\" $OpenBSD$
+.\"
+.\" Copyright (c) 2026 Todd T. Fries <todd@fries.net>
+.\"
+.\" Permission to use, copy, modify, and distribute this software for any
+.\" purpose with or without fee is hereby granted, provided that the above
+.\" copyright notice and this permission notice appear in all copies.
+.\"
+.\" THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+.\" WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+.\" MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+.\" ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+.\" WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+.\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+.\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+.Dd $Mdocdate: November 15 2026 $
+.Dt IMAPIDLECTL 1
+.Os
+.Sh NAME
+.Nm imapidlectl
+.Nd show and set imapidle memory
+.Sh SYNOPSIS
+.Nm imapidlectl
+.Op Fl s Ar path
+.Op Ar name ...
+.Sh DESCRIPTION
+.Nm
+asks the running
+.Sy imapidle(1)
+for the values it holds in memory.
+The default socket is
+.Pa ~/tmp/imapidle.sock .
+.Fl s
+names another socket.
+.Pp
+With no
+.Ar name ,
+every node is printed as
+.Ar name Ns = Ns Ar value .
+A
+.Ar name
+prints that node and every node under it.
+.Ar name Ns = Ns Ar value
+sets a writable node and prints the result.
+.Pp
+A component that contains a dot is written with the dot doubled,
+so a mailbox
+.Ql INBOX.Sent
+is
+.Ql INBOX..Sent .
+.Pp
+.Ar shutdown=1
+asks the daemon to exit the way
+.Dv SIGTERM
+does.
+It does not create a shutdown file, so the next start is not held.
+.Ar pause=1
+pauses
+.Sy mbsync
+the way a pause file does.
+.Ar pause=0
+clears a pause that was set this way.
+A pause file is left in place and still pauses.
+Every other node is read-only.
+.Pp
+The reply is one node per line.
+An unknown name or a rejected write is an error on standard error,
+and
+.Nm
+exits 1.
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa ~/tmp/imapidle.sock
+The default socket.
+Mode 0600.
+.El
+.Sh EXIT STATUS
+.Ex -std imapidlectl
+.Sh SEE ALSO
+.Sy imapidle(1) ,
+.Sy imapidle.conf(5)

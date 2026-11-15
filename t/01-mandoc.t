@@ -19,7 +19,7 @@ use Test::More;
 my $mandoc = '/usr/bin/mandoc';
 plan skip_all => 'mandoc not installed' unless -x $mandoc;
 
-for my $page (qw(man/imapidle.1 man/imapidle.conf.5)) {
+for my $page (qw(man/imapidle.1 man/imapidle.conf.5 man/imapidlectl.1)) {
     ok(-f $page, "$page is present");
     my $out = `$mandoc -Tlint $page 2>&1`;
     my $rc  = $? >> 8;

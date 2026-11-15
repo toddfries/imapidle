@@ -16,9 +16,11 @@ use strict;
 use warnings;
 use Test::More;
 
-my $out = `perl -c imapidle 2>&1`;
-my $rc  = $? >> 8;
-is($rc, 0, 'perl -c exits 0') or diag($out);
-like($out, qr/syntax OK/, 'perl -c reports syntax OK') or diag($out);
+for my $src (qw(imapidle imapidlectl)) {
+    my $out = `perl -c $src 2>&1`;
+    my $rc  = $? >> 8;
+    is($rc, 0, "perl -c $src exits 0") or diag($out);
+    like($out, qr/syntax OK/, "perl -c $src reports syntax OK") or diag($out);
+}
 
 done_testing;

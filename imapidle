@@ -20,13 +20,14 @@ use Config;
 use Config::Tiny;
 use Cwd qw(abs_path);
 use Errno qw(EINPROGRESS EWOULDBLOCK EINTR EPIPE EAGAIN ECHILD);
-use Socket qw(SHUT_WR);
+use Socket qw(SHUT_WR SOCK_STREAM);
 use Fcntl;
 use File::Basename qw(dirname);
 use File::Path qw(make_path);
 use Getopt::Std;
 use IO::Select;
 use IO::Socket::SSL;
+use IO::Socket::UNIX;
 use Digest::SHA qw(sha256_hex sha1);
 use MIME::Base64 qw(encode_base64 decode_base64);
 use Mail::IMAPClient;
@@ -73,6 +74,10 @@ my $shutdown_reason = '';
 my $shutdown_waiting = 0;
 my $RELEASING = 0;
 my $SHUTDOWN = 0;
+my $CTL_PAUSE = 0;
+my $CTL_PATH;
+my $CTL_LISTEN;
+my %CTL_CLIENT;
 my $MBSYNC_BIN = '/usr/local/bin/mbsync';
 my $TRIGGER_HOOK;
 my $select = IO::Select->new();
@@ -1913,12 +1918,15 @@ sub _handles_ready {
         next unless defined $fd;
         vec($rin, $fd, 1) = 1;
     }
+    _ctl_note($rin, $win);
     my $n = _pselect($rin, $win, $ein, $timeout);
     return () if !defined $n || $n <= 0;
+    _ctl_dispatch($rin, $win);
     my @ready;
     for my $fh (@handles) {
         my $fd = fileno($fh);
         next unless defined $fd && vec($rin, $fd, 1);
+        next if _ctl_is($fh);
         push @ready, $fh;
     }
     return @ready;
@@ -1974,6 +1982,7 @@ sub _io_select {
     }
     vec($rin, fileno($CHLD_R), 1) = 1 if $CHLD_R && defined fileno($CHLD_R);
     vec($rin, fileno($INFO_R), 1) = 1 if $INFO_R && defined fileno($INFO_R);
+    _ctl_note($rin, $win);
     my $n = _pselect($rin, $win, $ein, $timeout);
     if (!defined $n || $n < 0) {
         return 0 if $!{EINTR};
@@ -1995,6 +2004,7 @@ sub _io_select {
             _drain_info();
             report_info();
         }
+        _ctl_dispatch($rin, $win);
     };
     $IO_DEPTH--;
     return 1 if $write && (vec($win, $fd, 1) || vec($ein, $fd, 1));
@@ -5268,6 +5278,7 @@ sub _close_for_shutdown {
     _release_imap_sessions();
     save_stat_files();
     save_track_file();
+    ctl_close();
     my $dir = $STATE_DIR;
     if (!defined $dir || $dir eq '') {
         $dir = (defined $ENV{HOME} && $ENV{HOME} ne '') ? "$ENV{HOME}/.local/imapidle" : '.local/imapidle';
@@ -5485,10 +5496,22 @@ sub pump_tracked {
     }
 }
 
+sub operations_paused {
+    return 1 if $CTL_PAUSE;
+    return pause_path() ? 1 : 0;
+}
+
 sub _pause_gate {
-    if (my $path = pause_path()) {
-        log_info("pause file $path detected, idling operations") unless $pause_announced;
-        $pause_announced = 1;
+    my $path = pause_path();
+    if ($path || $CTL_PAUSE) {
+        unless ($pause_announced) {
+            if ($path) {
+                log_info("pause file $path detected, idling operations");
+            } else {
+                log_info('pause requested, idling operations');
+            }
+            $pause_announced = 1;
+        }
         return 1;
     }
     if ($pause_announced) {
@@ -5766,7 +5789,7 @@ sub loop_timeout {
     $wait = $poll_wait if defined $poll_wait && $poll_wait < $wait;
     # Pause holds the pumps that would clear a due folder. A 0 here
     # busy-polls until that file is removed.
-    $wait = 1 if pause_path() && $wait < 1;
+    $wait = 1 if operations_paused() && $wait < 1;
     return $wait;
 }
 
@@ -6328,12 +6351,384 @@ sub daemonize {
     $FOREGROUND = 0;
 }
 
+# A dot inside a component is written twice, so the single dots stay
+# the separators. INBOX.Sent is INBOX..Sent.
+sub ctl_enc {
+    my ($s) = @_;
+    $s = '' unless defined $s;
+    $s =~ s/\./../g;
+    return $s;
+}
+
+sub ctl_match {
+    my ($name, $query) = @_;
+    return 1 if !defined $query || $query eq '' || $query eq 'all' || $query eq '-a';
+    return 1 if $name eq $query;
+    return 0 if length($name) <= length($query);
+    return substr($name, 0, length($query)) eq $query
+        && substr($name, length($query), 1) eq '.';
+}
+
+sub _ctl_put {
+    my ($nodes, $name, $value) = @_;
+    $value = '' unless defined $value;
+    $value =~ s/[\r\n\t]/ /g;
+    $nodes->{$name} = "$value";
+}
+
+sub ctl_nodes {
+    my ($now) = @_;
+    $now //= time();
+    my %n;
+    _ctl_put(\%n, 'version', $VERSION);
+    _ctl_put(\%n, 'pid', $$);
+    _ctl_put(\%n, 'verbose', $VERBOSE ? 1 : 0);
+    _ctl_put(\%n, 'foreground', $FOREGROUND ? 1 : 0);
+    _ctl_put(\%n, 'shutdown', _shutdown_wanted() ? 1 : 0);
+    _ctl_put(\%n, 'pause', operations_paused() ? 1 : 0);
+    _ctl_put(\%n, 'accounts', scalar keys %accounts);
+    _ctl_put(\%n, 'connections', scalar keys %conns);
+    _ctl_put(\%n, 'mbsync', scalar keys %children);
+    _ctl_put(\%n, 'hooks', scalar keys %hook_children);
+    if ($track_cfg) {
+        _ctl_put(\%n, 'track.disabled', $track_cfg->{disabled} ? 1 : 0);
+        _ctl_put(\%n, 'track.tunnel', $track_cfg->{tunnel} ? 1 : 0);
+        _ctl_put(\%n, 'track.hook', ($track_cfg->{hook} // '') ne '' ? 1 : 0);
+        for my $k (qw(connections min messages initial max list id capability empty tunnel_timeout)) {
+            _ctl_put(\%n, "track.$k", $track_cfg->{$k} // 0);
+        }
+    }
+    if ($pulse_cfg) {
+        _ctl_put(\%n, 'pulse.disabled', $pulse_cfg->{disabled} ? 1 : 0);
+        _ctl_put(\%n, 'pulse.sweep', $pulse_cfg->{sweep} // 3600);
+        _ctl_put(\%n, 'pulse.hook', ($pulse_cfg->{hook} // '') ne '' ? 1 : 0);
+        _ctl_put(\%n, 'pulse.channels', scalar @{ $pulse_cfg->{channels} // [] });
+        for my $ch (@{ $pulse_cfg->{channels} // [] }) {
+            my $base = 'pulse.channel.' . ctl_enc($ch);
+            my $next = $pulse_next{$ch};
+            _ctl_put(\%n, "$base.next", defined $next ? int($next) : 0);
+            my $last = $PULSE_LAST{$ch};
+            _ctl_put(\%n, "$base.last", defined $last ? int($last) : 0);
+        }
+    }
+    for my $name (sort keys %accounts) {
+        my $acc  = $accounts{$name};
+        my $base = 'account.' . ctl_enc($name);
+        _ctl_put(\%n, "$base.server", $acc->{server});
+        _ctl_put(\%n, "$base.port", $acc->{port});
+        _ctl_put(\%n, "$base.user", $acc->{user});
+        _ctl_put(\%n, "$base.channel", $acc->{mbsync_channel});
+        _ctl_put(\%n, "$base.auth", $acc->{auth});
+        _ctl_put(\%n, "$base.role", $acc->{role});
+        _ctl_put(\%n, "$base.wait", $acc->{wait} // 0);
+        _ctl_put(\%n, "$base.poll", defined $acc->{poll} ? $acc->{poll} : 60);
+        _ctl_put(\%n, "$base.disabled", $acc->{disabled} ? 1 : 0);
+        _ctl_put(\%n, "$base.config_disabled", $acc->{config_disabled} ? 1 : 0);
+        _ctl_put(\%n, "$base.next_try", int($acc->{next_try} // 0));
+        _ctl_put(\%n, "$base.fails", $acc->{fails} // 0);
+        _ctl_put(\%n, "$base.pass_wait", int($acc->{secret_wait} // 0));
+        _ctl_put(\%n, "$base.hook", ($acc->{hook} // '') ne '' ? 1 : 0);
+        _ctl_put(\%n, "$base.folders", scalar @{ $acc->{folders} // [] });
+        _ctl_put(\%n, "$base.covered", account_covered($name) ? 1 : 0);
+        for my $folder (@{ $acc->{folders} // [] }) {
+            my $fb = "$base.folder." . ctl_enc($folder->{name});
+            _ctl_put(\%n, "$fb.priority", $folder->{priority});
+            _ctl_put(\%n, "$fb.debounce", $folder->{debounce});
+        }
+    }
+    for my $key (sort keys %conns) {
+        my $conn = $conns{$key};
+        my ($cname, $what) = split /:/, $key, 2;
+        my $base = 'conn.' . ctl_enc($cname) . '.' . ctl_enc($what // '');
+        _ctl_put(\%n, "$base.mode", $conn->{mode} // 'IDLE');
+        _ctl_put(\%n, "$base.channel", $conn->{channel} // '');
+        _ctl_put(\%n, "$base.idling", $conn->{idling} ? 1 : 0);
+        _ctl_put(\%n, "$base.primary", $conn->{primary} ? 1 : 0);
+        _ctl_put(\%n, "$base.poll_next", int($conn->{poll_next} // 0));
+        _ctl_put(\%n, "$base.started", int($conn->{started} // 0));
+        _ctl_put(\%n, "$base.last_success", int($conn->{last_success} // 0));
+    }
+    for my $id (sort keys %track) {
+        my ($ch, $box) = split /\0/, $id, 2;
+        next unless defined $box;
+        my $rec  = $track{$id};
+        my $base = 'track.box.' . ctl_enc($ch) . '.' . ctl_enc($box);
+        _ctl_put(\%n, "$base.next", int($rec->{next} // 0));
+        _ctl_put(\%n, "$base.interval", int($rec->{interval} // 0));
+        _ctl_put(\%n, "$base.uidnext", defined $rec->{uidnext} ? $rec->{uidnext} : '');
+        _ctl_put(\%n, "$base.samples", scalar @{ $rec->{samples} // [] });
+        _ctl_put(\%n, "$base.fails", $rec->{fails} // 0);
+    }
+    for my $ch (sort keys %list_next) {
+        _ctl_put(\%n, 'track.list.' . ctl_enc($ch), int($list_next{$ch}));
+    }
+    my %sched;
+    $sched{$_} = 1 for keys %box_last_run;
+    $sched{$_} = 1 for keys %box_gap;
+    $sched{$_} = 1 for keys %box_pending;
+    $sched{$_} = 1 for keys %box_wait;
+    for my $id (sort keys %sched) {
+        my ($ch, $box) = split /\0/, $id, 2;
+        next unless defined $box;
+        my $base = 'schedule.' . ctl_enc($ch) . '.folder.' . ctl_enc($box);
+        _ctl_put(\%n, "$base.last", int($box_last_run{$id})) if $box_last_run{$id};
+        _ctl_put(\%n, "$base.gap", $box_gap{$id}) if defined $box_gap{$id};
+        _ctl_put(\%n, "$base.pending", $box_pending{$id} ? 1 : 0) if $box_pending{$id};
+        _ctl_put(\%n, "$base.wait", $box_wait{$id}) if defined $box_wait{$id};
+    }
+    for my $ch (sort keys %batch) {
+        my $b    = $batch{$ch};
+        my $base = 'schedule.' . ctl_enc($ch);
+        _ctl_put(\%n, "$base.deadline", defined $b->{deadline} ? int($b->{deadline}) : 0);
+        my $boxes = $b->{boxes};
+        next unless ref $boxes eq 'HASH';
+        for my $box (sort keys %$boxes) {
+            _ctl_put(\%n, "$base.folder." . ctl_enc($box) . '.queued', 1);
+        }
+    }
+    for my $pid (sort { $a <=> $b } keys %children) {
+        my $rec  = $children{$pid};
+        my $base = "mbsync.$pid";
+        _ctl_put(\%n, "$base.args", join(' ', @{ $rec->{args} // [] }));
+        _ctl_put(\%n, "$base.started", int($rec->{started} // 0));
+        my $kind = ($rec->{pulse} // '') ne '' ? 'pulse'
+            : ($rec->{track} // '') ne '' ? 'track' : 'hot';
+        _ctl_put(\%n, "$base.kind", $kind);
+    }
+    for my $pid (sort { $a <=> $b } keys %hook_children) {
+        my $rec = $hook_children{$pid};
+        _ctl_put(\%n, "hook.$pid.label", (ref $rec eq 'HASH' ? $rec->{label} : '') // 'hook');
+    }
+    for my $key (sort keys %CONN_TIME) {
+        my ($cname, $what) = split /\0/, $key, 2;
+        next unless defined $what;
+        my $row  = $CONN_TIME{$key};
+        my $base = 'conn_time.' . ctl_enc($cname) . '.' . ctl_enc($what);
+        _ctl_put(\%n, "$base.n", $row->{n} // 0);
+        _ctl_put(\%n, "$base.total", sprintf('%.2f', $row->{total} // 0));
+    }
+    return \%n;
+}
+
+# Writable nodes are shutdown and pause. Everything else is a readout.
+# shutdown=1 is the signal path: this process exits, and no file is left
+# to hold the next start. pause=1 is remembered here and OR'd with a
+# pause file. pause=0 clears only this latch.
+sub ctl_set {
+    my ($name, $value) = @_;
+    if ($name eq 'shutdown') {
+        return 'bad value' unless defined $value && $value eq '1';
+        $SHUTDOWN = 'TERM' unless $SHUTDOWN;
+        return;
+    }
+    if ($name eq 'pause') {
+        return 'bad value' unless defined $value && ($value eq '0' || $value eq '1');
+        $CTL_PAUSE = $value eq '1' ? 1 : 0;
+        return;
+    }
+    return 'read-only';
+}
+
+sub ctl_reply {
+    my ($line) = @_;
+    $line //= '';
+    $line =~ s/\r?\n\z//;
+    $line =~ s/^\s+|\s+$//g;
+    my $query = $line;
+    if ($line =~ /^([^=]+)=(.*)$/) {
+        $query = $1;
+        $query =~ s/\s+\z//;
+        my $err = ctl_set($query, $2);
+        return "error $err\n" if $err;
+        my $nodes = ctl_nodes();
+        return "error unknown oid $query\n" unless exists $nodes->{$query};
+        return "$query=$nodes->{$query}\n";
+    }
+    my $nodes = ctl_nodes();
+    my @names = sort grep { ctl_match($_, $query) } keys %$nodes;
+    return "error unknown oid $query\n" unless @names;
+    return join('', map { "$_=$nodes->{$_}\n" } @names);
+}
+
+sub ctl_socket_path {
+    return $CTL_PATH if defined $CTL_PATH && $CTL_PATH ne '';
+    my $dir = runtime_dir();
+    return unless defined $dir && $dir ne '';
+    return "$dir/imapidle.sock";
+}
+
+sub set_ctl_path_for_test { $CTL_PATH = $_[0]; }
+
+sub ctl_pump_for_test {
+    ctl_accept();
+    for my $id (keys %CTL_CLIENT) {
+        my $c = $CTL_CLIENT{$id} or next;
+        ctl_read($c);
+    }
+}
+
+sub _ctl_is {
+    my ($fh) = @_;
+    return 0 unless defined $fh && defined fileno($fh);
+    my $fd = fileno($fh);
+    return 1 if $CTL_LISTEN && defined fileno($CTL_LISTEN) && $fd == fileno($CTL_LISTEN);
+    return 1 if $CTL_CLIENT{$fd};
+    return 0;
+}
+
+sub _ctl_note {
+    if ($CTL_LISTEN && defined fileno($CTL_LISTEN)) {
+        vec($_[0], fileno($CTL_LISTEN), 1) = 1;
+    }
+    for my $c (values %CTL_CLIENT) {
+        next unless $c->{fh};
+        my $fd = fileno($c->{fh});
+        next unless defined $fd;
+        vec($_[0], $fd, 1) = 1;
+        vec($_[1], $fd, 1) = 1 if length($c->{out} // '');
+    }
+}
+
+sub ctl_drop {
+    my ($c) = @_;
+    return unless $c && $c->{fh};
+    my $fd = fileno($c->{fh});
+    $select->remove($c->{fh});
+    delete $CTL_CLIENT{$fd} if defined $fd;
+    close $c->{fh};
+    $c->{fh}  = undef;
+    $c->{out} = '';
+}
+
+sub ctl_flush {
+    my ($c) = @_;
+    return unless $c && $c->{fh} && length($c->{out} // '');
+    while (length $c->{out}) {
+        my $n = syswrite($c->{fh}, $c->{out});
+        if (!defined $n) {
+            return if $! == EAGAIN || $! == EWOULDBLOCK;
+            ctl_drop($c);
+            return;
+        }
+        last if $n == 0;
+        substr($c->{out}, 0, $n, '');
+    }
+    ctl_drop($c) if $c->{fh} && !length($c->{out} // '');
+}
+
+sub ctl_read {
+    my ($c) = @_;
+    return unless $c && $c->{fh};
+    my $n = sysread($c->{fh}, my $buf, 1024);
+    if (!defined $n) {
+        return if $! == EAGAIN || $! == EWOULDBLOCK;
+        ctl_drop($c);
+        return;
+    }
+    if ($n == 0) {
+        ctl_drop($c) unless length($c->{out} // '');
+        return;
+    }
+    $c->{in} .= $buf;
+    if (length($c->{in}) > 1024 && index($c->{in}, "\n") < 0) {
+        $c->{out} = "error bad value\n";
+        $c->{in}  = '';
+        ctl_flush($c);
+        return;
+    }
+    my $at = index($c->{in}, "\n");
+    return if $at < 0;
+    my $line = substr($c->{in}, 0, $at + 1);
+    $c->{in}  = '';
+    $c->{out} = ctl_reply($line);
+    ctl_flush($c);
+}
+
+sub ctl_accept {
+    return unless $CTL_LISTEN;
+    while (1) {
+        my $fh = $CTL_LISTEN->accept();
+        last unless $fh;
+        $fh->blocking(0);
+        if (scalar(keys %CTL_CLIENT) >= 4) {
+            syswrite($fh, "error busy\n");
+            close $fh;
+            next;
+        }
+        $select->add($fh);
+        my $fd = fileno($fh);
+        next unless defined $fd;
+        $CTL_CLIENT{$fd} = { fh => $fh, in => '', out => '' };
+    }
+}
+
+sub _ctl_dispatch {
+    my ($rin, $win) = @_;
+    if ($CTL_LISTEN && defined fileno($CTL_LISTEN) && vec($rin, fileno($CTL_LISTEN), 1)) {
+        ctl_accept();
+    }
+    for my $id (keys %CTL_CLIENT) {
+        my $c = $CTL_CLIENT{$id} or next;
+        my $fd = fileno($c->{fh});
+        next unless defined $fd;
+        ctl_read($c) if vec($rin, $fd, 1);
+        $c = $CTL_CLIENT{$id} or next;
+        ctl_flush($c) if length($c->{out} // '') && $win && vec($win, $fd, 1);
+    }
+}
+
+sub ctl_listen {
+    my $path = ctl_socket_path();
+    return unless defined $path && $path ne '';
+    return if $CTL_LISTEN;
+    my $dir = dirname($path);
+    make_path($dir, { mode => 0755 }) if $dir ne '' && !-d $dir;
+    if (-e $path) {
+        my $probe = IO::Socket::UNIX->new(Type => SOCK_STREAM, Peer => $path);
+        if ($probe) {
+            close $probe;
+            log_warn('ctl socket in use');
+            return;
+        }
+        unlink $path;
+    }
+    my $old = umask 0177;
+    my $srv = IO::Socket::UNIX->new(
+        Type   => SOCK_STREAM,
+        Local  => $path,
+        Listen => 4,
+    );
+    umask $old;
+    unless ($srv) {
+        log_warn("ctl listen: $!");
+        return;
+    }
+    $srv->blocking(0);
+    $CTL_LISTEN = $srv;
+    $select->add($srv);
+    log_info("ctl $path");
+}
+
+sub ctl_close {
+    for my $id (keys %CTL_CLIENT) {
+        ctl_drop($CTL_CLIENT{$id});
+    }
+    if ($CTL_LISTEN) {
+        $select->remove($CTL_LISTEN);
+        close $CTL_LISTEN;
+        $CTL_LISTEN = undef;
+    }
+    my $path = ctl_socket_path();
+    unlink $path if defined $path && $path ne '' && -S $path;
+}
+
 sub graceful_shutdown {
     my ($sig) = @_;
     request_shutdown($sig);
 }
 
 sub main_loop {
+    ctl_listen();
     log_info('entering main loop (' . scalar(keys %conns) . ' connection(s))');
     my $failures = 0;
     while (1) {
@@ -6709,6 +7104,7 @@ sub reset_track_for_test {
     $shutdown_reason  = '';
     $shutdown_waiting = 0;
     $SHUTDOWN         = 0;
+    $CTL_PAUSE        = 0;
 }
 
 sub reset_conn_time_for_test { %CONN_TIME = (); }
