@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 14 2026 $
+.Dd $Mdocdate: November 15 2026 $
 .Dt IMAPIDLE 1
 .Os
 .Sh NAME
@@ -436,6 +436,9 @@ A random value modulo X is added so those mailboxes do not wake
 together.
 A mailbox that is due does not busy-wait while its channel
 is already syncing, or while every slot is in use.
+A
+.Cm STATUS
+already waiting on the server is left to finish.
 The loop sleeps, and a child exit wakes it.
 The wait stays between 10 minutes and 6 hours.
 With new mail the wait aims for about 5 messages and is at least
@@ -457,6 +460,15 @@ A failed
 .Cm STATUS
 closes that connection and syncs the mailbox
 instead of asking again immediately.
+On shutdown the next wake, the interval, and
+.Cm UIDNEXT
+are written with the time the next folder list is due.
+A later start uses those clocks.
+It still logs in, idles each configured folder, and syncs
+those folders once.
+The folder list and a tracked
+.Cm STATUS
+wait until the saved times.
 A name containing a colon is remembered and not synced: the command
 splits on the first colon.
 A folder the server no longer lists is not tried again until a later
@@ -662,6 +674,15 @@ as
 .It Pa ~/.local/imapidle/folders/
 One file per channel.
 One mailbox name per line, as the server spelled it.
+.It Pa ~/.local/imapidle/track
+The next wake, the interval, and
+.Cm UIDNEXT
+of each tracked mailbox, and when the next folder list is due.
+Written on shutdown.
+A later start uses those clocks.
+The file mode is 0600 when
+.Nm
+creates it.
 .It Pa ~/.local/imapidle/mbsync-real
 How many times each
 .Sy mbsync

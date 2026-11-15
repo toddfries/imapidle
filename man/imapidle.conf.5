@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 14 2026 $
+.Dd $Mdocdate: November 15 2026 $
 .Dt IMAPIDLE.CONF 5
 .Os
 .Sh NAME
@@ -614,6 +614,15 @@ The file mode is 0600 when
 creates it.
 .It Pa ~/.local/imapidle/folders/
 One file per channel, one mailbox name per line.
+.It Pa ~/.local/imapidle/track
+The next wake, the interval, and
+.Cm UIDNEXT
+of each tracked mailbox, and when the next folder list is due.
+Written on shutdown.
+A later start uses those clocks.
+The file mode is 0600 when
+.Nm imapidle
+creates it.
 .It Pa ~/.local/imapidle/mbsync-real
 Count and total real seconds for each
 .Sy mbsync

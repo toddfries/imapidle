@@ -56,6 +56,7 @@ my %children;
 my %pulse_next;
 my %PULSE_LAST;
 my $PULSE_LAST_FILE;
+my $TRACK_FILE;
 my $pulse_cfg = { disabled => 0, sweep => 3600, channels => [] };
 my $track_cfg;
 my %track;
@@ -777,6 +778,7 @@ sub _encode_box {
     $name =~ s/\\/\\\\/g;
     $name =~ s/\r/\\r/g;
     $name =~ s/\n/\\n/g;
+    $name =~ s/\t/\\t/g;
     return $name;
 }
 
@@ -785,6 +787,7 @@ sub _decode_box {
     $name =~ s/\\\\/\0/g;
     $name =~ s/\\n/\n/g;
     $name =~ s/\\r/\r/g;
+    $name =~ s/\\t/\t/g;
     $name =~ s/\0/\\/g;
     return $name;
 }
@@ -874,9 +877,10 @@ sub apply_folder_list {
             samples  => [],
             fails    => 0,
         } unless $track{$id};
-        # A name already tracked keeps its clock. A brand-new list and
-        # a name that appeared later both start at initial.
-        $track{$id}{next} = $now + $track_cfg->{initial} if $added || $fresh;
+        # A name already tracked keeps its clock, including one
+        # restored from the track file. A name that appeared later
+        # starts at initial.
+        $track{$id}{next} = $now + $track_cfg->{initial} if $added;
     }
     for my $id (keys %track) {
         my ($ch) = split /\0/, $id, 2;
@@ -1060,6 +1064,83 @@ sub load_stat_files {
 sub save_stat_files {
     _stat_save($MBSYNC_REAL_FILE, \%MBSYNC_REAL) if defined $MBSYNC_REAL_FILE;
     _stat_save($CONN_TIME_FILE,   \%CONN_TIME)   if defined $CONN_TIME_FILE;
+}
+
+# Next wake, interval, and UIDNEXT, plus when LIST is next due.
+# Written on shutdown so a restart does not STATUS the herd together.
+sub save_track_file {
+    return unless defined $TRACK_FILE && $TRACK_FILE ne '';
+    my $dir = dirname($TRACK_FILE);
+    make_path($dir, { mode => 0700 }) if $dir ne '' && $dir ne '.';
+    my $old = umask 077;
+    open my $fh, '>', $TRACK_FILE or do {
+        umask $old;
+        log_error("Cannot write $TRACK_FILE: $!");
+        return;
+    };
+    print $fh "# list\tchannel\twhen\n";
+    print $fh "# box\tchannel\tmailbox\tnext\tinterval\tuidnext\n";
+    for my $ch (sort keys %list_next) {
+        next if !defined $ch || $ch eq '' || $ch =~ /[\s\\\/]/;
+        my $when = $list_next{$ch};
+        next unless defined $when && $when =~ /^\d+(?:\.\d+)?\z/;
+        print $fh "list\t$ch\t", _stat_num($when), "\n";
+    }
+    for my $id (sort keys %track) {
+        my ($ch, $box) = split /\0/, $id, 2;
+        next if !defined $ch || $ch eq '' || $ch =~ /[\s\\\/]/;
+        next if !defined $box || $box eq '' || index($box, ':') >= 0;
+        my $rec = $track{$id} or next;
+        my $next = $rec->{next};
+        my $interval = $rec->{interval};
+        next unless defined $next && $next =~ /^\d+(?:\.\d+)?\z/;
+        next unless defined $interval && $interval =~ /^\d+(?:\.\d+)?\z/;
+        my $uid = '';
+        $uid = $rec->{uidnext}
+            if defined $rec->{uidnext} && $rec->{uidnext} =~ /^\d+\z/;
+        print $fh join("\t",
+            'box', $ch, _encode_box($box),
+            _stat_num($next), _stat_num($interval), $uid,
+        ), "\n";
+    }
+    close $fh;
+    umask $old;
+}
+
+sub load_track_file {
+    return unless defined $TRACK_FILE && -f $TRACK_FILE;
+    open my $fh, '<', $TRACK_FILE or return;
+    while (<$fh>) {
+        chomp;
+        next if /^\s*#/ || /^\s*$/;
+        my ($kind, @f) = split /\t/, $_, -1;
+        next unless defined $kind;
+        if ($kind eq 'list') {
+            my ($ch, $when) = @f;
+            next unless defined $ch && $ch ne '' && $ch !~ /[\s\\\/]/;
+            next unless defined $when && $when =~ /^\d+(?:\.\d+)?\z/;
+            $list_next{$ch} = $when + 0;
+            next;
+        }
+        next unless $kind eq 'box';
+        my ($ch, $box, $next, $interval, $uid) = @f;
+        next unless defined $ch && $ch ne '' && $ch !~ /[\s\\\/]/;
+        next unless defined $box && $box ne '';
+        $box = _decode_box($box);
+        next if $box eq '' || index($box, ':') >= 0;
+        next unless defined $next && $next =~ /^\d+(?:\.\d+)?\z/;
+        next unless defined $interval && $interval =~ /^\d+(?:\.\d+)?\z/;
+        my $id = _track_key($ch, $box);
+        $track{$id} = {
+            interval => $interval + 0,
+            next     => $next + 0,
+            samples  => [],
+            fails    => 0,
+        };
+        $track{$id}{uidnext} = $uid + 0
+            if defined $uid && $uid =~ /^\d+\z/;
+    }
+    close $fh;
 }
 
 sub note_conn_time {
@@ -4901,6 +4982,7 @@ sub _release_imap_sessions {
 sub _close_for_shutdown {
     _release_imap_sessions();
     save_stat_files();
+    save_track_file();
     my $dir = $STATE_DIR;
     if (!defined $dir || $dir eq '') {
         $dir = (defined $ENV{HOME} && $ENV{HOME} ne '') ? "$ENV{HOME}/.local/imapidle" : '.local/imapidle';
@@ -5137,18 +5219,30 @@ my $LIVE = 1;
 
 sub set_live_for_test { $LIVE = $_[0] ? 1 : 0; }
 
+# A STATUS read waits inside this pump. A nested pump writes another
+# command and never reads the reply, which is what pegged the CPU.
+my $PUMP_DEPTH = 0;
+
 sub pump_schedule {
     my ($now) = @_;
     return unless $LIVE;
-    $now //= time();
-    my $phase = shutdown_phase();
-    return if $phase;
-    return if _pause_gate();
-    for my $job (due_mbsync_jobs($now, slots_for_hot($now))) {
-        trigger_mbsync($job->{wait}, @{ $job->{args} });
-    }
-    pump_tracked($now);
-    pump_pulse($now);
+    return if $PUMP_DEPTH;
+    $PUMP_DEPTH++;
+    my $err;
+    eval {
+        $now //= time();
+        my $phase = shutdown_phase();
+        unless ($phase || _pause_gate()) {
+            for my $job (due_mbsync_jobs($now, slots_for_hot($now))) {
+                trigger_mbsync($job->{wait}, @{ $job->{args} });
+            }
+            pump_tracked($now);
+            pump_pulse($now);
+        }
+        1;
+    } or $err = $@ || 'pump failed';
+    $PUMP_DEPTH--;
+    die $err if $err;
 }
 
 # Server keepalive and command replies are not mail. EXISTS, EXPUNGE,
@@ -5974,6 +6068,8 @@ sub open_state_dir {
         if !defined $CONN_TIME_FILE || $CONN_TIME_FILE eq '';
     $PULSE_LAST_FILE = "$STATE_DIR/pulse-last"
         if !defined $PULSE_LAST_FILE || $PULSE_LAST_FILE eq '';
+    $TRACK_FILE = "$STATE_DIR/track"
+        if !defined $TRACK_FILE || $TRACK_FILE eq '';
     my $known   = "$STATE_DIR/known_hosts";
     my $learned = "$STATE_DIR/learned";
     if (defined $CONFIG_DIR && $CONFIG_DIR ne '') {
@@ -5984,6 +6080,7 @@ sub open_state_dir {
     $LEARNED     = $learned;
     load_folder_files();
     load_stat_files();
+    load_track_file();
     _pulse_last_load();
     _apply_pulse_last();
 }
@@ -6238,8 +6335,10 @@ sub set_state_dir_for_test {
     $MBSYNC_REAL_FILE = "$dir/mbsync-real";
     $CONN_TIME_FILE   = "$dir/conn-time";
     $PULSE_LAST_FILE  = "$dir/pulse-last";
+    $TRACK_FILE       = "$dir/track";
     $KNOWN_HOSTS      = "$dir/known_hosts";
     $LEARNED          = "$dir/learned";
+    load_track_file();
     _pulse_last_load();
     _apply_pulse_last();
 }
@@ -6299,6 +6398,7 @@ sub track_rows_for_test {
             box      => $box,
             interval => $rec->{interval},
             next     => $rec->{next},
+            uidnext  => $rec->{uidnext},
             fails    => $rec->{fails} // 0,
             samples  => scalar @{ $rec->{samples} // [] },
         };
@@ -6337,6 +6437,16 @@ sub set_track_due_for_test {
 sub list_next_for_test {
     return unless exists $list_next{ $_[0] };
     return $list_next{ $_[0] };
+}
+
+sub set_list_next_for_test { $list_next{ $_[0] } = $_[1]; }
+
+sub set_track_uid_for_test {
+    my ($channel, $box, $uid, $interval) = @_;
+    my $id = _track_key($channel, $box);
+    return unless $track{$id};
+    $track{$id}{uidnext}  = $uid if defined $uid;
+    $track{$id}{interval} = $interval if defined $interval;
 }
 
 sub folder_names_for_test {

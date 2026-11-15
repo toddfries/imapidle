@@ -536,6 +536,106 @@ clear_children_for_test();
 clear_conns_for_test();
 reset_track_for_test();
 
+# A probe's own wait used to call pump again and write STATUS forever.
+{
+    package ReenterIMAP;
+    sub new { bless { cmds => 0, done => 0, idle => 0 }, shift }
+    sub IsConnected { 1 }
+    sub LastError   { '' }
+    sub done { $_[0]->{done}++; return 'A1 OK DONE' }
+    sub idle { $_[0]->{idle}++; return 'A2' }
+    sub tag_and_run {
+        my ($self, $cmd) = @_;
+        $self->{cmds}++;
+        main::pump_schedule(time()) if $self->{cmds} == 1;
+        return (qq{* STATUS "Quiet" (MESSAGES 0 UIDNEXT 4)\n}, 'A OK');
+    }
+    sub logout { }
+}
+package main;
+reset_schedule_for_test();
+reset_track_for_test();
+set_connections_for_test(4);
+set_next_try_for_test($_, time() + 100000) for account_names();
+my $re_now = time();
+set_track_due_for_test('fdc', 'Quiet', $re_now - 1);
+my $re_imap = ReenterIMAP->new;
+set_primary_for_test('probeacct', 'fdc', $re_imap, 'IDLE');
+my @re_forked;
+set_trigger_hook_for_test(sub {
+    my ($wait, $args, $meta) = @_;
+    push @re_forked, $args->[0];
+    return 0;
+});
+pump_schedule($re_now);
+is($re_imap->{cmds}, 1, 'a STATUS wait does not start another pump');
+is_deeply(\@re_forked, [], 'that nested pump does not sync');
+my ($re_row) = grep { $_->{box} eq 'Quiet' } track_rows_for_test();
+cmp_ok($re_row->{next} - $re_now, '>=', 86399, 'the probed mailbox still parks');
+set_track_due_for_test('fdc', 'Next', $re_now - 1);
+pump_schedule($re_now);
+is($re_imap->{cmds}, 2, 'the following pump may probe again');
+my $re_delay = next_track_delay($re_now);
+ok(!defined $re_delay || $re_delay > 0, 'parked mailboxes do not busy-poll');
+set_trigger_hook_for_test(undef);
+clear_children_for_test();
+clear_conns_for_test();
+reset_track_for_test();
+
+# Shutdown stores the mailbox clock and the LIST clock.
+{
+    package DieListIMAP;
+    sub folders_hash { die "LIST ran\n" }
+}
+package main;
+my $clock_dir = "$dir/trackstate";
+mkdir $clock_dir;
+set_state_dir_for_test($clock_dir);
+reset_track_for_test();
+my $clock_now = time();
+set_track_due_for_test('fdc', 'Saved', $clock_now + 4000);
+set_track_uid_for_test('fdc', 'Saved', 15, 7200);
+set_track_due_for_test('fdc', "Odd\tName", $clock_now + 50);
+set_track_uid_for_test('fdc', "Odd\tName", 0, 600);
+set_track_due_for_test('fdc', 'a:b', $clock_now + 10);
+set_list_next_for_test('fdc', $clock_now + 80000);
+save_track_file();
+reset_track_for_test();
+load_track_file();
+my ($saved_row) = grep { $_->{box} eq 'Saved' } track_rows_for_test();
+is($saved_row->{next}, $clock_now + 4000, 'a saved wake is restored');
+is($saved_row->{interval}, 7200, 'a saved interval is restored');
+is($saved_row->{uidnext}, 15, 'a saved UIDNEXT is restored');
+my ($odd_row) = grep { $_->{box} eq "Odd\tName" } track_rows_for_test();
+is($odd_row->{uidnext}, 0, 'a zero UIDNEXT is restored');
+ok((!grep { $_->{box} eq 'a:b' } track_rows_for_test()),
+    'a colon name is not stored');
+is(list_next_for_test('fdc'), $clock_now + 80000, 'the LIST clock is restored');
+my $list_err = '';
+eval {
+    consider_list(
+        'acct',
+        { mbsync_channel => 'fdc', folders => [] },
+        bless({}, 'DieListIMAP'),
+        $clock_now,
+    );
+    1;
+} or $list_err = $@;
+is($list_err, '', 'a future LIST clock does not list');
+mkdir "$clock_dir/folders";
+open my $names, '>', "$clock_dir/folders/fdc" or die "folder file: $!";
+print $names "Saved\n";
+close $names;
+_load_folder_file('fdc');
+apply_folder_list('fdc', ['Saved', 'Newbox'], { INBOX => 1 }, 1, $clock_now);
+($saved_row) = grep { $_->{box} eq 'Saved' } track_rows_for_test();
+is($saved_row->{next}, $clock_now + 4000, 'a later list keeps the saved wake');
+is($saved_row->{uidnext}, 15, 'a later list keeps the saved UIDNEXT');
+my ($new_row) = grep { $_->{box} eq 'Newbox' } track_rows_for_test();
+is($new_row->{next}, $clock_now + 1800, 'a new mailbox still starts at initial');
+reset_track_for_test();
+set_state_dir_for_test("$dir/state");
+
 # --- queue, pause, shutdown ---
 
 is(load_config(write_conf(<<'EOF')), '', 'queue fixture loads');
