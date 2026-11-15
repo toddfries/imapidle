@@ -5162,16 +5162,27 @@ sub next_track_delay {
     my ($now) = @_;
     $now //= time();
     my $wait;
-    unless ($track_cfg->{disabled}) {
+    # An overdue folder that cannot start must not make the select
+    # timeout 0. No free slot, or the channel is already syncing.
+    # A child exit wakes the sleep.
+    unless ($track_cfg->{disabled} || slots_for_cold($now) <= 0) {
         for my $id (keys %track) {
-            my $d = ($track{$id}{next} // 0) - $now;
+            my $rec = $track{$id} or next;
+            my $d = ($rec->{next} // 0) - $now;
+            if ($d <= 0) {
+                my ($ch, $box) = split /\0/, $id, 2;
+                next if !defined $ch || !defined $box || $box eq '';
+                next if tracked_deferred($ch, $box, $now);
+            }
             $d = 0 if $d < 0;
             $wait = $d if !defined $wait || $d < $wait;
         }
     }
     for my $ch (keys %list_next) {
         my $d = ($list_next{$ch} // 0) - $now;
-        $d = 0 if $d < 0;
+        # Already due: housekeeping lists on the next wake. A 0 here
+        # busy-polls until that list lands.
+        next if $d <= 0;
         $wait = $d if !defined $wait || $d < $wait;
     }
     my %rows = load_learned();
@@ -5180,7 +5191,7 @@ sub next_track_delay {
             my $when = $row->{$k};
             next unless defined $when && $when =~ /^\d+(?:\.\d+)?\z/;
             my $d = $when - $now;
-            $d = 0 if $d < 0;
+            next if $d <= 0;
             $wait = $d if !defined $wait || $d < $wait;
         }
     }

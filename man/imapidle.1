@@ -434,6 +434,9 @@ When the new wait is longer, one quarter of the added seconds
 is X.
 A random value modulo X is added so those mailboxes do not wake
 together.
+A mailbox that is due does not busy-wait while its channel
+is already syncing, or while every slot is in use.
+The loop sleeps, and a child exit wakes it.
 The wait stays between 10 minutes and 6 hours.
 With new mail the wait aims for about 5 messages and is at least
 three times the average sync of that mailbox.

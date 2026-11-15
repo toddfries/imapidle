@@ -363,6 +363,28 @@ is($slowbox->{samples}, 1, 'a non-zero exit with a summary is a sample');
 is($slowbox->{fails}, 0, 'a summary clears the failure streak');
 is(list_next_for_test('fdc'), 0, 'a non-zero tracked exit asks for LIST');
 
+reset_track_for_test();
+reset_schedule_for_test();
+set_next_try_for_test($_, time() + 10000) for account_names();
+{
+    my $ps = pulse_snapshot_for_test();
+    set_pulse_next_for_test($_, time() + 10000) for @{ $ps->{channels} // [] };
+}
+set_track_due_for_test('fdc', 'Quiet', time() - 1);
+is(loop_timeout(), 0, 'a tracked folder that can start wakes the loop');
+set_connections_for_test(1);
+hold_child_for_test(4242, 'mbsync other:Box');
+cmp_ok(loop_timeout(), '>=', 29, 'a due tracked folder with no free slot does not spin');
+clear_children_for_test();
+set_connections_for_test(4);
+hold_child_for_test(4243, 'mbsync fdc:Other');
+cmp_ok(loop_timeout(), '>=', 29, 'a due tracked folder waits while its channel is busy');
+clear_children_for_test();
+set_track_due_for_test('fdc', 'Quiet', time() + 10);
+my $track_wait = loop_timeout();
+cmp_ok($track_wait, '>', 8, 'the loop wakes for a tracked folder');
+cmp_ok($track_wait, '<=', 10, 'the loop does not sleep past that folder');
+
 # --- queue, pause, shutdown ---
 
 is(load_config(write_conf(<<'EOF')), '', 'queue fixture loads');
