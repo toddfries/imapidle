@@ -440,6 +440,19 @@ The loop sleeps, and a child exit wakes it.
 The wait stays between 10 minutes and 6 hours.
 With new mail the wait aims for about 5 messages and is at least
 three times the average sync of that mailbox.
+Before that run, the primary connection sends
+.Cm STATUS
+for
+.Cm MESSAGES
+and
+.Cm UIDNEXT .
+No messages, including the first answer, waits a day
+and does not sync.
+A count above zero, or a changed
+.Cm UIDNEXT ,
+runs
+.Sy mbsync
+and then follows the interval above.
 A name containing a colon is remembered and not synced: the command
 splits on the first colon.
 A folder the server no longer lists is not tried again until a later

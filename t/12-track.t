@@ -47,6 +47,7 @@ is($cfg->{connections}, 2, 'the mbsync cap defaults to 2');
 is($cfg->{min}, 600, 'the floor defaults to 10 minutes');
 is($cfg->{messages}, 5, 'the message target defaults to 5');
 is($cfg->{initial}, 1800, 'the first interval defaults to 30 minutes');
+is($cfg->{empty}, 86400, 'an empty mailbox waits a day');
 ok((!grep { $_ eq 'track' } account_names()), 'track is not an account');
 
 my $over = write_conf(<<'EOF');
@@ -71,6 +72,19 @@ is($cfg->{connections}, 3, 'a set key overrides the default');
 is($cfg->{min}, 120, 'min is overridden');
 is($cfg->{list}, 259200, 'an omitted key keeps its default');
 is_deeply([account_names()], ['acct'], 'the track section is not connected');
+
+like(load_config(write_conf(<<'EOF')), qr/\[track\] bad empty/, 'empty below 60 is rejected');
+[acct]
+type = idle
+server = imap.example.com
+user = a@example.com
+pass = secret
+mbsync_channel = ch
+folder0 = INBOX
+[track]
+type = global
+empty = 10
+EOF
 
 like(load_config(write_conf(<<'EOF')), qr/\[track\] bad min/, 'min below 60 is rejected');
 [acct]
@@ -384,6 +398,97 @@ set_track_due_for_test('fdc', 'Quiet', time() + 10);
 my $track_wait = loop_timeout();
 cmp_ok($track_wait, '>', 8, 'the loop wakes for a tracked folder');
 cmp_ok($track_wait, '<=', 10, 'the loop does not sleep past that folder');
+
+# --- STATUS before mbsync ---
+
+is_deeply(
+    [parse_status_counts(qq{* STATUS "Empty" (UIDNEXT 5 MESSAGES 0)\nA OK STATUS})],
+    [0, 5],
+    'STATUS counts accept either order',
+);
+ok(!defined parse_status_counts('* STATUS "Empty" (MESSAGES 0)'),
+    'a STATUS without UIDNEXT is not a count');
+ok(status_stays_empty(0, 5, undef), 'the first zero-message look waits');
+ok(status_stays_empty(0, 5, 5), 'the same UIDNEXT keeps waiting');
+ok(!status_stays_empty(0, 6, 5), 'a moved UIDNEXT syncs');
+ok(!status_stays_empty(2, 5, 5), 'messages above zero sync');
+
+{
+    package StatusIMAP;
+    sub new {
+        my ($class, $replies) = @_;
+        return bless { replies => $replies, cmds => [], idle => 0, done => 0 }, $class;
+    }
+    sub IsConnected { 1 }
+    sub LastError   { '' }
+    sub done        { $_[0]->{done}++; return ('A1 OK DONE'); }
+    sub idle        { $_[0]->{idle}++; return 'A2'; }
+    sub tag_and_run {
+        my ($self, $cmd) = @_;
+        push @{ $self->{cmds} }, $cmd;
+        my ($box) = $cmd =~ /STATUS "((?:\\.|[^"\\])*)"/;
+        $box =~ s/\\"/"/g if defined $box;
+        $box =~ s/\\\\/\\/g if defined $box;
+        my $lines = $self->{replies}{$box // ''} // [];
+        return @$lines;
+    }
+}
+
+reset_track_for_test();
+reset_schedule_for_test();
+clear_children_for_test();
+clear_conns_for_test();
+my $status_now = time();
+set_track_due_for_test('fdc', 'Empty', $status_now - 1);
+set_track_due_for_test('fdc', 'Full', $status_now - 1);
+my $status_imap = StatusIMAP->new({
+    Empty => [qq{* STATUS "Empty" (MESSAGES 0 UIDNEXT 5)\n}, 'A OK'],
+    Full  => [qq{* STATUS "Full" (MESSAGES 3 UIDNEXT 9)\n}, 'A OK'],
+});
+set_primary_for_test('acct', 'fdc', $status_imap, 'IDLE');
+my @status_forked;
+set_trigger_hook_for_test(sub {
+    my ($wait, $args, $meta) = @_;
+    push @status_forked, $args->[0];
+    return hold_child_for_test(73000 + @status_forked, 'mbsync ' . $args->[0]);
+});
+pump_tracked($status_now);
+is_deeply(\@status_forked, ['fdc:Full'], 'an empty mailbox does not run mbsync');
+is($status_imap->{done}, 1, 'IDLE is paused for STATUS');
+is($status_imap->{idle}, 1, 'IDLE resumes after STATUS');
+my ($empty_row) = grep { $_->{box} eq 'Empty' } track_rows_for_test();
+cmp_ok($empty_row->{next} - $status_now, '>=', 86399, 'the empty mailbox waits a day');
+cmp_ok($empty_row->{next} - $status_now, '<=', 86401, 'the empty wait is one day');
+
+clear_children_for_test();
+@status_forked = ();
+set_track_due_for_test('fdc', 'Full', $status_now + 86400);
+set_track_due_for_test('fdc', 'Empty', $status_now - 1);
+pump_tracked($status_now);
+is_deeply(\@status_forked, [], 'the same UIDNEXT still skips mbsync');
+
+clear_children_for_test();
+@status_forked = ();
+$status_imap->{replies}{Empty} = [qq{* STATUS "Empty" (MESSAGES 0 UIDNEXT 8)\n}, 'A OK'];
+set_track_due_for_test('fdc', 'Empty', $status_now - 1);
+pump_tracked($status_now);
+is_deeply(\@status_forked, ['fdc:Empty'], 'a new UIDNEXT runs mbsync');
+
+clear_children_for_test();
+clear_conns_for_test();
+@status_forked = ();
+reset_track_for_test();
+set_track_due_for_test('left', 'One', $status_now - 1);
+set_track_due_for_test('right', 'Two', $status_now - 1);
+my $wide = track_cfg_for_test();
+$wide->{connections} = 4;
+install_track($wide, 0);
+pump_tracked($status_now);
+is_deeply([sort @status_forked], ['left:One', 'right:Two'],
+    'without a primary connection both channels still sync');
+set_trigger_hook_for_test(undef);
+clear_children_for_test();
+clear_conns_for_test();
 
 # --- queue, pause, shutdown ---
 

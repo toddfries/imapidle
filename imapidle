@@ -568,6 +568,7 @@ sub _blank_track {
         id             => 604800,
         capability     => 604800,
         connections    => 2,
+        empty          => 86400,
         tunnel         => 0,
         tunnel_timeout => 3600,
         mbsyncrc       => '',
@@ -585,7 +586,7 @@ sub _parse_track_section {
     my $bad = sub { push @$problems, "[$name] $_[0]"; };
     $cfg->{disabled} = 1 if _config_disabled($row->{disabled});
 
-    for my $key (qw(min messages initial max list id capability connections)) {
+    for my $key (qw(min messages initial max list id capability connections empty)) {
         next unless exists $row->{$key};
         if (!defined $row->{$key} || $row->{$key} !~ /^\d+$/) {
             $bad->("bad $key");
@@ -597,6 +598,7 @@ sub _parse_track_section {
     $bad->('bad list')        if $cfg->{list} < 60;
     $bad->('bad id')          if $cfg->{id} < 60;
     $bad->('bad capability')  if $cfg->{capability} < 60;
+    $bad->('bad empty')       if $cfg->{empty} < 60;
     $bad->('bad messages')    if $cfg->{messages} < 1;
     $bad->('bad connections') if $cfg->{connections} < 1;
     $bad->('bad max')         if $cfg->{max} < $cfg->{min};
@@ -728,6 +730,34 @@ sub id_reply_hash {
 sub capability_hash {
     my (@caps) = @_;
     return sha256_hex(join(' ', sort map { uc $_ } @caps));
+}
+
+sub imap_mailbox {
+    my ($name) = @_;
+    $name = '' unless defined $name;
+    $name =~ s/\\/\\\\/g;
+    $name =~ s/"/\\"/g;
+    return qq{"$name"};
+}
+
+# Untagged STATUS text. Undef when either count is missing.
+sub parse_status_counts {
+    my ($text) = @_;
+    return unless defined $text && $text ne '';
+    my ($messages) = $text =~ /\bMESSAGES\s+(\d+)/i;
+    my ($uidnext)  = $text =~ /\bUIDNEXT\s+(\d+)/i;
+    return unless defined $messages && defined $uidnext;
+    return ($messages + 0, $uidnext + 0);
+}
+
+# A first look with zero messages waits. A later look waits when
+# UIDNEXT is the one we stored. Any mail, or a moved UIDNEXT, syncs.
+sub status_stays_empty {
+    my ($messages, $uidnext, $prev) = @_;
+    return 0 unless defined $messages && $messages == 0;
+    return 0 unless defined $uidnext;
+    return 1 if !defined $prev;
+    return $prev == $uidnext ? 1 : 0;
 }
 
 sub mbsync_new_messages {
@@ -4733,6 +4763,7 @@ sub finish_track_job {
     my ($channel, $box) = split /\0/, $id, 2;
     $list_next{$channel} = 0 if defined $channel && $channel ne '' && $status;
     my $row = $track{$id} or return;
+    $row->{await_sync} = 0;
     my $msgs = mbsync_new_messages($text);
     if (!defined $msgs) {
         $row->{fails} = ($row->{fails} // 0) + 1;
@@ -4872,19 +4903,152 @@ sub request_shutdown {
     _poke_info();
 }
 
+sub _primary_for_channel {
+    my ($channel) = @_;
+    return unless defined $channel && $channel ne '';
+    for my $key (keys %conns) {
+        my $conn = $conns{$key} or next;
+        next unless $conn->{primary} && $conn->{imap};
+        next unless ($conn->{channel} // '') eq $channel;
+        return $conn;
+    }
+    return;
+}
+
+sub _due_unprobed {
+    my ($channel, $now) = @_;
+    my @ids;
+    for my $id (keys %track) {
+        my $rec = $track{$id} or next;
+        next if $rec->{await_sync};
+        next if ($rec->{next} // 0) > $now;
+        my ($ch, $box) = split /\0/, $id, 2;
+        next if !defined $ch || $ch ne $channel;
+        next if !defined $box || $box eq '';
+        push @ids, $id;
+    }
+    return sort @ids;
+}
+
+# Ask the primary connection before spending an mbsync on a mailbox
+# that has nothing in it. One IDLE gap covers a batch, then IDLE resumes.
+sub _probe_channel {
+    my ($conn, $channel, $now) = @_;
+    my @ids = _due_unprobed($channel, $now);
+    return unless @ids;
+    my $limit = 40;
+    @ids = @ids[0 .. $limit - 1] if @ids > $limit;
+    my $imap = $conn->{imap} or return;
+    my $idle = ($conn->{mode} // '') eq 'IDLE';
+    my $empty_n = 0;
+    my $sync_n  = 0;
+    my $gap = $track_cfg->{empty} // 86400;
+    my $ok = eval {
+        if ($idle) {
+            my @done = imap_done($imap, $conn->{tag});
+            _queue_mail_lines($conn, @done);
+            die($imap->LastError // 'not connected') unless imap_connected($imap);
+        }
+        for my $id (@ids) {
+            my $rec = $track{$id} or next;
+            my (undef, $box) = split /\0/, $id, 2;
+            my @resp = grep { defined && $_ ne '' } $imap->tag_and_run(
+                'STATUS ' . imap_mailbox($box) . ' (MESSAGES UIDNEXT)'
+            );
+            my ($messages, $uidnext) = parse_status_counts(join("\n", @resp));
+            if (!defined $messages) {
+                $rec->{await_sync} = 1;
+                $sync_n++;
+                next;
+            }
+            my $prev = $rec->{uidnext};
+            my $was_empty = $rec->{empty} ? 1 : 0;
+            $rec->{uidnext}  = $uidnext;
+            $rec->{messages} = $messages;
+            if (status_stays_empty($messages, $uidnext, $prev)) {
+                $rec->{empty}      = 1;
+                $rec->{await_sync} = 0;
+                $rec->{next}       = $now + $gap;
+                $empty_n++;
+                next;
+            }
+            $rec->{empty}      = 0;
+            $rec->{await_sync} = 1;
+            $sync_n++;
+            log_info("$channel: $box has mail") if $was_empty;
+        }
+        1;
+    };
+    my $err = $@;
+    if ($idle && imap_connected($imap)) {
+        my $tag = eval { $imap->idle() };
+        if ($tag) {
+            $conn->{tag}       = $tag;
+            $conn->{last_idle} = time();
+        } else {
+            log_warn("$conn->{name}: IDLE after STATUS failed: " . scrub($@));
+        }
+    }
+    if (!$ok) {
+        log_warn("$conn->{name}: STATUS probe: " . scrub($err));
+        for my $id (@ids) {
+            my $rec = $track{$id} or next;
+            next if ($rec->{next} // 0) > $now;
+            $rec->{await_sync} = 1;
+        }
+        return;
+    }
+    my $n = $empty_n + $sync_n;
+    log_info("$channel: STATUS $n probed, $empty_n empty, $sync_n sync") if $n;
+}
+
+sub probe_tracked {
+    my ($now) = @_;
+    return if $track_cfg->{disabled};
+    $now //= time();
+    my %channels;
+    for my $id (keys %track) {
+        my $rec = $track{$id} or next;
+        next if $rec->{await_sync};
+        next if ($rec->{next} // 0) > $now;
+        my ($ch) = split /\0/, $id, 2;
+        $channels{$ch} = 1 if defined $ch && $ch ne '';
+    }
+    for my $ch (sort keys %channels) {
+        my $conn = _primary_for_channel($ch) or next;
+        _probe_channel($conn, $ch, $now);
+    }
+}
+
+sub _needs_probe {
+    my ($id, $now) = @_;
+    my $rec = $track{$id} or return 0;
+    return 0 if $rec->{await_sync};
+    return 0 if ($rec->{next} // 0) > $now;
+    my ($ch) = split /\0/, $id, 2;
+    return _primary_for_channel($ch) ? 1 : 0;
+}
+
 sub pump_tracked {
     my ($now) = @_;
     $now //= time();
     return if $track_cfg->{disabled};
+    probe_tracked($now);
+    my %started;
     for my $job (due_tracked($now)) {
         last if slots_for_cold($now) <= 0;
+        next if _needs_probe($job->{id}, $now);
+        next if $started{ $job->{channel} } || channel_busy($job->{channel});
         my $pid = trigger_mbsync(0, "$job->{channel}:$job->{box}", {
             track   => $job->{id},
             capture => 1,
         });
-        if (!$pid) {
+        if ($pid) {
+            $started{ $job->{channel} } = 1;
+        } else {
             my $row = $track{ $job->{id} } or next;
-            $row->{next} = $now + ($track_cfg->{initial} // 1800);
+            $row->{next}       = $now + ($track_cfg->{initial} // 1800);
+            $row->{await_sync} = 0;
         }
     }
 }
@@ -6075,6 +6239,21 @@ sub track_rows_for_test {
         };
     }
     return @rows;
+}
+
+sub set_primary_for_test {
+    my ($name, $channel, $imap, $mode) = @_;
+    my $key = "$name:INBOX";
+    $conns{$key} = {
+        key     => $key,
+        name    => $name,
+        channel => $channel,
+        imap    => $imap,
+        primary => 1,
+        mode    => $mode // 'NOTIFY',
+        tag     => 'A1',
+    };
+    return $key;
 }
 
 sub set_track_due_for_test {

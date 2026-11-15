@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 12 2026 $
+.Dd $Mdocdate: November 14 2026 $
 .Dt IMAPIDLE.CONF 5
 .Os
 .Sh NAME
@@ -395,8 +395,9 @@ Values are whole numbers.
 .Va min ,
 .Va list ,
 .Va id ,
+.Va capability ,
 and
-.Va capability
+.Va empty
 must be at least 60.
 .Va max
 must be at least
@@ -428,6 +429,9 @@ The default is 1800.
 .It Va max
 Longest tracked interval, in seconds.
 The default is 21600.
+.It Va empty
+Seconds before a mailbox with no messages is asked again.
+The default is 86400, one day.
 .It Va list
 Seconds between mailbox lists on the primary IMAP connection.
 The default is 259200, three days.
@@ -516,6 +520,28 @@ The learned interval is kept in memory and starts again from
 .Va initial
 after a restart.
 The mailbox names are what the folder file keeps.
+.Pp
+When a tracked mailbox is due, the primary connection sends
+.Cm STATUS
+for
+.Cm MESSAGES
+and
+.Cm UIDNEXT
+before
+.Sy mbsync
+runs.
+Zero messages and the same
+.Cm UIDNEXT
+wait
+.Va empty
+seconds and do not sync.
+The first answer of zero messages does that too.
+A larger count, or a new
+.Cm UIDNEXT ,
+syncs and then uses the three-sample interval.
+The saved
+.Cm UIDNEXT
+lasts for this process.
 .Pp
 .Pa ~/tmp/pause ,
 .Pa ~/tmp/pause.mail ,
@@ -659,6 +685,7 @@ min = 600
 messages = 5
 initial = 1800
 max = 21600
+empty = 86400
 list = 259200
 id = 604800
 capability = 604800
