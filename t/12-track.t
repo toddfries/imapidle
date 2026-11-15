@@ -138,7 +138,7 @@ open my $fh, '>', $learned or die "write learned: $!";
 print $fh "mail.example:993\trejected\tdovecot-2.2\n";
 close $fh;
 
-is(id_command(), 'ID ("name" "imapidle" "version" "0.1")', 'the ID command is two string pairs');
+is(id_command(), 'ID ("name" "imapidle" "version" "0.2")', 'the ID command is two string pairs');
 
 my $old = SeqIMAP->new(
     ['* ID ("name" "Dovecot" "version" "2.2.36")', 'A1 OK ID completed'],

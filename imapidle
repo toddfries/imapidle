@@ -34,6 +34,7 @@ use POSIX qw(:sys_wait_h :signal_h _exit setsid);
 use Sys::Syslog qw(:standard :macros);
 use Time::HiRes qw(time);
 
+my $VERSION = '0.2';
 my $CONFIG_DIR;
 my $CONFIG_FILE;
 my $SELF_PATH = abs_path($0) // $0;
@@ -709,7 +710,7 @@ sub next_id_interval {
     return int($next);
 }
 
-sub id_command { return 'ID ("name" "imapidle" "version" "0.1")'; }
+sub id_command { return qq{ID ("name" "imapidle" "version" "$VERSION")}; }
 
 sub id_reply_hash {
     my ($line) = @_;
