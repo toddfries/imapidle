@@ -262,6 +262,21 @@ Folders of the same channel that become ready together are one process.
 mbsync channel:INBOX channel:Archive
 .Ed
 .Pp
+A configured
+.Va hook
+runs after that process exits 0.
+One exit runs the command once, not once per folder.
+The same command already running runs once more when it exits,
+not as a second copy at the same time.
+A hook is not an
+.Sy mbsync
+slot, and shutdown does not wait for it.
+A non-zero exit does not run the hook.
+A pause file does not cancel a hook whose
+.Sy mbsync
+already exited.
+The command text is not logged.
+.Pp
 The process is started only after
 .Nm
 is the process that stays.

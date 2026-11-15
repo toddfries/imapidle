@@ -53,6 +53,9 @@ my %accounts;
 my %conns;
 my %sock_to_key;
 my %children;
+my %hook_children;
+my %hook_by_cmd;
+my %hook_again;
 my %pulse_next;
 my %PULSE_LAST;
 my $PULSE_LAST_FILE;
@@ -497,7 +500,7 @@ sub parse_folder_spec {
 }
 
 sub _blank_pulse {
-    return { disabled => 0, sweep => 3600, channels => [] };
+    return { disabled => 0, sweep => 3600, channels => [], hook => '' };
 }
 
 sub _pulse_usable {
@@ -514,7 +517,7 @@ sub _parse_pulse_section {
     return $empty unless ref $row eq 'HASH';
     $name = 'pulse' if !defined $name || $name eq '';
     if (_config_disabled($row->{disabled})) {
-        return { disabled => 1, sweep => 3600, channels => [] };
+        return { disabled => 1, sweep => 3600, channels => [], hook => '' };
     }
 
     my $bad = sub { push @$problems, "[$name] $_[0]"; };
@@ -555,7 +558,12 @@ sub _parse_pulse_section {
             push @channels, $name;
         }
     }
-    return { disabled => 0, sweep => $sweep, channels => \@channels };
+    return {
+        disabled => 0,
+        sweep    => $sweep,
+        channels => \@channels,
+        hook     => _hook_value($row->{hook}),
+    };
 }
 
 sub _blank_track {
@@ -573,6 +581,7 @@ sub _blank_track {
         tunnel         => 0,
         tunnel_timeout => 3600,
         mbsyncrc       => '',
+        hook           => '',
     };
 }
 
@@ -626,6 +635,7 @@ sub _parse_track_section {
     if (defined $row->{mbsyncrc} && $row->{mbsyncrc} ne '') {
         $cfg->{mbsyncrc} = $row->{mbsyncrc};
     }
+    $cfg->{hook} = _hook_value($row->{hook});
     return $cfg;
 }
 
@@ -1426,6 +1436,7 @@ sub parse_config_file {
             role           => $type,
             folders        => \@folders,
             wait           => $wait + 0,
+            hook           => _hook_value($row->{hook}),
             backoff        => 5,
             next_try       => 0,
             fails          => 0,
@@ -1483,6 +1494,7 @@ sub _held_account {
         role            => ($role && $role eq 'passonly') ? 'passonly' : 'idle',
         folders         => [],
         wait            => 0,
+        hook            => _hook_value($row->{hook}),
         backoff         => 5,
         next_try        => 0,
         fails           => 0,
@@ -1507,7 +1519,7 @@ sub install_pulse {
     if ($new->{disabled}) {
         log_info('pulse: disabled') if !$reload || !$old->{disabled};
         %pulse_next = ();
-        $pulse_cfg = { disabled => 1, sweep => 3600, channels => [] };
+        $pulse_cfg = { disabled => 1, sweep => 3600, channels => [], hook => '' };
         return;
     }
 
@@ -1538,6 +1550,7 @@ sub install_pulse {
         disabled => 0,
         sweep    => $new->{sweep},
         channels => [ @{ $new->{channels} } ],
+        hook     => $new->{hook} // '',
     };
     # A fresh start reads pulse-last. Exits recorded only in this process
     # are dropped when that file is absent. SIGHUP keeps the in-memory clock.
@@ -3594,6 +3607,124 @@ sub note_mbsync_real {
 
 sub reset_mbsync_real_for_test { %MBSYNC_REAL = (); }
 
+# Trim a hook command. Blank means the section sets none.
+sub _hook_value {
+    my ($s) = @_;
+    return '' unless defined $s;
+    $s =~ s/^\s+|\s+$//g;
+    return $s;
+}
+
+sub _hook_channel {
+    my ($rec) = @_;
+    my $args = ref $rec eq 'HASH' ? $rec->{args} : undef;
+    return '' unless ref $args eq 'ARRAY' && @$args;
+    my ($ch) = split /:/, ($args->[0] // ''), 2;
+    return '' unless defined $ch && $ch ne '';
+    return $ch;
+}
+
+sub _hook_label {
+    my ($rec) = @_;
+    my $ch = _hook_channel($rec);
+    return $ch ne '' ? $ch : 'hook';
+}
+
+# Account hook for this channel, else the pulse hook when the job is a
+# pulse run, plus the global hook when that text is different.
+# One exit starts each command once.
+sub _hook_commands {
+    my ($rec) = @_;
+    return () unless ref $rec eq 'HASH';
+    my $ch = _hook_channel($rec);
+    my @cmds;
+    my $account_hook = 0;
+    if ($ch ne '') {
+        for my $name (sort keys %accounts) {
+            my $acc = $accounts{$name} or next;
+            next if $acc->{config_disabled};
+            next if ($acc->{mbsync_channel} // '') ne $ch;
+            my $hook = _hook_value($acc->{hook});
+            if ($hook ne '') {
+                push @cmds, $hook;
+                $account_hook = 1;
+            }
+        }
+    }
+    if ($rec->{pulse} && !$account_hook) {
+        my $hook = _hook_value($pulse_cfg->{hook});
+        push @cmds, $hook if $hook ne '';
+    }
+    my $global = _hook_value($track_cfg->{hook});
+    push @cmds, $global if $global ne '';
+    my (%seen, @out);
+    for my $cmd (@cmds) {
+        next if $seen{$cmd}++;
+        push @out, $cmd;
+    }
+    return @out;
+}
+
+# A burst of mailboxes would otherwise start one indexer per exit.
+# The command already running is remembered and started once more.
+sub _start_hook {
+    my ($cmd, $label) = @_;
+    $cmd = _hook_value($cmd);
+    return 0 if $cmd eq '';
+    $label = 'hook' if !defined $label || $label eq '';
+    if (my $running = $hook_by_cmd{$cmd}) {
+        $hook_again{$cmd} = $label;
+        return $running;
+    }
+    my $pid = fork();
+    if (!defined $pid) {
+        log_error("$label: hook fork failed: $!");
+        return 0;
+    }
+    if ($pid == 0) {
+        $SIG{PIPE} = 'IGNORE';
+        $SIG{HUP}  = 'DEFAULT';
+        $SIG{INFO} = 'DEFAULT';
+        $SIG{CHLD} = 'DEFAULT';
+        $SIG{TERM} = 'DEFAULT';
+        $SIG{INT}  = 'DEFAULT';
+        _restore_wake_mask();
+        close_extra_fds();
+        open STDIN,  '<', '/dev/null' or _exit(127);
+        open STDOUT, '>', '/dev/null' or _exit(127);
+        open STDERR, '>', '/dev/null' or _exit(127);
+        exec '/bin/sh', '-c', $cmd or _exit(1);
+    }
+    $hook_children{$pid} = { cmd => $cmd, label => $label };
+    $hook_by_cmd{$cmd} = $pid;
+    log_info("$label: hook");
+    return $pid;
+}
+
+sub _finish_hook {
+    my ($pid, $rec, $status) = @_;
+    my $cmd   = (ref $rec eq 'HASH' ? $rec->{cmd} : '') // '';
+    my $label = (ref $rec eq 'HASH' && ($rec->{label} // '') ne '') ? $rec->{label} : 'hook';
+    delete $hook_by_cmd{$cmd} if $cmd ne '' && ($hook_by_cmd{$cmd} // 0) == $pid;
+    my $how = exit_how($status);
+    if (($status // 0) == 0) {
+        log_info("$label: hook $how");
+    } else {
+        log_warn("$label: hook $how");
+    }
+    my $again = delete $hook_again{$cmd};
+    _start_hook($cmd, $again) if defined $again && $again ne '';
+}
+
+# Exit 0 only. A hook is not an mbsync child and does not hold a slot.
+sub maybe_arm_sync_hooks {
+    my ($rec, $status) = @_;
+    return unless ref $rec eq 'HASH';
+    return unless defined $status && $status == 0;
+    my $label = _hook_label($rec);
+    _start_hook($_, $label) for _hook_commands($rec);
+}
+
 sub reap_children {
     while (1) {
         my $statb = pack('i', 0);
@@ -3609,6 +3740,10 @@ sub reap_children {
         }
         last if $pid == 0;
         my $status = unpack('i', $statb);
+        if (my $hook = delete $hook_children{$pid}) {
+            _finish_hook($pid, $hook, $status);
+            next;
+        }
         my $rec    = delete $children{$pid};
         _unlink_tunnel_cfg($rec);
         my $real   = 0;
@@ -3637,6 +3772,7 @@ sub reap_children {
         }
         finish_pulse_channel($rec->{pulse}) if ref $rec eq 'HASH';
         finish_track_job($rec, $status, $real, $text) if ref $rec eq 'HASH' && $rec->{track};
+        maybe_arm_sync_hooks($rec, $status) if ref $rec eq 'HASH';
     }
 }
 
@@ -6253,11 +6389,18 @@ sub forget_child_for_test {
     delete $children{ $_[0] };
 }
 sub clear_children_for_test { %children = (); }
+sub clear_hooks_for_test {
+    %hook_children = ();
+    %hook_by_cmd   = ();
+    %hook_again    = ();
+}
+sub hook_running_for_test { return scalar keys %hook_children; }
 sub pulse_snapshot_for_test {
     return {
         disabled => $pulse_cfg->{disabled} ? 1 : 0,
         sweep    => $pulse_cfg->{sweep},
         channels => [ @{ $pulse_cfg->{channels} // [] } ],
+        hook     => $pulse_cfg->{hook} // '',
         next     => { %pulse_next },
     };
 }

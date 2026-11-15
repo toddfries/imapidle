@@ -210,6 +210,21 @@ Seconds to sleep inside the
 child before exec.
 The default is 0.
 This does not stall the IMAP loop.
+.It Va hook
+A command passed to
+.Pa /bin/sh
+with
+.Fl c ,
+run after an
+.Sy mbsync
+of this section's channel exits 0.
+One exit runs it once.
+The same command already running runs once more when it exits.
+The command text is not written to the log.
+Standard input, output, and error are discarded.
+A non-zero exit from the hook is logged and does not disable
+the account.
+Unset means no command.
 .It Va folder0 , folder1 , ...
 Mailbox names, starting at
 .Va folder0
@@ -346,6 +361,16 @@ With one slot, pulse waits until the named sync is done.
 A run that takes longer starts its next wait later.
 A channel that is still running is not started a second time.
 The wait starts when that process exits.
+.Pp
+.Va hook
+on this section is a command passed to
+.Pa /bin/sh
+with
+.Fl c .
+It runs when one of these channels exits 0, unless an account
+whose channel is that name has its own
+.Va hook .
+The command text is not logged.
 .Pp
 These runs do not pause IMAP, the 5 second combine window, or a
 different channel.
@@ -498,6 +523,25 @@ when that file exists, otherwise
 .Ev XDG_CONFIG_HOME
 defaults to
 .Pa ~/.config .
+.It Va hook
+A command passed to
+.Pa /bin/sh
+with
+.Fl c ,
+run after every
+.Sy mbsync
+that exits 0.
+An account or pulse
+.Va hook
+for that run also runs when its text differs.
+The same command already running runs once more when it exits.
+Shutdown does not wait for it, and it does not use a connection
+slot.
+The command text is not written to the log.
+.Va disabled
+does not suppress this command.
+An example is
+.Cm notmuch new .
 .El
 .Pp
 Every three finished syncs of one mailbox replace its interval.
