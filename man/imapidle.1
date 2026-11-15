@@ -501,6 +501,31 @@ Each configured folder keeps its own minimum time.
 An event that names a mailbox schedules that folder.
 An event that names none schedules every folder configured for the account.
 .Pp
+A capability list with neither
+.Cm NOTIFY
+nor
+.Cm IDLE
+keeps that one connection and does not select a folder.
+Every
+.Va poll
+seconds, 60 when the account omits the key, it sends
+.Cm STATUS
+.Pq MESSAGES UIDNEXT
+for each configured folder.
+The first look records those counts.
+A later change in the message count or
+.Cm UIDNEXT
+schedules
+.Sy mbsync
+the same way an
+.Cm IDLE
+event does.
+The connection is not an
+.Cm IDLE
+session.
+Shutdown logs it out and does not send
+.Cm DONE .
+.Pp
 Otherwise
 .Nm
 opens one
@@ -541,11 +566,19 @@ says it is due.
 A changed hash requests
 .Cm CAPABILITY
 again and is logged once.
-A host that does not advertise
+A host that advertises
+.Cm IDLE
+but not
 .Cm NOTIFY ,
-or that rejects it, is opened with
+or that rejects
+.Cm NOTIFY ,
+is opened with
 .Cm IDLE
 after that.
+A capability list with neither stays on the single connection above.
+A learned line that does not record that list stays on
+.Cm IDLE
+until the list is seen.
 Later connections do not repeat the discovery and do not send
 .Cm NOTIFY
 again.

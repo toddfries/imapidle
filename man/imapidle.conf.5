@@ -225,6 +225,18 @@ Standard input, output, and error are discarded.
 A non-zero exit from the hook is logged and does not disable
 the account.
 Unset means no command.
+.It Va poll
+Seconds between mailbox checks when the server advertises
+neither
+.Cm IDLE
+nor
+.Cm NOTIFY .
+The default is 60.
+A value below 60 is rejected.
+The account keeps one connection and sends
+.Cm STATUS
+for each configured folder.
+A server that supports either extension ignores this key.
 .It Va folder0 , folder1 , ...
 Mailbox names, starting at
 .Va folder0

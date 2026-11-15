@@ -355,7 +355,7 @@ sub _learned_extra_keys {
     return qw(
         id_hash id_status id_next id_interval id_quiet
         id_changes id_gap_total id_last_change
-        cap_hash cap_next cap_force cap_has_notify
+        cap_hash cap_next cap_force cap_has_notify cap_no_idle
     );
 }
 
@@ -434,9 +434,13 @@ sub server_uses_idle {
 }
 
 sub _log_discovery {
-    my ($name, $notify, $id, $folders) = @_;
+    my ($name, $notify, $id, $folders, $poll) = @_;
     if ($notify eq 'absent') {
-        log_info("$name: server does not advertise NOTIFY, using IDLE");
+        if ($poll) {
+            log_info("$name: server does not advertise NOTIFY or IDLE, polling");
+        } else {
+            log_info("$name: server does not advertise NOTIFY, using IDLE");
+        }
         return;
     }
     log_info("$name: server identified as $id") if defined $id && $id ne '';
@@ -467,8 +471,34 @@ sub remember_discovery {
     delete $row->{cap_has_notify};
     $rows{$host} = $row;
     save_learned(%rows);
-    _log_discovery($name, $notify, $id, $folders);
+    my $poll = $notify eq 'absent' && $row->{cap_no_idle};
+    _log_discovery($name, $notify, $id, $folders, $poll);
     return $notify;
+}
+
+# Neither extension was advertised. Rejected NOTIFY still uses IDLE.
+sub server_needs_poll {
+    my ($server, $port) = @_;
+    my $row = learned_row($server, $port) or return 0;
+    return 0 unless ($row->{notify} // '') eq 'absent';
+    return $row->{cap_no_idle} ? 1 : 0;
+}
+
+sub _store_idle_cap {
+    my ($server, $port, $has_idle, $has_notify) = @_;
+    return unless defined $server && defined $port;
+    my %rows = load_learned();
+    my $host = "$server:$port";
+    my $row = $rows{$host} // { notify => '', id => '' };
+    if ($has_idle || $has_notify) {
+        return unless $row->{cap_no_idle};
+        delete $row->{cap_no_idle};
+    } else {
+        return if $row->{cap_no_idle};
+        $row->{cap_no_idle} = 1;
+    }
+    $rows{$host} = $row;
+    save_learned(%rows);
 }
 
 sub calculate_debounce {
@@ -1170,7 +1200,10 @@ sub _conn_time_key {
     return unless ref $conn eq 'HASH';
     my $name = $conn->{name} // '';
     return if $name eq '';
-    my $what = ($conn->{mode} // '') eq 'NOTIFY' ? 'notify' : ($conn->{folder} // '');
+    my $mode = $conn->{mode} // '';
+    my $what = $mode eq 'NOTIFY' ? 'notify'
+        : $mode eq 'POLL' ? 'poll'
+        : ($conn->{folder} // '');
     return if $what eq '';
     return $name . "\0" . $what;
 }
@@ -1422,6 +1455,14 @@ sub parse_config_file {
 
         my $wait = $row->{wait} // 0;
         $wait = 0 unless $wait =~ /^\d+$/;
+        my $poll = 60;
+        if (exists $row->{poll}) {
+            if (!defined $row->{poll} || $row->{poll} !~ /^\d+$/ || $row->{poll} < 60) {
+                $bad->('bad poll');
+            } else {
+                $poll = $row->{poll} + 0;
+            }
+        }
 
         next if grep { index($_, "[$section]") == 0 } @problems;
 
@@ -1436,6 +1477,7 @@ sub parse_config_file {
             role           => $type,
             folders        => \@folders,
             wait           => $wait + 0,
+            poll           => $poll,
             hook           => _hook_value($row->{hook}),
             backoff        => 5,
             next_try       => 0,
@@ -2939,13 +2981,22 @@ sub consider_capability {
     my @caps = eval { $imap->capability };
     return 0 if $@ || !@caps;
     my $hash = capability_hash(@caps);
-    my $has  = grep { uc($_) eq 'NOTIFY' } @caps;
+    my $has      = grep { uc($_) eq 'NOTIFY' } @caps;
+    my $has_idle = grep { uc($_) eq 'IDLE' } @caps;
     my %rows = load_learned();
     my $host = "$server:$port";
     my $row  = $rows{$host} // { notify => '', id => '' };
     $row->{cap_hash}  = $hash;
     $row->{cap_force} = 0;
     $row->{cap_next}  = $now + ($track_cfg->{capability} // 604800);
+    my $prev_notify = $row->{notify} // '';
+    my $had_poll = $row->{cap_no_idle} ? 1 : 0;
+    if ($has_idle || $has) {
+        delete $row->{cap_no_idle};
+    } else {
+        $row->{cap_no_idle} = 1;
+    }
+    my $has_poll = $row->{cap_no_idle} ? 1 : 0;
     if ($has) {
         $row->{cap_has_notify} = 1;
         $rows{$host} = $row;
@@ -2956,6 +3007,11 @@ sub consider_capability {
     $rows{$host} = $row;
     save_learned(%rows);
     remember_discovery($name, $server, $port, 'absent', $row->{id}, $folders);
+    # An absent row already stored skips the discovery log. The first
+    # capability list with neither extension still has to say so.
+    if ($has_poll && !$had_poll && $prev_notify eq 'absent') {
+        _log_discovery($name, 'absent', $row->{id}, $folders, 1);
+    }
     return 0;
 }
 
@@ -3041,6 +3097,8 @@ sub setup_notification {
         if ($need_cap) {
             my @caps = $imap->capability or return 0;
             my $has_notify = grep { uc($_) eq 'NOTIFY' } @caps;
+            my $has_idle   = grep { uc($_) eq 'IDLE' } @caps;
+            _store_idle_cap($server, $port, $has_idle, $has_notify);
             if (!$has_notify) {
                 remember_discovery($name, $server, $port, 'absent', undef, $folder_list);
                 return 0;
@@ -3188,9 +3246,95 @@ sub adopt_notify {
     log_info("$name: NOTIFY mode, " . scalar(@{ $acc->{folders} }) . ' folder(s)');
 }
 
+sub _poll_interval {
+    my ($acc) = @_;
+    my $n = ($acc && defined $acc->{poll}) ? $acc->{poll} + 0 : 60;
+    return $n < 60 ? 60 : $n;
+}
+
+# One connection, no IDLE. The first STATUS is a baseline. A later
+# change of the count or UIDNEXT schedules mbsync.
+sub adopt_poll {
+    my ($name, $acc, $socket, $imap) = @_;
+    my $every = _poll_interval($acc);
+    register_conn({
+        key          => "$name:POLL",
+        name         => $name,
+        imap         => $imap,
+        mode         => 'POLL',
+        socket       => $socket,
+        channel      => $acc->{mbsync_channel},
+        wait         => $acc->{wait},
+        folders      => $acc->{folders},
+        last_success => time(),
+        poll_next    => 0,
+        seen         => {},
+    });
+    log_info("$name: polling " . scalar(@{ $acc->{folders} }) . " folder(s) every ${every}s");
+}
+
+sub _poll_conn {
+    my ($conn, $now) = @_;
+    return unless $conn && ($conn->{mode} // '') eq 'POLL';
+    return unless $conn->{key} && exists $conns{ $conn->{key} };
+    $now //= time();
+    my $name = $conn->{name} // '';
+    my $acc = $accounts{$name};
+    $conn->{poll_next} = $now + _poll_interval($acc);
+    my $imap = $conn->{imap};
+    unless ($imap && imap_connected($imap)) {
+        drop_conn($conn->{key}, 'poll failed');
+        return;
+    }
+    my $channel = ($acc && $acc->{mbsync_channel}) // $conn->{channel} // '';
+    my $folders = $acc ? $acc->{folders} : $conn->{folders};
+    $folders = [] unless ref $folders eq 'ARRAY';
+    $conn->{seen} = {} unless ref $conn->{seen} eq 'HASH';
+    my $ok = eval {
+        for my $folder (@$folders) {
+            my $box = $folder->{name} // '';
+            next if $box eq '';
+            my @resp = grep { defined && $_ ne '' } $imap->tag_and_run(
+                'STATUS ' . imap_mailbox($box) . ' (MESSAGES UIDNEXT)'
+            );
+            my ($messages, $uidnext) = parse_status_counts(join("\n", @resp));
+            die "STATUS $box\n" unless defined $messages;
+            my $prev = $conn->{seen}{$box};
+            $conn->{seen}{$box} = { messages => $messages, uidnext => $uidnext };
+            next unless $prev;
+            next if ($prev->{messages} // -1) == $messages
+                && ($prev->{uidnext} // -1) == $uidnext;
+            note_mail_event(
+                $channel, $box,
+                $folder->{debounce} // 0,
+                ($acc && defined $acc->{wait}) ? $acc->{wait} : 0,
+                $now,
+            );
+        }
+        1;
+    };
+    return if $ok;
+    log_warn("$name: poll failed: " . scrub($@));
+    drop_conn($conn->{key}, 'poll failed') if exists $conns{ $conn->{key} };
+}
+
+sub next_poll_delay {
+    my ($now) = @_;
+    $now //= time();
+    my $wait;
+    for my $conn (values %conns) {
+        next if ($conn->{mode} // '') ne 'POLL';
+        my $d = ($conn->{poll_next} // 0) - $now;
+        next if $d <= 0;
+        $wait = $d if !defined $wait || $d < $wait;
+    }
+    return $wait;
+}
+
 sub account_covered {
     my ($name) = @_;
     return 1 if $conns{"$name:NOTIFY"};
+    return 1 if $conns{"$name:POLL"};
     my $acc = $accounts{$name} or return 0;
     for my $f (@{ $acc->{folders} }) {
         return 0 unless $conns{"$name:$f->{name}"};
@@ -3376,6 +3520,9 @@ sub connect_account {
             if ($notify) {
                 adopt_notify($name, $acc, $socket, $imap);
                 $conns{"$name:NOTIFY"}{primary} = 1 if $conns{"$name:NOTIFY"};
+            } elsif (server_needs_poll($acc->{server}, $acc->{port})) {
+                adopt_poll($name, $acc, $socket, $imap);
+                $conns{"$name:POLL"}{primary} = 1 if $conns{"$name:POLL"};
             } else {
                 my $folder = $need[0];
                 $imap->select($folder->{name})
@@ -3418,7 +3565,9 @@ sub _settle_account {
 
 sub restart_idle {
     my ($conn) = @_;
-    return 1 if !$conn || ($conn->{mode} // '') eq 'NOTIFY';
+    return 1 unless $conn;
+    my $mode = $conn->{mode} // '';
+    return 1 if $mode eq 'NOTIFY' || $mode eq 'POLL';
     return 0 unless $conn->{imap};
     my $ok = eval {
         if ($conn->{idling}) {
@@ -5547,7 +5696,10 @@ sub housekeeping {
         my $ok = eval {
             $dead = 1 if !$conn->{imap} || !$conn->{imap}->IsConnected;
             # IDLE forbids any command except DONE. NOOP would break the session.
-            if (!$dead && $mode ne 'IDLE') {
+            if (!$dead && $mode eq 'POLL') {
+                _poll_conn($conn, $now) if ($conn->{poll_next} // 0) <= $now;
+                $dead = 1 unless exists $conns{$key};
+            } elsif (!$dead && $mode ne 'IDLE') {
                 $conn->{imap}->noop or $dead = 1;
             }
             1;
@@ -5610,6 +5762,8 @@ sub loop_timeout {
     $wait = $off if defined $off && $off < $wait;
     my $track_wait = next_track_delay($now);
     $wait = $track_wait if defined $track_wait && $track_wait < $wait;
+    my $poll_wait = next_poll_delay($now);
+    $wait = $poll_wait if defined $poll_wait && $poll_wait < $wait;
     # Pause holds the pumps that would clear a due folder. A 0 here
     # busy-polls until that file is removed.
     $wait = 1 if pause_path() && $wait < 1;
@@ -5704,6 +5858,12 @@ sub _retarget_conns {
         $notify->{folders} = $new->{folders};
         $notify->{wait}    = $new->{wait};
         $notify->{channel} = $new->{mbsync_channel};
+    }
+    my $poll = $conns{"$name:POLL"};
+    if ($poll) {
+        $poll->{folders} = $new->{folders};
+        $poll->{wait}    = $new->{wait};
+        $poll->{channel} = $new->{mbsync_channel};
     }
     for my $oldf (@{ $old->{folders} }) {
         my $fname = $oldf->{name};
@@ -5908,6 +6068,7 @@ sub info_lines {
         }
         my @modes;
         push @modes, 'NOTIFY' if $conns{"$name:NOTIFY"};
+        push @modes, 'POLL'   if $conns{"$name:POLL"};
         for my $folder (@{ $acc->{folders} }) {
             push @modes, 'IDLE ' . $folder->{name} if $conns{"$name:$folder->{name}"};
         }
@@ -6456,6 +6617,26 @@ sub plant_notify_for_test {
         channel => $acc->{mbsync_channel},
         wait    => $acc->{wait},
         folders => $acc->{folders},
+    };
+    return $key;
+}
+
+sub plant_poll_for_test {
+    my ($name) = @_;
+    my $acc = $accounts{$name} or return;
+    my $key = "$name:POLL";
+    $conns{$key} = {
+        key          => $key,
+        name         => $name,
+        mode         => 'POLL',
+        channel      => $acc->{mbsync_channel},
+        wait         => $acc->{wait},
+        folders      => $acc->{folders},
+        poll_next    => 0,
+        seen         => {},
+        primary      => 1,
+        started      => time(),
+        last_success => time(),
     };
     return $key;
 }

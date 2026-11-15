@@ -4,7 +4,6 @@ Parked from imap-idle-notify-session-extraction.md. Todd asked for a password co
 
 - Pidfile and an OpenBSD rc.d script. Why: no pidfile yet. Saving: skip rc integration until the foreground run looks right.
 - Max concurrent mbsync processes. Why: forks are unlimited. Saving: a semaphore is unused until more than one account is syncing.
-- Poll fallback for servers without IDLE or NOTIFY. Why: the code tries NOTIFY, then IDLE. Saving: no third mode until those two have been watched against a real server.
 - Trigger only on EXISTS, ignore flag-only events. Why: every drained line can arm mbsync. Saving: filter after a live trace shows which lines matter.
 - Log level switch beyond -d. Why: -d copies every line to stderr. Saving: no second logger until a real run is noisy.
 
