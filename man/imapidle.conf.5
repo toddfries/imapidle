@@ -34,39 +34,45 @@ Every section has a
 .Va type
 of
 .Cm global ,
-.Cm pulse ,
+.Cm server ,
+.Cm account ,
 .Cm idle ,
 or
-.Cm passonly .
+.Cm pulse .
 The comparison ignores case.
 The section name is a label used in log lines.
 At most one
 .Cm global
-section and one
-.Cm pulse
-section are allowed.
+section is allowed.
 A missing
 .Va type ,
 an unknown
 .Va type ,
 or a second
 .Cm global
-or
-.Cm pulse
 section rejects the file.
+.Cm server
+names a host, a port, and how the session is encrypted.
+.Cm account
+holds a login and an
+.Sy mbsync
+channel and does not connect until an
 .Cm idle
-watches mailboxes.
-.Cm passonly
-holds credentials and does not open
-.Cm IDLE
 or
-.Cm NOTIFY .
 .Cm pulse
-names channels that are swept on a timer.
+section names it.
+.Cm idle
+watches mailboxes of one account.
+.Cm pulse
+lists accounts whose mailboxes are swept on a timer.
+More than one
+.Cm pulse
+section is allowed, and each has its own sweep.
 .Cm global
 holds the limits and the tunnel switch.
 See
-.Sx PULSE CHANNELS
+.Sx SERVERS ,
+.Sx PULSE CHANNELS ,
 and
 .Sx TRACKED MAILBOXES .
 .Pp
@@ -87,24 +93,53 @@ are comments.
 Text after a value is not a comment.
 .Pp
 An
+.Cm account
+section, and an
 .Cm idle
-or
-.Cm passonly
-section requires
+section that names
+.Va server
+itself, requires
 .Va server ,
 .Va user ,
-.Va mbsync_channel ,
 and exactly one of
 .Va pass
 or
 .Va pass_cmd .
+That inline
+.Cm idle
+section also requires
+.Va mbsync_channel .
+An
+.Cm account
+section uses its own name when
+.Va mbsync_channel
+is omitted.
+An
+.Cm idle
+section may instead set
+.Va channel
+to an account name and put
+.Va folderN
+there.
+A
+.Cm pulse
+.Va channelN
+value is an account name.
 A missing required key, both
 .Va pass
 and
 .Va pass_cmd ,
-a bad port, an empty
+a bad port, a bad
+.Va proto ,
+an empty
 .Va folderN ,
 a resync time below 60 seconds,
+.Va folderN
+on an
+.Cm account
+or
+.Cm pulse
+section,
 or a bad
 .Cm pulse
 or
@@ -129,10 +164,11 @@ are not accepted.
 .Bl -tag -width "mbsync_channel"
 .It Va type
 .Cm global ,
-.Cm pulse ,
+.Cm server ,
+.Cm account ,
 .Cm idle ,
 or
-.Cm passonly .
+.Cm pulse .
 Required.
 The comparison ignores case.
 .It Va disabled
@@ -141,11 +177,56 @@ Set to
 to keep the section without connecting to it.
 The comparison ignores case.
 .It Va server
-IMAP host name.
-Required.
+On an
+.Cm account
+or an inline
+.Cm idle
+section, either the name of a
+.Cm server
+section or a host name.
+A host name uses implicit TLS on port 993 unless this section
+sets
+.Va port
+or
+.Va proto .
+Required for those logins.
+.It Va host
+Host name of a
+.Cm server
+section.
+Required there.
 .It Va port
 TCP port.
-The default is 993.
+When it is omitted,
+.Cm tls
+uses 993 and
+.Cm starttls
+or
+.Cm notls
+uses 143.
+A port written on the
+.Cm server
+section stays when an account changes
+.Va proto ,
+unless that account also sets
+.Va port .
+.It Va proto
+.Cm tls ,
+.Cm starttls ,
+or
+.Cm notls .
+.Cm tls
+is implicit TLS immediately after TCP and is the default.
+.Cm starttls
+reads the clear greeting, requests STARTTLS, and then uses
+the same certificate checks.
+.Cm notls
+stays cleartext, for a local host or a forwarded port, and
+records no certificate.
+The default is never
+.Cm notls .
+An account may set its own value.
+Any other word rejects the file.
 .It Va user
 IMAP login name.
 Required.
@@ -191,13 +272,39 @@ For
 .Cm xoauth2
 the value is a bearer token.
 The token is not written to the log.
+.It Va channel
+On an
+.Cm idle
+section, the account to watch.
+The idle section name is only a label.
+.Va folderN
+belongs on this section.
+Setting both
+.Va channel
+and
+.Va server
+rejects the file.
+On a
+.Cm pulse
+section the numbered form
+.Va channelN
+names accounts.
+A bare
+.Va channel
+key there rejects the file.
 .It Va mbsync_channel
 Channel name passed to
 .Sy mbsync .
-Required.
+An inline
+.Cm idle
+section requires it.
+An
+.Cm account
+section defaults it to the section name.
 It must match a channel in the
 .Sy mbsync
 configuration.
+Two idle or pulse accounts may not use the same name.
 While
 .Va tunnel
 is off, that file is not read.
@@ -287,12 +394,14 @@ key is present, and only for
 .Cm idle .
 The default mailbox is
 .Cm INBOX .
-A
-.Cm passonly
-section ignores
 .Va folder
-and
-.Va folderN .
+or
+.Va folderN
+on an
+.Cm account
+or
+.Cm pulse
+section rejects the file.
 .It Va priority
 Used only with
 .Va folder ,
@@ -359,74 +468,154 @@ child, after the 5 second wait.
 A batch uses the largest
 .Va wait
 among its folders.
+.Sh SERVERS
+A section with
+.Va type
+.Cm server
+is not connected by itself.
+Other sections name it with
+.Va server .
+It needs
+.Va host .
+.Va proto
+is
+.Cm tls ,
+.Cm starttls ,
+or
+.Cm notls ,
+and
+.Cm tls
+is the default.
+An omitted
+.Va port
+is 993 for
+.Cm tls
+and 143 for the other two.
+A port that is set is used as written.
+An account that names the section may set its own
+.Va port
+or
+.Va proto .
+Changing
+.Va proto
+picks the default port only when neither the account nor the
+server wrote a port.
+A
+.Va server
+value that is not a section name is a host name, with implicit
+TLS on port 993 unless that account sets
+.Va port
+or
+.Va proto .
+.Cm notls
+logs one line that the account is cleartext and skips the
+certificate check.
 .Sh PULSE CHANNELS
 A section with
 .Va type
 .Cm pulse
-names
+names account sections, not bare
 .Sy mbsync
-channels that are not IMAP accounts.
+channels.
 The section may use any name.
-Each non-disabled
-.Cm passonly
-channel is added to this list when it is not already there.
-With no pulse section, and at least one passonly account, a pulse
-is assumed: enabled, sweep 3600, and those channels.
-A disabled pulse section does not run them.
-.Nm
-runs each one as
-.Pa mbsync channel
-with no mailbox argument.
+More than one such section is allowed.
+Each has its own
+.Va sweep .
 .Va channel0 ,
 .Va channel1 ,
 and so on start at 0 and have no gaps.
-A channel name may not contain a space or a colon, and may not start
+Each value is the name of an
+.Cm account
+section.
+A name that is not an account rejects the file.
+The same account on two pulse sections, or on both an idle
+section and a pulse section, rejects the file.
+Two of those accounts may not share one
+.Va mbsync_channel ,
+because the track file keys a mailbox by that channel.
+A value may not contain a space or a colon, and may not start
 with a dash.
-The same name twice is an error.
+The same name twice in one section is an error.
+.Va folderN
+rejects the file.
+.Pp
+The account connects for
+.Cm LIST
+and
+.Cm STATUS
+only.
+It does not enter
+.Cm IDLE .
+Every mailbox that list returns is a pulse mailbox and runs as
+.Pa mbsync channel:box .
+One mailbox of a channel runs at a time.
+Different channels run together, up to the free slots.
 .Pp
 .Va sweep
-is how many seconds that channel waits after its own
+is how many seconds a mailbox that has mail waits after its own
 .Sy mbsync
-exits before it runs again.
+exits.
 The default is 3600.
-Each channel keeps its own clock.
-A channel with no saved exit is due.
-An exit is written to
-.Pa ~/.local/imapidle/pulse-last .
-A later start waits
+The next wake is that exit plus
+.Va sweep ,
+with no extra spread.
+The first time a mailbox is seen with mail, and no earlier exit
+is saved for that channel, the wait is
 .Va sweep
-seconds from that exit, so a restart does not run the channel
-again while the wait remains.
+plus the same quarter spread used by backoff, so a herd of new
+mailboxes does not sync in the same second.
+An exit recorded in
+.Pa ~/.local/imapidle/pulse-last
+seeds only a mailbox that is not already in the track file.
+If that saved time plus
+.Va sweep
+is already past, the mailbox syncs now.
+If it is still ahead, that time is the clock, and no second
+spread is added.
+A mailbox that is already tracked keeps the clock in the track
+file.
+.Pp
+An empty pulse mailbox uses the tracked empty interval and the
+weekly confirmation, not
+.Va sweep .
+See
+.Sx TRACKED MAILBOXES .
+A mailbox that gains mail leaves that class, and
+.Va sweep
+applies from the exit of the sync that finds the mail.
+.Cm STATUS
+runs before each sweep.
+A due
+.Cm STATUS
+does not take an
+.Sy mbsync
+slot.
+The weekly confirmation does, because it runs
+.Sy mbsync .
+.Pp
 Named
 .Va folderN
-mailboxes are queued at startup.
+mailboxes are still queued at startup.
 When
 .Va connections
-is above 1, one slot stays with those folders and pulse uses
-the other slots.
-With one slot, pulse waits until the named sync is done.
-A run that takes longer starts its next wait later.
-A channel that is still running is not started a second time.
-The wait starts when that process exits.
+is above 1 and a pulse mailbox is due to sync, one slot stays
+with those folders and pulse uses the other slots.
+With one slot, that sync waits until the named sync is done.
+When no pulse sync is due, the named folders may use every slot.
+A mailbox that is still running is not started again.
 .Pp
 .Va hook
 on this section is a command passed to
 .Pa /bin/sh
 with
 .Fl c .
-It runs when one of these channels exits 0, unless an account
-whose channel is that name has its own
+It runs when one of these mailboxes exits 0, unless that
+account has its own
 .Va hook .
 The command text is not logged.
 .Pp
 These runs do not pause IMAP, the 5 second combine window, or a
 different channel.
-The same channel does not overlap.
-A bare
-.Pa mbsync
-of that channel and a
-.Ar channel:box
-run wait for each other.
 .Pp
 .Va disabled
 set to
@@ -436,14 +625,15 @@ holds the section.
 and
 .Va channelN
 are not checked while it is held.
+A file that holds only that section still loads.
 Any other value leaves it active.
 .Pp
-On reload, a channel that remains keeps the clock it already has.
-A channel that is new is due immediately.
-A channel that was removed is not started again.
-Changing
+On reload, a mailbox that remains keeps the clock it already has.
+A new
 .Va sweep
-applies the next time a run exits.
+is stored on that mailbox and applies the next time it is
+scheduled.
+A channel that leaves pulse drops the mailboxes this sweep added.
 .Sh TRACKED MAILBOXES
 A section with
 .Va type
@@ -719,12 +909,23 @@ One file per channel, one mailbox name per line.
 .It Pa ~/.local/imapidle/track
 The next wake, the interval, and
 .Cm UIDNEXT
-of each tracked mailbox, and when the next folder list is due.
+of each tracked mailbox, including a pulse mailbox, and when
+the next folder list is due.
 Written on shutdown.
 A later start uses those clocks.
 The file mode is 0600 when
 .Nm imapidle
 creates it.
+.It Pa ~/.local/imapidle/pulse-last
+The last time an
+.Sy mbsync
+of a pulse channel exited.
+One channel and that time per line.
+A mailbox already stored in
+.Pa track
+keeps its own clock.
+A mailbox seen for the first time uses this time as the start
+of its sweep.
 .It Pa ~/.local/imapidle/mbsync-real
 Count and total real seconds for each
 .Sy mbsync
@@ -761,29 +962,31 @@ folder = INBOX
 priority = 3
 .Ed
 .Pp
-A channel that is synced on the pulse clock, with no
-.Cm IDLE
-session.
-Its
+A shared server, a login that does not idle, and a sweep of
+that login's mailboxes.
 .Va mbsync_channel
-is added to the pulse list:
+is omitted, so it is the account name:
 .Bd -literal -offset indent
+[fdh]
+type = server
+host = mail.example.com
+proto = tls
+
 [lists]
-type = passonly
-server = imap.example.com
+type = account
+server = fdh
 user = you@lists.example
 pass = secret
-mbsync_channel = lists
+
+[slow]
+type = pulse
+sweep = 7200
+channel0 = lists
 .Ed
 .Pp
-Channels that are not watched over IMAP:
-.Bd -literal -offset indent
-[pulse]
-type = pulse
-sweep = 3600
-channel0 = lists
-channel1 = archive
-.Ed
+Another
+.Cm pulse
+section may name other accounts and use another sweep.
 .Pp
 Leaving out the global section uses these values.
 Writing the section overrides only the keys that are set.

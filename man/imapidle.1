@@ -364,9 +364,10 @@ off, or back on, takes effect on the next
 .Pp
 .Fl -tunnel
 reads one
-.Cm idle
+.Cm idle ,
+.Cm account ,
 or
-.Cm passonly
+.Cm pulse
 section, logs in, and exits.
 It does not watch other accounts and it does not become a daemon.
 Standard output is the IMAP stream.
@@ -422,12 +423,15 @@ in
 .Pa [track]
 limits how many of those processes run at once.
 The default is 2.
-When the limit is above 1 and a pulse channel is due, one slot
-stays with the named folders and pulse uses the others.
-One long named sync does not hold every pulse channel.
-With one slot, pulse waits until that named sync is done.
-When no pulse channel is due, hot folders may use every slot.
-Tracked mailboxes and pulse channels leave one slot free when
+When the limit is above 1 and a pulse mailbox is due to sync,
+one slot stays with the named folders and pulse uses the others.
+A due
+.Cm STATUS
+does not take a slot.
+One long named sync does not hold every pulse mailbox.
+With one slot, a pulse sync waits until that named sync is done.
+When no pulse sync is due, hot folders may use every slot.
+Tracked mailboxes and pulse mailboxes leave one slot free when
 the limit is above 1 and no named sync is using it.
 A pause file stops new
 .Sy mbsync
@@ -438,29 +442,33 @@ so a due mailbox does not busy-poll.
 A shutdown file uses the same finish path as
 .Dv SIGTERM .
 .Pp
-An optional
-.Pa [pulse]
-section runs
-.Pa mbsync channel
-with no mailbox, once per listed channel.
-A channel with no saved exit is due.
-A saved exit waits
+One or more
+.Cm pulse
+sections each name accounts and a
+.Va sweep .
+Each of those accounts opens one IMAP connection for
+.Cm LIST
+and
+.Cm STATUS
+and does not enter
+.Cm IDLE .
+Every mailbox that list returns is synced as its own
+.Pa mbsync channel:box .
+An empty mailbox uses the tracked empty interval and the weekly
+confirmation, not
+.Va sweep .
+A mailbox that has mail waits
 .Va sweep
-seconds from that time, including after a restart.
-Named
-.Va folderN
-mailboxes are queued at startup.
-When
-.Va connections
-is above 1, one slot stays with those folders and pulse uses
-the other slots.
-With one slot, pulse waits until the named sync is done.
-Each channel then waits
-.Va sweep
-seconds after its own process exits.
-The default is 3600 seconds.
-Channels run at the same time.
-IMAP is not paused, and a different channel is not delayed.
+seconds after its own
+.Sy mbsync
+exits.
+The first time that mailbox is seen with mail, the wait adds the
+same quarter spread used by backoff, so a herd of new mailboxes
+does not sync in one second.
+A time saved in
+.Pa pulse-last
+applies only to a mailbox that is not already in the track file.
+One mailbox of a channel runs at a time.
 A bare channel and a
 .Ar channel:box
 for that same channel do not run together.
@@ -852,13 +860,16 @@ The key is the same
 token.
 An older base64 key is still read.
 .It Pa ~/.local/imapidle/pulse-last
-The last time each pulse channel's
+The last time an
 .Sy mbsync
-exited.
+of a pulse channel exited.
 One channel and that time per line.
-A restart waits
-.Va sweep
-seconds from the time.
+A mailbox already listed in
+.Pa track
+keeps its own clock.
+A mailbox seen for the first time uses this time as the start
+of its
+.Va sweep .
 .It Pa ~/tmp/pause
 .It Pa ~/tmp/pause.mail
 .It Pa ~/tmp/pause.imapidle
@@ -876,15 +887,18 @@ finishes.
 .Sh EXIT STATUS
 .Ex -std imapidle
 Startup failures exit 1 before the main loop.
-That includes a missing configuration, a file with no account and no
-pulse channel, and any account that lacks
+That includes a missing configuration, a file with no account
+and no pulse section, and a login that lacks
 .Va server ,
 .Va user ,
-.Va mbsync_channel ,
 or exactly one of
 .Va pass
 and
 .Va pass_cmd .
+An inline
+.Cm idle
+section also requires
+.Va mbsync_channel .
 The message is written to standard error.
 The process does not fork.
 After the main loop has started, the process exits 0 on

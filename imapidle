@@ -57,11 +57,11 @@ my %children;
 my %hook_children;
 my %hook_by_cmd;
 my %hook_again;
-my %pulse_next;
 my %PULSE_LAST;
 my $PULSE_LAST_FILE;
 my $TRACK_FILE;
-my $pulse_cfg = { disabled => 0, sweep => 3600, channels => [] };
+my %servers;
+my @PULSE_SECTIONS;
 my $track_cfg;
 my %track;
 my %folder_lists;
@@ -109,8 +109,15 @@ sub _name_width {
         my $ch = $accounts{$name}{mbsync_channel} // '';
         $w = length($ch) if length($ch) > $w;
     }
-    for my $ch (@{ $pulse_cfg->{channels} // [] }) {
-        $w = length($ch) if defined $ch && length($ch) > $w;
+    for my $sec (@PULSE_SECTIONS) {
+        my $label = $sec->{name} // '';
+        $w = length($label) if length($label) > $w;
+        for my $ch (@{ $sec->{channels} // [] }) {
+            $w = length($ch) if defined $ch && length($ch) > $w;
+        }
+    }
+    for my $name (keys %servers) {
+        $w = length($name) if length($name) > $w;
     }
     return $w;
 }
@@ -547,14 +554,232 @@ sub parse_folder_spec {
 }
 
 sub _blank_pulse {
-    return { disabled => 0, sweep => 3600, channels => [], hook => '' };
+    return {
+        name     => '',
+        disabled => 0,
+        sweep    => 3600,
+        channels => [],
+        hook     => '',
+    };
 }
 
-sub _pulse_usable {
-    my ($off) = @_;
-    return 0 unless $off;
-    return 1 if $off->{disabled};
-    return @{ $off->{channels} // [] } ? 1 : 0;
+sub _pulse_list_usable {
+    my ($list) = @_;
+    return 0 unless ref $list eq 'ARRAY';
+    for my $sec (@$list) {
+        return 1 if $sec->{disabled};
+        return 1 if @{ $sec->{channels} // [] };
+    }
+    return 0;
+}
+
+sub _bad_channel_name {
+    my ($name) = @_;
+    return 1 if !defined $name || $name eq '';
+    return 1 if $name =~ /[[:space:]:]/ || $name =~ /^-/;
+    return 0;
+}
+
+sub _parse_proto {
+    my ($val) = @_;
+    return 'tls' if !defined $val || $val eq '';
+    my $p = lc $val;
+    $p =~ s/^\s+|\s+$//g;
+    return $p if $p eq 'tls' || $p eq 'starttls' || $p eq 'notls';
+    return;
+}
+
+sub _default_port {
+    my ($proto) = @_;
+    return ($proto // 'tls') eq 'tls' ? 993 : 143;
+}
+
+# $ok is false when a folder value is bad. The caller already recorded it.
+sub _parse_folders {
+    my ($section, $row, $problems, $default_inbox) = @_;
+    my $bad = sub { push @$problems, "[$section] $_[0]"; };
+    my @folders;
+    my $i = 0;
+    while (exists $row->{"folder$i"}) {
+        my $folder = parse_folder_spec($row->{"folder$i"});
+        unless ($folder) {
+            $bad->("empty folder$i");
+            return;
+        }
+        if ($folder->{bad}) {
+            $bad->($folder->{bad});
+            return;
+        }
+        push @folders, $folder;
+        $i++;
+    }
+    if (!@folders && $default_inbox) {
+        my $spec = $row->{folder};
+        $spec = 'INBOX' unless defined $spec && $spec ne '';
+        my $folder = parse_folder_spec($spec);
+        unless ($folder && !$folder->{bad}) {
+            $bad->($folder && $folder->{bad} ? $folder->{bad} : 'bad folder');
+            return;
+        }
+        my $priority = $row->{priority} // $folder->{priority};
+        $priority = 5 unless defined $priority && $priority =~ /^-?\d+$/;
+        $folder->{priority} = $priority + 0;
+        $folder->{debounce} = calculate_debounce($folder->{priority});
+        push @folders, $folder;
+    }
+    return \@folders;
+}
+
+sub _parse_server_section {
+    my ($name, $row, $problems) = @_;
+    my $bad = sub { push @$problems, "[$name] $_[0]"; };
+    my $host = $row->{host};
+    if (!defined $host || $host eq '') {
+        $bad->('missing host');
+        $host = '';
+    }
+    my $proto = 'tls';
+    if (exists $row->{proto} && defined $row->{proto} && $row->{proto} ne '') {
+        my $p = _parse_proto($row->{proto});
+        if (!defined $p) {
+            $bad->('bad proto');
+            $proto = 'tls';
+        } else {
+            $proto = $p;
+        }
+    }
+    my $port_set = 0;
+    my $port = _default_port($proto);
+    if (exists $row->{port} && defined $row->{port} && $row->{port} ne '') {
+        if ($row->{port} !~ /^\d+$/ || $row->{port} < 1 || $row->{port} > 65535) {
+            $bad->('bad port');
+        } else {
+            $port = $row->{port} + 0;
+            $port_set = 1;
+        }
+    }
+    return {
+        host     => $host,
+        port     => $port,
+        proto    => $proto,
+        port_set => $port_set,
+    };
+}
+
+# Host, port, and proto for one login. A server section wins on the
+# name. An account port replaces that section's port. An account proto
+# replaces the section's proto, and an omitted port then follows the
+# proto unless the server wrote a port of its own.
+sub _apply_endpoint {
+    my ($section, $row, $servers, $problems) = @_;
+    my $bad = sub { push @$problems, "[$section] $_[0]"; };
+    my $ref = $row->{server} // '';
+    my ($host, $proto, $port, $server_port);
+    if ($ref ne '' && exists $servers->{$ref}) {
+        my $s = $servers->{$ref};
+        $host        = $s->{host};
+        $proto       = $s->{proto};
+        $port        = $s->{port};
+        $server_port = $s->{port_set} ? 1 : 0;
+    } else {
+        $host        = $ref;
+        $proto       = 'tls';
+        $port        = undef;
+        $server_port = 0;
+    }
+    if (exists $row->{proto} && defined $row->{proto} && $row->{proto} ne '') {
+        my $p = _parse_proto($row->{proto});
+        if (!defined $p) {
+            $bad->('bad proto');
+        } else {
+            $proto = $p;
+            $port = undef unless $server_port;
+        }
+    }
+    if (exists $row->{port} && defined $row->{port} && $row->{port} ne '') {
+        if ($row->{port} !~ /^\d+$/ || $row->{port} < 1 || $row->{port} > 65535) {
+            $bad->('bad port');
+        } else {
+            $port = $row->{port} + 0;
+        }
+    }
+    $port = _default_port($proto) if !defined $port;
+    return ($host, $port + 0, $proto);
+}
+
+# Shared by an account and a legacy idle section. $need_channel keeps
+# the old required mbsync_channel on an inline idle section.
+sub _login_secrets {
+    my ($section, $row, $problems, $need_channel) = @_;
+    my $bad = sub { push @$problems, "[$section] $_[0]"; };
+    my @missing;
+    push @missing, 'server' unless defined $row->{server} && $row->{server} ne '';
+    push @missing, 'user'   unless defined $row->{user} && $row->{user} ne '';
+    if ($need_channel) {
+        push @missing, 'mbsync_channel'
+            unless defined $row->{mbsync_channel} && $row->{mbsync_channel} ne '';
+    }
+    $bad->('missing ' . join(', ', @missing)) if @missing;
+    my $has_pw  = defined $row->{pass}     && $row->{pass} ne '';
+    my $has_cmd = defined $row->{pass_cmd} && $row->{pass_cmd} ne '';
+    if ($has_pw && $has_cmd) {
+        $bad->('set only one of pass or pass_cmd');
+    } elsif (!$has_pw && !$has_cmd) {
+        $bad->('missing pass or pass_cmd');
+    }
+    my $auth = lc($row->{auth} // 'login');
+    if ($auth ne 'login' && $auth ne 'xoauth2') {
+        $bad->('auth must be login or xoauth2');
+        $auth = 'login';
+    }
+    return ($has_pw, $has_cmd, $auth);
+}
+
+sub _section_poll {
+    my ($section, $row, $problems) = @_;
+    my $poll = 60;
+    return $poll unless exists $row->{poll};
+    if (!defined $row->{poll} || $row->{poll} !~ /^\d+$/ || $row->{poll} < 60) {
+        push @$problems, "[$section] bad poll";
+        return $poll;
+    }
+    return $row->{poll} + 0;
+}
+
+sub _section_hyper {
+    my ($row, $default) = @_;
+    return $default ? 1 : 0 unless exists $row->{hyperdelete};
+    return _config_disabled($row->{hyperdelete}) ? 1 : 0;
+}
+
+sub _new_account {
+    my (%a) = @_;
+    my $wait = $a{wait} // 0;
+    $wait = 0 unless $wait =~ /^\d+$/;
+    return {
+        server         => $a{host},
+        port           => $a{port} + 0,
+        proto          => $a{proto} // 'tls',
+        user           => $a{user},
+        pass           => $a{pass},
+        pass_cmd       => $a{pass_cmd},
+        mbsync_channel => $a{channel},
+        auth           => $a{auth} // 'login',
+        role           => $a{role} // 'account',
+        folders        => $a{folders} // [],
+        wait           => $wait + 0,
+        poll           => $a{poll} // 60,
+        hyperdelete    => $a{hyper} ? 1 : 0,
+        hook           => _hook_value($a{hook}),
+        sweep          => $a{sweep},
+        pulse_hook     => _hook_value($a{pulse_hook}),
+        pulse_section  => $a{pulse_section} // '',
+        backoff        => 5,
+        next_try       => 0,
+        fails          => 0,
+        up             => 0,
+        disabled       => 0,
+    };
 }
 
 # [pulse] is not an account. A bad value is pushed onto @$problems.
@@ -564,10 +789,24 @@ sub _parse_pulse_section {
     return $empty unless ref $row eq 'HASH';
     $name = 'pulse' if !defined $name || $name eq '';
     if (_config_disabled($row->{disabled})) {
-        return { disabled => 1, sweep => 3600, channels => [], hook => '' };
+        return {
+            name     => $name,
+            disabled => 1,
+            sweep    => 3600,
+            channels => [],
+            hook     => '',
+        };
     }
 
     my $bad = sub { push @$problems, "[$name] $_[0]"; };
+    for my $key (keys %$row) {
+        if ($key eq 'folder' || $key =~ /^folder\d+$/) {
+            $bad->('folder');
+            last;
+        }
+    }
+    $bad->('channel') if exists $row->{channel};
+
     my $sweep = 3600;
     if (exists $row->{sweep}) {
         if (!defined $row->{sweep} || $row->{sweep} !~ /^\d+$/) {
@@ -589,23 +828,24 @@ sub _parse_pulse_section {
                 $bad->("gap before channel$i");
                 last;
             }
-            my $name = $row->{"channel$i"};
-            if (!defined $name || $name eq '') {
+            my $ch = $row->{"channel$i"};
+            if (!defined $ch || $ch eq '') {
                 $bad->("empty channel$i");
                 last;
             }
-            if ($name =~ /[[:space:]:]/ || $name =~ /^-/) {
+            if ($ch =~ /[[:space:]:]/ || $ch =~ /^-/) {
                 $bad->("bad channel$i");
                 last;
             }
-            if ($seen{$name}++) {
-                $bad->("duplicate channel $name");
+            if ($seen{$ch}++) {
+                $bad->("duplicate channel $ch");
                 last;
             }
-            push @channels, $name;
+            push @channels, $ch;
         }
     }
     return {
+        name     => $name,
         disabled => 0,
         sweep    => $sweep,
         channels => \@channels,
@@ -939,8 +1179,13 @@ sub apply_folder_list {
             next;
         }
         $keep{$id} = 1;
-        next if $track{$id} && !$fresh;
-        my $added = !$fresh && !$track{$id};
+        my $sweep = _pulse_sweep_for_channel($channel);
+        if ($track{$id} && !$fresh) {
+            _mark_pulse_row($track{$id}, $sweep, 1) if defined $sweep;
+            next;
+        }
+        my $added   = !$fresh && !$track{$id};
+        my $existed = $track{$id} ? 1 : 0;
         $track{$id} = {
             interval => $track_cfg->{initial},
             next     => $now + $track_cfg->{initial},
@@ -949,8 +1194,16 @@ sub apply_folder_list {
         } unless $track{$id};
         # A name already tracked keeps its clock, including one
         # restored from the track file. A name that appeared later
-        # starts at initial.
+        # starts at initial. A new pulse mailbox is due for STATUS
+        # immediately so empty and mail are told apart before the sweep.
         $track{$id}{next} = $now + $track_cfg->{initial} if $added;
+        if (defined $sweep) {
+            if ($existed) {
+                _mark_pulse_row($track{$id}, $sweep, 1);
+            } else {
+                _arm_new_pulse_row($track{$id}, $sweep, $channel, $now);
+            }
+        }
     }
     for my $id (keys %track) {
         my ($ch) = split /\0/, $id, 2;
@@ -1243,6 +1496,7 @@ sub _conn_time_key {
     my $mode = $conn->{mode} // '';
     my $what = $mode eq 'NOTIFY' ? 'notify'
         : $mode eq 'POLL' ? 'poll'
+        : $mode eq 'PULSE' ? 'pulse'
         : ($conn->{folder} // '');
     return if $what eq '';
     return $name . "\0" . $what;
@@ -1290,14 +1544,37 @@ sub _hot_running {
     return $n;
 }
 
-# A due pulse channel that is not already running.
+# True when this pulse mailbox will start mbsync, not merely STATUS.
+# The first classification and an empty probe that is not due for
+# its weekly confirmation do not take a slot.
+sub _row_wants_pulse_mbsync {
+    my ($rec, $now) = @_;
+    return 0 unless $rec && $rec->{pulse};
+    $now //= time();
+    return 1 if $rec->{await_sync} && ($rec->{next} // 0) <= $now;
+    return 1 if _confirm_due($rec, $now);
+    return 1 if $rec->{classified} && !$rec->{empty} && ($rec->{next} // 0) <= $now;
+    return 0;
+}
+
+sub _pulse_status_only {
+    my ($rec, $now) = @_;
+    return 0 unless $rec && $rec->{pulse};
+    $now //= time();
+    return 0 if _row_wants_pulse_mbsync($rec, $now);
+    return ($rec->{next} // 0) <= $now ? 1 : 0;
+}
+
+# A pulse mailbox that will sync, and whose channel is free.
 sub _pulse_wants_slot {
     my ($now) = @_;
     $now //= time();
-    return 0 if $pulse_cfg->{disabled};
-    for my $ch (@{ $pulse_cfg->{channels} // [] }) {
-        next unless exists $pulse_next{$ch};
-        next if ($pulse_next{$ch} // 0) > $now;
+    return 0 if $track_cfg && $track_cfg->{disabled};
+    for my $id (keys %track) {
+        my $rec = $track{$id} or next;
+        next unless _row_wants_pulse_mbsync($rec, $now);
+        my ($ch) = split /\0/, $id, 2;
+        next if !defined $ch || $ch eq '';
         next if channel_busy($ch);
         return 1;
     }
@@ -1365,33 +1642,15 @@ sub basename_file {
     return $path;
 }
 
-# A passonly channel joins the pulse clock. It does not open IMAP.
-sub _merge_passonly_channels {
-    my ($accounts, $pulse) = @_;
-    return unless $pulse && !$pulse->{disabled};
-    my %seen = map { $_ => 1 } @{ $pulse->{channels} // [] };
-    for my $name (sort keys %{$accounts}) {
-        my $acc = $accounts->{$name} or next;
-        next if ($acc->{role} // '') ne 'passonly';
-        next if $acc->{config_disabled};
-        my $ch = $acc->{mbsync_channel} // '';
-        next if $ch eq '' || $seen{$ch};
-        $seen{$ch} = 1;
-        push @{ $pulse->{channels} }, $ch;
-    }
-}
-
-# Returns (hashref, '') or (undef, error). Does not touch %accounts.
-# The third value is the pulse section. The fourth is the global section.
+# Returns (accounts, '', pulses, track, servers) or (undef, error).
+# Does not touch %accounts. Pulses is a list of sections.
 sub parse_config_file {
     my ($file) = @_;
     my $cfg = Config::Tiny->read($file)
       or return (undef, "Cannot read $file: " . (Config::Tiny->errstr // $!));
 
-    my (%fresh, @problems);
-    my ($pulse_name, $pulse_row, $global_name, $global_row);
-    # Account names can sort before the global section. Read its
-    # hyperdelete here so an account that omits the key still inherits it.
+    my (@problems, %server_rows, %account_rows, %idle_rows, @pulse_rows);
+    my ($global_name, $global_row);
     my $hyper_default = 0;
     for my $section (keys %{$cfg}) {
         next if $section eq '_';
@@ -1407,20 +1666,10 @@ sub parse_config_file {
         next if $section eq '_';
         my $row = $cfg->{$section};
         next unless ref $row eq 'HASH';
-
         my $type = lc($row->{type} // '');
         $type =~ s/^\s+|\s+$//g;
         if ($type eq '') {
             push @problems, "[$section] missing type";
-            next;
-        }
-        if ($type eq 'pulse') {
-            if ($pulse_row) {
-                push @problems, "[$section] second pulse section";
-                next;
-            }
-            $pulse_name = $section;
-            $pulse_row  = $row;
             next;
         }
         if ($type eq 'global') {
@@ -1432,136 +1681,197 @@ sub parse_config_file {
             $global_row  = $row;
             next;
         }
-        if ($type ne 'idle' && $type ne 'passonly') {
-            push @problems, "[$section] bad type";
+        if ($type eq 'server') {
+            $server_rows{$section} = $row;
             next;
         }
-
-        my $bad = sub {
-            push @problems, "[$section] $_[0]";
-        };
-
-        if (_config_disabled($row->{disabled})) {
-            $fresh{$section} = _held_account($row, $type);
+        if ($type eq 'account') {
+            $account_rows{$section} = $row;
             next;
         }
-
-        my @missing;
-        push @missing, 'server'         unless defined $row->{server} && $row->{server} ne '';
-        push @missing, 'user'           unless defined $row->{user} && $row->{user} ne '';
-        push @missing, 'mbsync_channel' unless defined $row->{mbsync_channel} && $row->{mbsync_channel} ne '';
-        if (@missing) {
-            $bad->('missing ' . join(', ', @missing));
-        }
-
-        my $has_pw  = defined $row->{pass}     && $row->{pass} ne '';
-        my $has_cmd = defined $row->{pass_cmd} && $row->{pass_cmd} ne '';
-        if ($has_pw && $has_cmd) {
-            $bad->('set only one of pass or pass_cmd');
-        } elsif (!$has_pw && !$has_cmd) {
-            $bad->('missing pass or pass_cmd');
-        }
-
-        my $auth = lc($row->{auth} // 'login');
-        if ($auth ne 'login' && $auth ne 'xoauth2') {
-            $bad->('auth must be login or xoauth2');
-        }
-
-        my $port = $row->{port} // 993;
-        if ($port !~ /^\d+$/ || $port < 1 || $port > 65535) {
-            $bad->('bad port');
-        }
-
-        my @folders;
         if ($type eq 'idle') {
-            my $i          = 0;
-            my $bad_folder = 0;
-            while (exists $row->{"folder$i"}) {
-                my $folder = parse_folder_spec($row->{"folder$i"});
-                unless ($folder) {
-                    $bad->("empty folder$i");
-                    $bad_folder = 1;
-                    last;
-                }
-                if ($folder->{bad}) {
-                    $bad->($folder->{bad});
-                    $bad_folder = 1;
-                    last;
-                }
-                push @folders, $folder;
-                $i++;
-            }
-            if ($bad_folder) {
-                next;
-            }
-
-            if (!@folders && !@missing) {
-                my $spec = $row->{folder};
-                $spec = 'INBOX' unless defined $spec && $spec ne '';
-                my $folder = parse_folder_spec($spec);
-                unless ($folder && !$folder->{bad}) {
-                    $bad->($folder && $folder->{bad} ? $folder->{bad} : 'bad folder');
-                    next;
-                }
-                my $priority = $row->{priority} // $folder->{priority};
-                $priority = 5 unless $priority =~ /^-?\d+$/;
-                $folder->{priority} = $priority + 0;
-                $folder->{debounce} = calculate_debounce($folder->{priority});
-                push @folders, $folder;
-            }
+            $idle_rows{$section} = $row;
+            next;
         }
-
-        my $wait = $row->{wait} // 0;
-        $wait = 0 unless $wait =~ /^\d+$/;
-        my $hyper = $hyper_default;
-        if (exists $row->{hyperdelete}) {
-            $hyper = _config_disabled($row->{hyperdelete}) ? 1 : 0;
+        if ($type eq 'pulse') {
+            push @pulse_rows, [ $section, $row ];
+            next;
         }
-
-        my $poll = 60;
-        if (exists $row->{poll}) {
-            if (!defined $row->{poll} || $row->{poll} !~ /^\d+$/ || $row->{poll} < 60) {
-                $bad->('bad poll');
-            } else {
-                $poll = $row->{poll} + 0;
-            }
-        }
-
-        next if grep { index($_, "[$section]") == 0 } @problems;
-
-        $fresh{$section} = {
-            server         => $row->{server},
-            port           => $port + 0,
-            user           => $row->{user},
-            pass           => $has_pw ? $row->{pass} : undef,
-            pass_cmd       => $has_cmd ? $row->{pass_cmd} : undef,
-            mbsync_channel => $row->{mbsync_channel},
-            auth           => $auth,
-            role           => $type,
-            folders        => \@folders,
-            wait           => $wait + 0,
-            poll           => $poll,
-            hyperdelete    => $hyper,
-            hook           => _hook_value($row->{hook}),
-            backoff        => 5,
-            next_try       => 0,
-            fails          => 0,
-            up             => 0,
-            disabled       => 0,
-        };
+        push @problems, "[$section] bad type";
     }
 
-    my $pulse = _parse_pulse_section($pulse_name, $pulse_row, \@problems);
-    my $track = _parse_track_section($global_name, $global_row, \@problems);
-    _merge_passonly_channels(\%fresh, $pulse);
+    my %srv;
+    for my $name (sort keys %server_rows) {
+        $srv{$name} = _parse_server_section($name, $server_rows{$name}, \@problems);
+    }
 
+    my %fresh;
+    my $blocked = sub {
+        my ($section) = @_;
+        return grep { index($_, "[$section] ") == 0 } @problems;
+    };
+
+    for my $section (sort keys %account_rows) {
+        my $row = $account_rows{$section};
+        if (_config_disabled($row->{disabled})) {
+            $fresh{$section} = _held_account($row, 'account');
+            next;
+        }
+        for my $key (keys %$row) {
+            if ($key eq 'folder' || $key =~ /^folder\d+$/) {
+                push @problems, "[$section] folder";
+                last;
+            }
+        }
+        my ($has_pw, $has_cmd, $auth) = _login_secrets($section, $row, \@problems, 0);
+        my $channel = $row->{mbsync_channel};
+        $channel = $section if !defined $channel || $channel eq '';
+        push @problems, "[$section] bad mbsync_channel" if _bad_channel_name($channel);
+        my ($host, $port, $proto) = _apply_endpoint($section, $row, \%srv, \@problems);
+        my $folders = [];
+        my $poll = _section_poll($section, $row, \@problems);
+        next if $blocked->($section);
+        $fresh{$section} = _new_account(
+            host    => $host,
+            port    => $port,
+            proto   => $proto,
+            user    => $row->{user},
+            pass    => $has_pw ? $row->{pass} : undef,
+            pass_cmd => $has_cmd ? $row->{pass_cmd} : undef,
+            channel => $channel,
+            auth    => $auth,
+            role    => 'account',
+            folders => $folders,
+            wait    => $row->{wait},
+            poll    => $poll,
+            hyper   => _section_hyper($row, $hyper_default),
+            hook    => $row->{hook},
+        );
+    }
+
+    my @binds;
+    for my $section (sort keys %idle_rows) {
+        my $row = $idle_rows{$section};
+        my $has_channel = defined $row->{channel} && $row->{channel} ne '';
+        my $has_server  = defined $row->{server} && $row->{server} ne '';
+        if ($has_channel && $has_server) {
+            push @problems, "[$section] sets both channel and server";
+            next;
+        }
+        if ($has_channel) {
+            next if _config_disabled($row->{disabled});
+            push @problems, "[$section] bad channel" if _bad_channel_name($row->{channel});
+            my $folders = _parse_folders($section, $row, \@problems, 1);
+            next if $blocked->($section) || !$folders;
+            push @binds, {
+                section => $section,
+                channel => $row->{channel},
+                folders => $folders,
+                hook    => _hook_value($row->{hook}),
+            };
+            next;
+        }
+        if (_config_disabled($row->{disabled})) {
+            $fresh{$section} = _held_account($row, 'idle');
+            next;
+        }
+        my ($has_pw, $has_cmd, $auth) = _login_secrets($section, $row, \@problems, 1);
+        my $channel = $row->{mbsync_channel} // '';
+        push @problems, "[$section] bad mbsync_channel"
+            if $channel ne '' && _bad_channel_name($channel);
+        my ($host, $port, $proto) = _apply_endpoint($section, $row, \%srv, \@problems);
+        my $folders = _parse_folders($section, $row, \@problems, 1);
+        my $poll = _section_poll($section, $row, \@problems);
+        next if $blocked->($section) || !$folders;
+        $fresh{$section} = _new_account(
+            host     => $host,
+            port     => $port,
+            proto    => $proto,
+            user     => $row->{user},
+            pass     => $has_pw ? $row->{pass} : undef,
+            pass_cmd => $has_cmd ? $row->{pass_cmd} : undef,
+            channel  => $channel,
+            auth     => $auth,
+            role     => 'idle',
+            folders  => $folders,
+            wait     => $row->{wait},
+            poll     => $poll,
+            hyper    => _section_hyper($row, $hyper_default),
+            hook     => $row->{hook},
+        );
+    }
+
+    my @pulses;
+    for my $item (@pulse_rows) {
+        my ($section, $row) = @$item;
+        push @pulses, _parse_pulse_section($section, $row, \@problems);
+    }
+
+    my %bound;
+    for my $bind (@binds) {
+        my $name = $bind->{channel};
+        my $acc  = $fresh{$name};
+        if (!$acc) {
+            push @problems, "[$bind->{section}] unknown account $name";
+            next;
+        }
+        my $role = $acc->{role} // '';
+        if ($bound{$name} || $role eq 'idle' || $role eq 'pulse') {
+            push @problems, "[$bind->{section}] duplicate account $name";
+            next;
+        }
+        $acc->{role}    = 'idle';
+        $acc->{folders} = $bind->{folders};
+        $acc->{hook}    = $bind->{hook} if ($acc->{hook} // '') eq '' && $bind->{hook} ne '';
+        $bound{$name}   = 'idle';
+    }
+
+    for my $pulse (@pulses) {
+        next if $pulse->{disabled};
+        my $label = $pulse->{name} // 'pulse';
+        for my $name (@{ $pulse->{channels} // [] }) {
+            my $acc = $fresh{$name};
+            if (!$acc) {
+                push @problems, "[$label] unknown account $name";
+                next;
+            }
+            my $role = $acc->{role} // '';
+            if ($bound{$name} || $role eq 'idle' || $role eq 'pulse') {
+                push @problems, "[$label] duplicate account $name";
+                next;
+            }
+            $acc->{role}          = 'pulse';
+            $acc->{sweep}         = $pulse->{sweep};
+            $acc->{pulse_hook}    = $pulse->{hook} // '';
+            $acc->{pulse_section} = $label;
+            $acc->{folders}       = [];
+            $bound{$name}         = 'pulse';
+        }
+    }
+
+    my %seen_ch;
+    for my $name (sort keys %fresh) {
+        my $acc = $fresh{$name} or next;
+        next if $acc->{config_disabled};
+        my $role = $acc->{role} // '';
+        next if $role eq 'account';
+        my $ch = $acc->{mbsync_channel} // '';
+        next if $ch eq '';
+        if ($seen_ch{$ch}) {
+            push @problems, "[$name] duplicate mbsync channel $ch";
+            next;
+        }
+        $seen_ch{$ch} = 1;
+    }
+
+    my $track = _parse_track_section($global_name, $global_row, \@problems);
     if (@problems) {
         return (undef, join("\n", @problems));
     }
-    unless (%fresh || _pulse_usable($pulse)) {
+    unless (%fresh || _pulse_list_usable(\@pulses)) {
         return (undef, 'no usable accounts in ' . $file);
     }
-    return (\%fresh, '', $pulse, $track);
+    return (\%fresh, '', \@pulses, $track, \%srv);
 }
 
 sub _config_disabled {
@@ -1583,24 +1893,34 @@ sub xoauth2_initial {
     return encode_base64("user=$user\x01auth=Bearer $token\x01\x01", '');
 }
 
+
 sub _held_account {
     my ($row, $role) = @_;
-    my $port = $row->{port} // 993;
-    $port = 993 unless $port =~ /^\d+$/ && $port >= 1 && $port <= 65535;
+    my $proto = _parse_proto($row->{proto}) // 'tls';
+    my $port = $row->{port};
+    if (!defined $port || $port !~ /^\d+$/ || $port < 1 || $port > 65535) {
+        $port = _default_port($proto);
+    }
     my $has_pw  = defined $row->{pass}     && $row->{pass} ne '';
     my $has_cmd = defined $row->{pass_cmd} && $row->{pass_cmd} ne '';
+    my $channel = $row->{mbsync_channel} // '';
     return {
         server          => $row->{server} // '',
         port            => $port + 0,
+        proto           => $proto,
         user            => $row->{user} // '',
         pass            => $has_pw ? $row->{pass} : undef,
         pass_cmd        => $has_cmd ? $row->{pass_cmd} : undef,
-        mbsync_channel  => $row->{mbsync_channel} // '',
+        mbsync_channel  => $channel,
         auth            => _auth_name($row->{auth}),
-        role            => ($role && $role eq 'passonly') ? 'passonly' : 'idle',
+        role            => ($role && $role eq 'account') ? 'account' : 'idle',
         folders         => [],
         wait            => 0,
+        poll            => 60,
         hook            => _hook_value($row->{hook}),
+        sweep           => undef,
+        pulse_hook      => '',
+        pulse_section   => '',
         backoff         => 5,
         next_try        => 0,
         fails           => 0,
@@ -1610,63 +1930,66 @@ sub _held_account {
     };
 }
 
-# Returns an error string, or the empty string and fills %accounts.
 sub reset_pulse_state {
-    %pulse_next = ();
-    $pulse_cfg = _blank_pulse();
+    @PULSE_SECTIONS = ();
+    %servers = ();
 }
 
-# $reload keeps the clock of a channel that is still listed.
-# A new channel is due immediately. The sweep wait starts at exit.
+sub install_servers {
+    my ($new) = @_;
+    %servers = %{ $new // {} };
+}
+
+# $reload keeps each mailbox clock. A new sweep is used on the next exit.
 sub install_pulse {
     my ($new, $reload, $quiet) = @_;
-    $new //= _blank_pulse();
-    my $old = $pulse_cfg // _blank_pulse();
-    if ($new->{disabled}) {
-        log_info('pulse: disabled') if !$reload || !$old->{disabled};
-        %pulse_next = ();
-        $pulse_cfg = { disabled => 1, sweep => 3600, channels => [], hook => '' };
-        return;
-    }
-
-    my (%keep, @added);
-    for my $ch (@{ $new->{channels} }) {
-        if ($reload && !$old->{disabled} && exists $pulse_next{$ch}) {
-            $keep{$ch} = $pulse_next{$ch};
-        } else {
-            $keep{$ch} = 0;
-            push @added, $ch if $reload;
+    $new = [] unless ref $new eq 'ARRAY';
+    my %old = map { $_->{name} => $_ } @PULSE_SECTIONS;
+    my %keep;
+    for my $sec (@$new) {
+        my $name = $sec->{name} // 'pulse';
+        $keep{$name} = 1;
+        my $prev = $old{$name};
+        if ($sec->{disabled}) {
+            log_info("$name: pulse disabled") if !$reload || !$prev || !$prev->{disabled};
+            next;
+        }
+        if ($reload) {
+            log_info("$name: pulse enabled") if $prev && $prev->{disabled};
+            if ($prev && !$prev->{disabled} && ($prev->{sweep} // 0) != ($sec->{sweep} // 0)) {
+                log_info("$name: pulse sweep $sec->{sweep}");
+            }
+            my %had = map { $_ => 1 } @{ $prev->{channels} // [] };
+            my %now = map { $_ => 1 } @{ $sec->{channels} // [] };
+            for my $ch (sort keys %had) {
+                log_info("$ch: pulse removed") unless $now{$ch};
+            }
+            for my $ch (@{ $sec->{channels} // [] }) {
+                log_info("$ch: pulse added") unless $had{$ch};
+            }
+        } elsif (!$quiet && @{ $sec->{channels} // [] }) {
+            log_info("$name: pulse sweep $sec->{sweep}: " . join(' ', @{ $sec->{channels} }));
         }
     }
     if ($reload) {
-        log_info('pulse: enabled') if $old->{disabled};
-        for my $ch (sort keys %pulse_next) {
-            log_info("$ch: pulse removed") unless exists $keep{$ch};
+        for my $name (sort keys %old) {
+            log_info("$name: pulse removed") unless $keep{$name};
         }
-        log_info("$_: pulse added") for @added;
-        my $had = !$old->{disabled} && (@{ $old->{channels} } || @{ $new->{channels} });
-        if ($had && ($old->{sweep} // 3600) != $new->{sweep}) {
-            log_info("pulse: sweep $new->{sweep}");
-        }
-    } elsif (!$quiet && @{ $new->{channels} }) {
-        log_info('pulse: sweep ' . $new->{sweep} . ': ' . join(' ', @{ $new->{channels} }));
     }
-    %pulse_next = %keep;
-    $pulse_cfg = {
-        disabled => 0,
-        sweep    => $new->{sweep},
-        channels => [ @{ $new->{channels} } ],
-        hook     => $new->{hook} // '',
-    };
-    # A fresh start reads pulse-last. Exits recorded only in this process
-    # are dropped when that file is absent. SIGHUP keeps the in-memory clock.
-    if (!$reload) {
+    @PULSE_SECTIONS = map { {
+        name     => $_->{name} // 'pulse',
+        disabled => $_->{disabled} ? 1 : 0,
+        sweep    => $_->{sweep} // 3600,
+        channels => [ @{ $_->{channels} // [] } ],
+        hook     => $_->{hook} // '',
+    } } @$new;
+    if ($reload) {
+        _stamp_pulse_rows();
+    } else {
         _pulse_last_load();
-        _apply_pulse_last();
     }
 }
 
-# Last pulse exit, one channel per line. A missing channel is due.
 sub _pulse_last_load {
     %PULSE_LAST = ();
     return unless defined $PULSE_LAST_FILE && -f $PULSE_LAST_FILE;
@@ -1700,18 +2023,87 @@ sub _pulse_last_save {
     umask $old;
 }
 
-sub _apply_pulse_last {
-    return if $pulse_cfg->{disabled};
-    my $sweep = $pulse_cfg->{sweep} // 3600;
-    for my $ch (@{ $pulse_cfg->{channels} // [] }) {
-        next unless exists $PULSE_LAST{$ch};
-        $pulse_next{$ch} = $PULSE_LAST{$ch} + $sweep;
+# The saved whole-channel exit is applied when a mailbox row is created.
+sub _apply_pulse_last { }
+
+sub _pulse_note_exit {
+    my ($channel, $now) = @_;
+    return unless defined $channel && $channel ne '';
+    $now //= time();
+    $PULSE_LAST{$channel} = $now;
+    _pulse_last_save();
+}
+
+sub _pulse_account_by_channel {
+    my ($channel) = @_;
+    return unless defined $channel && $channel ne '';
+    for my $name (keys %accounts) {
+        my $acc = $accounts{$name} or next;
+        next if $acc->{config_disabled};
+        next unless ($acc->{role} // '') eq 'pulse';
+        return $acc if ($acc->{mbsync_channel} // '') eq $channel;
+    }
+    return;
+}
+
+sub _pulse_sweep_for_channel {
+    my $acc = _pulse_account_by_channel($_[0]);
+    return unless $acc;
+    my $sweep = $acc->{sweep} // 3600;
+    $sweep = 3600 if $sweep !~ /^\d+$/;
+    return $sweep + 0;
+}
+
+# A reload keeps each mailbox clock. A channel that is no longer
+# pulse drops only the rows this sweep created.
+sub _stamp_pulse_rows {
+    for my $id (keys %track) {
+        my $rec = $track{$id} or next;
+        my ($ch) = split /\0/, $id, 2;
+        my $sweep = _pulse_sweep_for_channel($ch);
+        if (!defined $sweep) {
+            delete $track{$id} if $rec->{pulse};
+            next;
+        }
+        $rec->{pulse}  = 1;
+        $rec->{sweep}  = $sweep;
+        $rec->{interval} = $sweep unless $rec->{empty};
+    }
+}
+
+# $existed marks a mailbox that already had a clock, including one
+# restored from the track file. A new name stays unclassified until
+# the first STATUS.
+sub _mark_pulse_row {
+    my ($rec, $sweep, $existed) = @_;
+    return unless $rec && defined $sweep;
+    $rec->{pulse}    = 1;
+    $rec->{sweep}    = $sweep;
+    $rec->{interval} = $sweep unless $rec->{empty};
+    $rec->{classified} = 1 if $existed;
+}
+
+sub _arm_new_pulse_row {
+    my ($rec, $sweep, $channel, $now) = @_;
+    $rec->{pulse}       = 1;
+    $rec->{sweep}       = $sweep;
+    $rec->{interval}    = $sweep;
+    $rec->{next}        = $now;
+    $rec->{classified}  = 0;
+    $rec->{await_sync}  = 0;
+    $rec->{empty}       = 0;
+    delete $rec->{confirm};
+    delete $rec->{confirming};
+    if (exists $PULSE_LAST{$channel}) {
+        $rec->{seed} = $PULSE_LAST{$channel};
+    } else {
+        delete $rec->{seed};
     }
 }
 
 sub load_config {
     my ($file, $quiet) = @_;
-    my ($fresh, $err, $off, $track) = parse_config_file($file);
+    my ($fresh, $err, $off, $track, $srv) = parse_config_file($file);
     %accounts = ();
     if ($err || !$fresh) {
         reset_pulse_state();
@@ -1720,6 +2112,7 @@ sub load_config {
         return 'empty config';
     }
     %accounts = %$fresh;
+    install_servers($srv);
     install_pulse($off, 0, $quiet);
     install_track($track, 0, $quiet);
     if (!$quiet) {
@@ -1735,8 +2128,13 @@ sub _log_loaded_account {
         log_info("$section: disabled");
         return;
     }
-    if (($acc->{role} // '') eq 'passonly') {
-        log_info("$section: passonly, mbsync $acc->{mbsync_channel}");
+    my $role = $acc->{role} // '';
+    if ($role eq 'account') {
+        log_info("$section: account, mbsync $acc->{mbsync_channel}");
+        return;
+    }
+    if ($role eq 'pulse') {
+        log_info("$section: pulse, mbsync $acc->{mbsync_channel}");
         return;
     }
     my $how = defined $acc->{pass_cmd} && $acc->{pass_cmd} ne '' ? 'pass_cmd' : 'pass';
@@ -2826,6 +3224,53 @@ sub _ssl_handshake {
     return $ssl;
 }
 
+sub _nb_read_line {
+    my ($sock, $deadline) = @_;
+    my $line = '';
+    while (1) {
+        my $remain = $deadline - Time::HiRes::time();
+        die "starttls timeout\n" if $remain <= 0;
+        io_wait_fd($sock, 0, $remain) or die "starttls timeout\n";
+        my $n = sysread($sock, my $byte, 1);
+        if (!defined $n) {
+            next if $!{EINTR} || $!{EAGAIN} || $!{EWOULDBLOCK};
+            die "starttls read: $!\n";
+        }
+        die "starttls closed\n" if $n == 0;
+        $line .= $byte;
+        last if $byte eq "\n";
+        die "starttls line too long\n" if length($line) > 8192;
+    }
+    $line =~ s/\r?\n\z//;
+    return $line;
+}
+
+sub _nb_write_all {
+    my ($sock, $data, $deadline) = @_;
+    while (length $data) {
+        my $remain = $deadline - Time::HiRes::time();
+        die "starttls timeout\n" if $remain <= 0;
+        io_wait_fd($sock, 1, $remain) or die "starttls timeout\n";
+        my $n = syswrite($sock, $data);
+        if (!defined $n) {
+            next if $!{EINTR} || $!{EAGAIN} || $!{EWOULDBLOCK};
+            die "starttls write: $!\n";
+        }
+        die "starttls closed\n" if $n == 0;
+        substr($data, 0, $n, '');
+    }
+}
+
+# Clear greeting, then STARTTLS, then the same handshake as implicit TLS.
+sub _imap_starttls {
+    my ($sock, $deadline) = @_;
+    my $greet = _nb_read_line($sock, $deadline);
+    die "starttls greeting\n" unless $greet =~ /^\*\s+(OK|PREAUTH)\b/i;
+    _nb_write_all($sock, "A001 STARTTLS\r\n", $deadline);
+    my $reply = _nb_read_line($sock, $deadline);
+    die "starttls rejected\n" unless $reply =~ /^A001\s+OK\b/i;
+}
+
 sub tcp_ssl_connect {
     my ($host, $port) = @_;
     my $deadline = Time::HiRes::time() + $IO_MAX;
@@ -2836,16 +3281,40 @@ sub tcp_ssl_connect {
     return $ssl;
 }
 
+# tls is implicit TLS. starttls upgrades after the greeting. notls
+# stays on the clear socket and does not collect a certificate.
+sub imap_transport {
+    my ($name, $acc) = @_;
+    my $proto = $acc->{proto} // 'tls';
+    my $host  = $acc->{server};
+    my $port  = $acc->{port};
+    my $deadline = Time::HiRes::time() + $IO_MAX;
+    my $sock = _tcp_connect($host, $port, $deadline);
+    if ($proto eq 'notls') {
+        log_info("$name: cleartext");
+        cloexec($sock);
+        $sock->blocking(0);
+        return $sock;
+    }
+    _imap_starttls($sock, $deadline) if $proto eq 'starttls';
+    my $ssl = _ssl_handshake($sock, $host, $port, $deadline);
+    cloexec($ssl);
+    $ssl->blocking(0);
+    return $ssl;
+}
+
 sub login_imap {
     my ($name, $acc, $password) = @_;
-    my $socket = tcp_ssl_connect($acc->{server}, $acc->{port});
+    my $socket = imap_transport($name, $acc);
     cloexec($socket);
 
-    my $fingerprint = $socket->get_fingerprint('SHA256');
-    if (!approve_fingerprint($acc->{server}, $acc->{port}, $fingerprint,
-            _tls_session_facts($socket))) {
-        $socket->close;
-        die 'Certificate fingerprint missing';
+    if (($acc->{proto} // 'tls') ne 'notls') {
+        my $fingerprint = $socket->get_fingerprint('SHA256');
+        if (!approve_fingerprint($acc->{server}, $acc->{port}, $fingerprint,
+                _tls_session_facts($socket))) {
+            $socket->close;
+            die 'Certificate fingerprint missing';
+        }
     }
 
     my %login = (
@@ -3440,7 +3909,11 @@ sub account_covered {
     my ($name) = @_;
     return 1 if $conns{"$name:NOTIFY"};
     return 1 if $conns{"$name:POLL"};
+    return 1 if $conns{"$name:PULSE"};
     my $acc = $accounts{$name} or return 0;
+    my $role = $acc->{role} // '';
+    return 1 if $role eq 'account';
+    return 0 if $role eq 'pulse';
     for my $f (@{ $acc->{folders} }) {
         return 0 unless $conns{"$name:$f->{name}"};
     }
@@ -3582,12 +4055,59 @@ sub _session_held {
     return 0;
 }
 
+sub adopt_pulse {
+    my ($name, $acc, $socket, $imap) = @_;
+    register_conn({
+        key          => "$name:PULSE",
+        name         => $name,
+        imap         => $imap,
+        mode         => 'PULSE',
+        socket       => $socket,
+        channel      => $acc->{mbsync_channel},
+        wait         => $acc->{wait},
+        folders      => [],
+        last_success => time(),
+        primary      => 1,
+    });
+    log_info("$name: pulse " . ($acc->{mbsync_channel} // ''));
+}
+
+sub _connect_pulse {
+    my ($name) = @_;
+    my $acc = $accounts{$name} or return 0;
+    my $password = account_pass($name);
+    if (!defined $password) {
+        my $cmd = $acc->{pass_cmd};
+        mark_retry($name) unless defined $cmd && $cmd ne '';
+        return 0;
+    }
+    my $ok = eval {
+        my ($socket, $imap) = login_imap($name, $acc, $password);
+        if (_shutdown_wanted()) {
+            close_session($imap, $socket);
+            _abandon_startup();
+        }
+        my $now = time();
+        consider_id($imap, $acc->{server}, $acc->{port}, $now);
+        consider_capability($name, $imap, $acc->{server}, $acc->{port}, [], $now);
+        consider_list($name, $acc, $imap, $now);
+        adopt_pulse($name, $acc, $socket, $imap);
+        1;
+    };
+    _abandon_startup();
+    return _settle_account($name, $ok, $@, $password);
+}
+
 sub connect_account {
     my ($name) = @_;
     _abandon_startup();
     my $acc = $accounts{$name} or return 0;
     return 0 if $acc->{disabled};
-    return 1 if ($acc->{role} // '') eq 'passonly';
+    return 1 if ($acc->{role} // '') eq 'account';
+    if (($acc->{role} // '') eq 'pulse') {
+        return 1 if $conns{"$name:PULSE"};
+        return _connect_pulse($name);
+    }
     return 1 if account_covered($name);
 
     my @need = grep { !$conns{"$name:$_->{name}"} } @{ $acc->{folders} };
@@ -3672,7 +4192,7 @@ sub restart_idle {
     my ($conn) = @_;
     return 1 unless $conn;
     my $mode = $conn->{mode} // '';
-    return 1 if $mode eq 'NOTIFY' || $mode eq 'POLL';
+    return 1 if $mode eq 'NOTIFY' || $mode eq 'POLL' || $mode eq 'PULSE';
     return 0 unless $conn->{imap};
     my $ok = eval {
         if ($conn->{idling}) {
@@ -3905,9 +4425,17 @@ sub _hook_commands {
             }
         }
     }
-    if ($rec->{pulse} && !$account_hook) {
-        my $hook = _hook_value($pulse_cfg->{hook});
-        push @cmds, $hook if $hook ne '';
+    if ($rec->{pulse} && !$account_hook && $ch ne '') {
+        for my $name (sort keys %accounts) {
+            my $acc = $accounts{$name} or next;
+            next if $acc->{config_disabled};
+            next if ($acc->{mbsync_channel} // '') ne $ch;
+            my $hook = _hook_value($acc->{pulse_hook});
+            if ($hook ne '') {
+                push @cmds, $hook;
+                last;
+            }
+        }
     }
     my $global = _hook_value($track_cfg->{hook});
     push @cmds, $global if $global ne '';
@@ -4024,7 +4552,9 @@ sub reap_children {
         } else {
             log_warn($line);
         }
-        finish_pulse_channel($rec->{pulse}) if ref $rec eq 'HASH';
+        if (ref $rec eq 'HASH' && ($rec->{pulse} // '') ne '' && ($rec->{track} // '') eq '') {
+            finish_pulse_channel($rec->{pulse});
+        }
         finish_track_job($rec, $status, $real, $text) if ref $rec eq 'HASH' && $rec->{track};
         settle_counts_after($rec) if $status == 0 && ref $rec eq 'HASH';
         maybe_arm_sync_hooks($rec, $status) if ref $rec eq 'HASH';
@@ -4042,7 +4572,11 @@ sub _drop_orphaned_children {
         $line .= ' gone';
         $LAST_CHILD_EXIT = $line;
         log_warn($line);
-        finish_pulse_channel($rec->{pulse}) if ref $rec eq 'HASH';
+        if (ref $rec eq 'HASH' && ($rec->{pulse} // '') ne '' && ($rec->{track} // '') eq '') {
+            finish_pulse_channel($rec->{pulse});
+        } elsif (ref $rec eq 'HASH' && ($rec->{pulse} // '') ne '' && ($rec->{track} // '') ne '') {
+            finish_track_job($rec, 1, 0, '');
+        }
     }
 }
 
@@ -4721,14 +5255,14 @@ sub _idle_section_for {
         my $acc = $accounts{$name} or next;
         next if $acc->{config_disabled};
         my $role = $acc->{role} // 'idle';
-        next if $role ne 'idle' && $role ne 'passonly';
+        next unless $role eq 'idle' || $role eq 'pulse' || $role eq 'account';
         return $name if ($acc->{mbsync_channel} // '') eq $channel;
     }
     for my $name (@names) {
         my $acc = $accounts{$name} or next;
         next if $acc->{config_disabled};
         my $role = $acc->{role} // 'idle';
-        next if $role ne 'idle' && $role ne 'passonly';
+        next unless $role eq 'idle' || $role eq 'pulse' || $role eq 'account';
         return $name if $name eq $acct_name;
         return $name if ($acc->{mbsync_channel} // '') eq $acct_name;
     }
@@ -5089,7 +5623,7 @@ sub tunnel_session {
     die "tunnel $section: unknown section\n" unless $acc;
     die "tunnel $section: disabled\n" if $acc->{config_disabled} || $acc->{disabled};
     my $role = $acc->{role} // '';
-    if ($role ne 'idle' && $role ne 'passonly') {
+    if ($role ne 'idle' && $role ne 'pulse' && $role ne 'account') {
         die "tunnel $section: not an account\n";
     }
     my $limit = $track_cfg->{tunnel_timeout} // 3600;
@@ -5221,59 +5755,74 @@ sub trigger_mbsync {
     return $pid;
 }
 
-# Each pulse channel is due on its own. sweep seconds are counted from
-# the exit of that channel's process, not from the start.
+# Channels that have a pulse mailbox ready to sync. STATUS alone is
+# not enough: the mailbox has to be classified and holding mail, or
+# waiting on its weekly confirmation.
 sub due_pulse_channels {
     my ($now) = @_;
     $now //= time();
-    return () if $pulse_cfg->{disabled};
-    my @due;
-    for my $ch (@{ $pulse_cfg->{channels} // [] }) {
-        next unless exists $pulse_next{$ch};
-        next if ($pulse_next{$ch} // 0) > $now;
+    return () if $track_cfg && $track_cfg->{disabled};
+    my %due;
+    for my $id (keys %track) {
+        my $rec = $track{$id} or next;
+        next unless _row_wants_pulse_mbsync($rec, $now);
+        my ($ch) = split /\0/, $id, 2;
+        next if !defined $ch || $ch eq '';
         next if channel_busy($ch);
-        push @due, $ch;
+        $due{$ch} = 1;
     }
-    return @due;
+    return sort keys %due;
 }
 
+# A bare channel exit, if one is still recorded. Mailbox jobs use
+# finish_track_job so each folder keeps its own clock.
 sub finish_pulse_channel {
     my ($ch, $now) = @_;
     $now //= time();
     return unless defined $ch && $ch ne '';
-    return if $pulse_cfg->{disabled};
-    return unless exists $pulse_next{$ch};
-    my $sweep = $pulse_cfg->{sweep} // 3600;
-    $pulse_next{$ch} = $now + $sweep;
-    $PULSE_LAST{$ch} = $now;
-    _pulse_last_save();
-    log_info("$ch: pulse next in ${sweep}s");
-}
-
-sub pump_pulse {
-    my ($now) = @_;
-    $now //= time();
-    return if $pulse_cfg->{disabled};
-    for my $ch (due_pulse_channels($now)) {
-        last if slots_for_cold($now) <= 0;
-        my $pid = trigger_mbsync(0, $ch, { pulse => $ch });
-        if (!$pid) {
-            my $sweep = $pulse_cfg->{sweep} // 3600;
-            $sweep = 1 if $sweep < 1;
-            $pulse_next{$ch} = $now + $sweep;
-        }
+    my $sweep = _pulse_sweep_for_channel($ch) // 3600;
+    $sweep = 1 if $sweep < 1;
+    my $n = 0;
+    for my $id (keys %track) {
+        my $rec = $track{$id} or next;
+        next unless $rec->{pulse};
+        my ($c) = split /\0/, $id, 2;
+        next if !defined $c || $c ne $ch;
+        $rec->{await_sync} = 0;
+        $rec->{confirming} = 0;
+        $rec->{next}       = $now + $sweep;
+        $rec->{interval}   = $sweep unless $rec->{empty};
+        $n++;
     }
+    _pulse_note_exit($ch, $now);
+    log_info("$ch: pulse next in ${sweep}s") if $n;
 }
 
+sub pump_pulse { }
+
+# Soonest pulse mbsync. Undef while no cold slot is free, so a full
+# connection list does not spin the loop. STATUS wakes are separate.
 sub next_pulse_delay {
     my ($now) = @_;
-    return if $pulse_cfg->{disabled};
+    $now //= time();
+    return if $track_cfg && $track_cfg->{disabled};
     return if slots_for_cold($now) <= 0;
     my $wait;
-    for my $ch (@{ $pulse_cfg->{channels} // [] }) {
-        next unless exists $pulse_next{$ch};
+    for my $id (keys %track) {
+        my $rec = $track{$id} or next;
+        next unless $rec->{pulse};
+        my ($ch) = split /\0/, $id, 2;
+        next if !defined $ch || $ch eq '';
         next if channel_busy($ch);
-        my $d = ($pulse_next{$ch} // 0) - $now;
+        my $when;
+        if ($rec->{classified} && !$rec->{empty}) {
+            $when = $rec->{next} // 0;
+        } elsif ($rec->{empty} && defined $rec->{confirm}) {
+            $when = $rec->{confirm};
+        } else {
+            next;
+        }
+        my $d = $when - $now;
         $d = 0 if $d < 0;
         $wait = $d if !defined $wait || $d < $wait;
     }
@@ -5349,6 +5898,72 @@ sub due_tracked {
     return sort { $a->{next} <=> $b->{next} || $a->{box} cmp $b->{box} } @due;
 }
 
+# The sweep is counted from this mailbox's mbsync exit. An empty
+# confirmation keeps the daily STATUS and the weekly clock.
+sub _finish_pulse_box {
+    my ($row, $channel, $box, $text, $now) = @_;
+    my $confirming = $row->{confirming} ? 1 : 0;
+    $row->{confirming} = 0;
+    $row->{await_sync} = 0;
+    my $sweep = $row->{sweep} // 3600;
+    $sweep = 1 if $sweep < 1;
+    my $msgs = mbsync_new_messages($text);
+    if ($confirming && $row->{empty}) {
+        if (defined $msgs && $msgs > 0) {
+            $row->{empty} = 0;
+            delete $row->{confirm};
+            $row->{classified} = 1;
+            $row->{interval}   = $sweep;
+            $row->{next}       = $now + $sweep;
+        } else {
+            my $gap  = $track_cfg->{empty} // 86400;
+            my $week = $track_cfg->{confirm} // 604800;
+            $row->{next}    = $now + $gap;
+            $row->{confirm} = $now + with_quarter_spread($week);
+        }
+        _pulse_note_exit($channel, $now);
+        return;
+    }
+    $row->{interval} = $sweep;
+    $row->{next}     = $now + $sweep;
+    _pulse_note_exit($channel, $now);
+    log_info("$channel: $box pulse next in ${sweep}s");
+}
+
+# First STATUS that finds mail. A saved channel exit is used as-is.
+# Otherwise the first wait is the sweep plus a quarter spread, and
+# this mailbox is not synced yet.
+sub _classify_pulse_mail {
+    my ($rec, $channel, $box, $now) = @_;
+    $rec->{classified} = 1;
+    $rec->{empty}      = 0;
+    delete $rec->{confirm};
+    $rec->{confirming} = 0;
+    my $sweep = $rec->{sweep} // 3600;
+    $sweep = 1 if $sweep < 1;
+    $rec->{interval} = $sweep;
+    my $seed = $rec->{seed};
+    delete $rec->{seed};
+    if (defined $seed && $seed =~ /^[\d.]+$/) {
+        my $due = $seed + $sweep;
+        if ($due <= $now) {
+            $rec->{await_sync} = 1;
+            $rec->{next}       = $now;
+            return;
+        }
+        $rec->{await_sync} = 0;
+        $rec->{next}       = $due;
+        my $in = int($due - $now);
+        $in = 0 if $in < 0;
+        log_info("$channel: $box sweep in ${in}s");
+        return;
+    }
+    my $spread = with_quarter_spread($sweep);
+    $rec->{await_sync} = 0;
+    $rec->{next}       = $now + $spread;
+    log_info("$channel: $box sweep in ${spread}s");
+}
+
 sub finish_track_job {
     my ($rec, $status, $real, $text, $now) = @_;
     return unless ref $rec eq 'HASH' && defined $rec->{track};
@@ -5357,6 +5972,10 @@ sub finish_track_job {
     my ($channel, $box) = split /\0/, $id, 2;
     $list_next{$channel} = 0 if defined $channel && $channel ne '' && $status;
     my $row = $track{$id} or return;
+    if ($row->{pulse}) {
+        _finish_pulse_box($row, $channel, $box, $text, $now);
+        return;
+    }
     my $confirming = $row->{confirming} ? 1 : 0;
     $row->{confirming} = 0;
     $row->{await_sync} = 0;
@@ -5612,6 +6231,10 @@ sub _probe_channel {
             $rec->{messages} = $messages;
             if (status_stays_empty($messages, $uidnext, $prev)) {
                 $rec->{empty} = 1;
+                if ($rec->{pulse}) {
+                    $rec->{classified} = 1;
+                    delete $rec->{seed};
+                }
                 unless (defined $rec->{confirm}) {
                     my $week = $track_cfg->{confirm} // 604800;
                     $rec->{confirm} = $now + with_quarter_spread($week);
@@ -5625,6 +6248,11 @@ sub _probe_channel {
                 $rec->{confirming} = 0;
                 $rec->{next}       = $now + $gap;
                 $empty_n++;
+                next;
+            }
+            if ($rec->{pulse} && !$rec->{classified}) {
+                _classify_pulse_mail($rec, $channel, $box, $now);
+                $sync_n++ if $rec->{await_sync};
                 next;
             }
             $rec->{empty}      = 0;
@@ -5696,14 +6324,24 @@ sub pump_tracked {
         my $row = $track{ $job->{id} };
         _arm_confirm($job->{channel}, $job->{box}, $row)
             if $row && _confirm_due($row, $now);
-        my $pid = trigger_mbsync(0, "$job->{channel}:$job->{box}", {
+        my %meta = (
             track   => $job->{id},
             capture => 1,
-        });
+        );
+        $meta{pulse} = $job->{channel} if $row && $row->{pulse};
+        my $pid = trigger_mbsync(0, "$job->{channel}:$job->{box}", \%meta);
         if ($pid) {
             $started{ $job->{channel} } = 1;
         } else {
             $row = $track{ $job->{id} } or next;
+            if ($row->{pulse}) {
+                my $sweep = $row->{sweep} // 3600;
+                $sweep = 1 if $sweep < 1;
+                $row->{confirming} = 0;
+                $row->{await_sync} = 0;
+                $row->{next}       = $now + $sweep;
+                next;
+            }
             if ($row->{confirming}) {
                 $row->{confirming} = 0;
                 $row->{await_sync} = 0;
@@ -5768,7 +6406,6 @@ sub pump_schedule {
                 trigger_mbsync($job->{wait}, @{ $job->{args} });
             }
             pump_tracked($now);
-            pump_pulse($now);
         }
         1;
     } or $err = $@ || 'pump failed';
@@ -6262,8 +6899,6 @@ sub loop_timeout {
     $wait = $sched if defined $sched && $sched < $wait;
     my $resync_wait = next_resync_delay($now);
     $wait = $resync_wait if defined $resync_wait && $resync_wait < $wait;
-    my $off = next_pulse_delay($now);
-    $wait = $off if defined $off && $off < $wait;
     my $track_wait = next_track_delay($now);
     $wait = $track_wait if defined $track_wait && $track_wait < $wait;
     my $poll_wait = next_poll_delay($now);
@@ -6281,18 +6916,32 @@ sub next_track_delay {
     # An overdue folder that cannot start must not make the select
     # timeout 0. No free slot, or the channel is already syncing.
     # A child exit wakes the sleep.
-    unless ($track_cfg->{disabled} || slots_for_cold($now) <= 0) {
+    unless ($track_cfg->{disabled}) {
+        my $cold_open = slots_for_cold($now) > 0;
         for my $id (keys %track) {
             my $rec = $track{$id} or next;
+            my $status_only = _pulse_status_only($rec, $now);
+            my $future_status = 0;
+            if ($rec->{pulse} && !_row_wants_pulse_mbsync($rec, $now)
+                && ($rec->{next} // 0) > $now) {
+                $future_status = 1;
+            }
+            next if !$cold_open && !$status_only && !$future_status;
             my $d = _track_when($rec) - $now;
             if ($d <= 0) {
                 my ($ch, $box) = split /\0/, $id, 2;
                 next if !defined $ch || !defined $box || $box eq '';
-                next if tracked_deferred($ch, $box, $now);
-                # The primary is still listed but cannot take STATUS.
-                # Asking it again is what pegged the CPU.
-                my $primary = _primary_for_channel($ch);
-                next if _needs_probe($id, $now) && !_probe_ready($primary);
+                if ($status_only) {
+                    # No primary yet: wait for the connect, do not spin.
+                    my $primary = _primary_for_channel($ch);
+                    next unless _probe_ready($primary);
+                } else {
+                    next if tracked_deferred($ch, $box, $now);
+                    # The primary is still listed but cannot take STATUS.
+                    # Asking it again is what pegged the CPU.
+                    my $primary = _primary_for_channel($ch);
+                    next if _needs_probe($id, $now) && !_probe_ready($primary);
+                }
             }
             $d = 0 if $d < 0;
             $wait = $d if !defined $wait || $d < $wait;
@@ -6327,6 +6976,7 @@ sub _session_key {
     return join("\0",
         $acc->{server}         // '',
         $acc->{port}           // '',
+        $acc->{proto}          // 'tls',
         $acc->{user}           // '',
         $acc->{pass}           // '',
         $acc->{pass_cmd}       // '',
@@ -6396,7 +7046,7 @@ sub reload_config_now {
         log_error('reload kept the previous config: no config file');
         return 'no config file';
     }
-    my ($fresh, $err, $off, $track) = parse_config_file($file);
+    my ($fresh, $err, $off, $track, $srv) = parse_config_file($file);
     if ($err || !$fresh) {
         $err //= 'empty config';
         log_error("reload kept the previous config: $err");
@@ -6466,6 +7116,7 @@ sub reload_config_now {
             log_info("$name: folders updated");
         }
     }
+    install_servers($srv);
     install_pulse($off, 1);
     install_track($track, 1);
     _request_list_refresh();
@@ -6563,10 +7214,23 @@ sub info_lines {
             push @lines, $line;
             next;
         }
-        if (($acc->{role} // '') eq 'passonly') {
-            my $line = "$name: passonly server $acc->{server}"
-                . " channel $acc->{mbsync_channel}";
+        my $role = $acc->{role} // '';
+        if ($role eq 'account' || $role eq 'pulse') {
+            my $mode = $role;
+            if ($role eq 'pulse') {
+                $mode = $conns{"$name:PULSE"} ? 'pulse'
+                    : ($acc->{disabled} ? 'disabled' : 'down');
+            }
+            my $line = "$name: $mode server $acc->{server} channel $acc->{mbsync_channel}";
             $line .= ' auth xoauth2' if ($acc->{auth} // '') eq 'xoauth2';
+            if ($mode eq 'down') {
+                my $wait = int(($acc->{next_try} // 0) - $now);
+                $wait = 0 if $wait < 0;
+                $line .= " retry ${wait}s";
+            } elsif ($acc->{disabled} && ($acc->{next_try} // 0) > $now) {
+                my $wait = int($acc->{next_try} - $now);
+                $line .= " back in ${wait}s";
+            }
             push @lines, $line;
             next;
         }
@@ -6608,6 +7272,7 @@ sub _track_info_lines {
     for my $id (keys %track) {
         my ($ch, $box) = split /\0/, $id, 2;
         next if !defined $ch || !defined $box;
+        next if $track{$id}{pulse};
         push @{ $by{$ch} }, { box => $box, rec => $track{$id} };
     }
     my @lines;
@@ -6636,22 +7301,43 @@ sub _track_info_lines {
 
 sub _pulse_info_lines {
     my ($now) = @_;
-    return () unless $pulse_cfg;
-    return ('pulse: disabled') if $pulse_cfg->{disabled};
     my @lines;
-    my $sweep = $pulse_cfg->{sweep} // 3600;
-    for my $ch (@{ $pulse_cfg->{channels} // [] }) {
-        my $state;
-        if (channel_busy($ch)) {
-            $state = 'running';
-        } elsif (!exists $pulse_next{$ch} || $pulse_next{$ch} <= $now) {
-            $state = 'due';
-        } else {
-            my $in = int($pulse_next{$ch} - $now);
-            $in = 0 if $in < 0;
-            $state = "next ${in}s";
+    for my $sec (@PULSE_SECTIONS) {
+        my $name = $sec->{name} // 'pulse';
+        if ($sec->{disabled}) {
+            push @lines, "$name: pulse disabled";
+            next;
         }
-        push @lines, "$ch: pulse sweep ${sweep}s $state";
+        my $sweep = $sec->{sweep} // 3600;
+        my $nch = scalar @{ $sec->{channels} // [] };
+        push @lines, "$name: pulse sweep ${sweep}s $nch";
+        for my $acct (@{ $sec->{channels} // [] }) {
+            my $acc = $accounts{$acct};
+            my $ch = ($acc && ($acc->{mbsync_channel} // '') ne '')
+                ? $acc->{mbsync_channel} : $acct;
+            my @boxes;
+            for my $id (keys %track) {
+                my $rec = $track{$id} or next;
+                next unless $rec->{pulse};
+                my ($c, $box) = split /\0/, $id, 2;
+                next if !defined $c || $c ne $ch || !defined $box;
+                push @boxes, { box => $box, rec => $rec };
+            }
+            if (!@boxes) {
+                push @lines, "$ch: pulse sweep ${sweep}s";
+                next;
+            }
+            @boxes = sort {
+                ($a->{rec}{next} // 0) <=> ($b->{rec}{next} // 0)
+                    || $a->{box} cmp $b->{box}
+            } @boxes;
+            my $soon = $boxes[0];
+            my $in = int(($soon->{rec}{next} // 0) - $now);
+            $in = 0 if $in < 0;
+            my $word = @boxes == 1 ? 'box' : 'boxes';
+            push @lines, "$ch: pulse " . scalar(@boxes)
+                . " $word, next $soon->{box} in ${in}s";
+        }
     }
     return @lines;
 }
@@ -6881,17 +7567,27 @@ sub ctl_nodes {
             _ctl_put(\%n, "track.$k", $track_cfg->{$k} // 0);
         }
     }
-    if ($pulse_cfg) {
-        _ctl_put(\%n, 'pulse.disabled', $pulse_cfg->{disabled} ? 1 : 0);
-        _ctl_put(\%n, 'pulse.sweep', $pulse_cfg->{sweep} // 3600);
-        _ctl_put(\%n, 'pulse.hook', ($pulse_cfg->{hook} // '') ne '' ? 1 : 0);
-        _ctl_put(\%n, 'pulse.channels', scalar @{ $pulse_cfg->{channels} // [] });
-        for my $ch (@{ $pulse_cfg->{channels} // [] }) {
-            my $base = 'pulse.channel.' . ctl_enc($ch);
-            my $next = $pulse_next{$ch};
-            _ctl_put(\%n, "$base.next", defined $next ? int($next) : 0);
+    for my $sname (sort keys %servers) {
+        my $srv  = $servers{$sname} or next;
+        my $base = 'server.' . ctl_enc($sname);
+        _ctl_put(\%n, "$base.host", $srv->{host} // '');
+        _ctl_put(\%n, "$base.port", $srv->{port} // 0);
+        _ctl_put(\%n, "$base.proto", $srv->{proto} // 'tls');
+    }
+    for my $sec (@PULSE_SECTIONS) {
+        my $label = $sec->{name} // 'pulse';
+        my $base  = 'pulse.' . ctl_enc($label);
+        _ctl_put(\%n, "$base.disabled", $sec->{disabled} ? 1 : 0);
+        _ctl_put(\%n, "$base.sweep", $sec->{sweep} // 3600);
+        _ctl_put(\%n, "$base.hook", ($sec->{hook} // '') ne '' ? 1 : 0);
+        _ctl_put(\%n, "$base.channels", scalar @{ $sec->{channels} // [] });
+        for my $acct (@{ $sec->{channels} // [] }) {
+            my $acc = $accounts{$acct};
+            my $ch = ($acc && ($acc->{mbsync_channel} // '') ne '')
+                ? $acc->{mbsync_channel} : $acct;
             my $last = $PULSE_LAST{$ch};
-            _ctl_put(\%n, "$base.last", defined $last ? int($last) : 0);
+            _ctl_put(\%n, "$base.channel." . ctl_enc($acct) . '.last',
+                defined $last ? int($last) : 0);
         }
     }
     for my $name (sort keys %accounts) {
@@ -6899,6 +7595,7 @@ sub ctl_nodes {
         my $base = 'account.' . ctl_enc($name);
         _ctl_put(\%n, "$base.server", $acc->{server});
         _ctl_put(\%n, "$base.port", $acc->{port});
+        _ctl_put(\%n, "$base.proto", $acc->{proto} // 'tls');
         _ctl_put(\%n, "$base.user", $acc->{user});
         _ctl_put(\%n, "$base.channel", $acc->{mbsync_channel});
         _ctl_put(\%n, "$base.auth", $acc->{auth});
@@ -6947,6 +7644,7 @@ sub ctl_nodes {
         _ctl_put(\%n, "$base.confirm", int($rec->{confirm})) if defined $rec->{confirm};
         _ctl_put(\%n, "$base.samples", scalar @{ $rec->{samples} // [] });
         _ctl_put(\%n, "$base.fails", $rec->{fails} // 0);
+        _ctl_put(\%n, "$base.pulse", 1) if $rec->{pulse};
     }
     for my $ch (sort keys %list_next) {
         _ctl_put(\%n, 'track.list.' . ctl_enc($ch), int($list_next{$ch}));
@@ -7484,18 +8182,52 @@ sub clear_hooks_for_test {
 }
 sub hook_running_for_test { return scalar keys %hook_children; }
 sub pulse_snapshot_for_test {
+    my @sections = map { {
+        name     => $_->{name} // 'pulse',
+        disabled => $_->{disabled} ? 1 : 0,
+        sweep    => $_->{sweep},
+        channels => [ @{ $_->{channels} // [] } ],
+        hook     => $_->{hook} // '',
+    } } @PULSE_SECTIONS;
+    my $first = $sections[0] // {
+        disabled => 0,
+        sweep    => undef,
+        channels => [],
+        hook     => '',
+    };
     return {
-        disabled => $pulse_cfg->{disabled} ? 1 : 0,
-        sweep    => $pulse_cfg->{sweep},
-        channels => [ @{ $pulse_cfg->{channels} // [] } ],
-        hook     => $pulse_cfg->{hook} // '',
-        next     => { %pulse_next },
+        sections => \@sections,
+        disabled => $first->{disabled} ? 1 : 0,
+        sweep    => $first->{sweep},
+        channels => [ @{ $first->{channels} // [] } ],
+        hook     => $first->{hook} // '',
+        next     => {},
     };
 }
 sub set_pulse_next_for_test {
     my ($ch, $when) = @_;
-    return unless exists $pulse_next{$ch};
-    $pulse_next{$ch} = $when;
+    for my $id (keys %track) {
+        my ($c) = split /\0/, $id, 2;
+        next if !defined $c || $c ne $ch;
+        next unless $track{$id} && $track{$id}{pulse};
+        $track{$id}{next} = $when;
+    }
+}
+sub set_pulse_box_for_test {
+    my ($channel, $box, $when, $sweep) = @_;
+    $sweep //= 3600;
+    my $id = set_track_due_for_test($channel, $box, $when);
+    my $rec = $track{$id} or return;
+    $rec->{pulse}      = 1;
+    $rec->{sweep}      = $sweep;
+    $rec->{interval}   = $sweep;
+    $rec->{classified} = 1;
+    $rec->{empty}      = 0;
+    $rec->{await_sync} = 1;
+    delete $rec->{confirm};
+    delete $rec->{confirming};
+    delete $rec->{seed};
+    return $id;
 }
 sub set_next_try_for_test {
     my ($name, $when) = @_;
@@ -7657,6 +8389,10 @@ sub track_rows_for_test {
             confirm    => $rec->{confirm},
             empty      => $rec->{empty} ? 1 : 0,
             confirming => $rec->{confirming} ? 1 : 0,
+            pulse      => $rec->{pulse} ? 1 : 0,
+            sweep      => $rec->{sweep},
+            classified => $rec->{classified} ? 1 : 0,
+            await_sync => $rec->{await_sync} ? 1 : 0,
             fails      => $rec->{fails} // 0,
             samples    => scalar @{ $rec->{samples} // [] },
         };

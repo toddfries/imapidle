@@ -848,9 +848,6 @@ user = a@example.com
 pass = secret
 mbsync_channel = ch
 folder0 = INBOX
-[pulse]
-type = pulse
-channel0 = knf
 EOF
 my $cap = track_cfg_for_test();
 $cap->{connections} = 4;
@@ -877,16 +874,16 @@ set_trigger_hook_for_test(sub {
 my $now = 10_000;
 queue_folder('hotc', 'INBOX', $now, $now);
 set_track_due_for_test('trkc', 'Archive', $now - 5);
-set_pulse_next_for_test('knf', 0);
+set_pulse_box_for_test('knf', 'INBOX', $now);
 pump_schedule($now);
 is_deeply(
     [map { join(' ', @{ $_->{args} }) } @forked],
-    ['hotc:INBOX', 'trkc:Archive', 'knf'],
+    ['hotc:INBOX', 'trkc:Archive', 'knf:INBOX'],
     'hot runs, then tracked, then pulse in a spare slot',
 );
 is($forked[1]{args}[0], 'trkc:Archive', 'a tracked job is a single channel:box');
 ok($forked[1]{track}, 'the tracked child is marked for the summary');
-is($forked[2]{args}[0], 'knf', 'pulse is not held behind the named sync');
+is($forked[2]{args}[0], 'knf:INBOX', 'pulse is not held behind the named sync');
 
 clear_children_for_test();
 @forked = ();
@@ -896,7 +893,7 @@ tag_child_for_test($tracked_pid, 'track', "trkc\0Archive");
 pump_schedule($now);
 is_deeply(
     [map { join(' ', @{ $_->{args} }) } @forked],
-    ['knf'],
+    ['knf:INBOX'],
     'a tracked sync does not hold pulse',
 );
 

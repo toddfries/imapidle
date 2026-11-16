@@ -258,16 +258,42 @@ like(load_config($two_global), qr/\[two\] second global section/, 'a second glob
 unlink $two_global;
 
 my $two_pulse = write_conf(<<'EOF');
+[one]
+type = account
+server = imap.example.com
+user = a@example.com
+pass = secret
+
+[two]
+type = account
+server = imap.example.com
+user = b@example.com
+pass = secret
+
 [a]
 type = pulse
+sweep = 100
 channel0 = one
 
 [b]
 type = pulse
+sweep = 200
 channel0 = two
 EOF
-like(load_config($two_pulse), qr/\[b\] second pulse section/, 'a second pulse section is rejected');
+is(load_config($two_pulse), '', 'two pulse sections load');
+is(scalar @{ pulse_snapshot_for_test()->{sections} }, 2, 'both pulse sections are kept');
+is(loaded_account('one')->{role}, 'pulse', 'the first account is a pulse login');
+is(loaded_account('one')->{sweep}, 100, 'each section keeps its sweep');
+is(loaded_account('two')->{sweep}, 200, 'the second sweep is independent');
 unlink $two_pulse;
+
+my $unknown_pulse = write_conf(<<'EOF');
+[a]
+type = pulse
+channel0 = missing
+EOF
+like(load_config($unknown_pulse), qr/\[a\] unknown account missing/, 'a pulse channel must name an account');
+unlink $unknown_pulse;
 
 my $idle_case = write_conf(<<'EOF');
 [acct]
@@ -281,60 +307,44 @@ is(load_config($idle_case), '', 'type comparison ignores case');
 is(loaded_account('acct')->{role}, 'idle', 'IDLE is an idle account');
 unlink $idle_case;
 
-my $passonly = write_conf(<<'EOF');
+my $old_login = write_conf(<<'EOF');
 [box]
 type = passonly
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = lists
-folder0 = INBOX
-
-[slow]
-type = pulse
-sweep = 10
-channel0 = other
 EOF
-is(load_config($passonly), '', 'a passonly section loads');
-is_deeply(loaded_account('box')->{folders}, [], 'passonly ignores folder keys');
-is(loaded_account('box')->{role}, 'passonly', 'role is passonly');
-is(connect_account('box'), 1, 'passonly does not connect');
-is(conn_count(), 0, 'passonly opens no socket');
-is_deeply(pulse_snapshot_for_test()->{channels}, [qw(other lists)], 'passonly joins the pulse list');
+like(load_config($old_login), qr/\[box\] bad type/, 'an unknown section type is rejected');
+unlink $old_login;
+
+my $acct_only = write_conf(<<'EOF');
+[box]
+type = account
+server = imap.example.com
+user = a@example.com
+pass = secret
+mbsync_channel = lists
+EOF
+is(load_config($acct_only), '', 'an account with no schedule loads');
+is(loaded_account('box')->{role}, 'account', 'the login stays unbound');
+is(connect_account('box'), 1, 'an unbound account does not connect');
+is(conn_count(), 0, 'an unbound account opens no socket');
 my @po = info_lines(time());
-ok((grep { $_ eq 'box: passonly server imap.example.com channel lists' } @po),
-    'state names a passonly account');
-ok(!grep(/box: down/, @po), 'passonly is not down');
-unlink $passonly;
+ok((grep { $_ eq 'box: account server imap.example.com channel lists' } @po),
+    'state names an unbound account');
+ok(!grep(/box: down/, @po), 'an unbound account is not down');
+unlink $acct_only;
 
-my $solo = write_conf(<<'EOF');
+my $held_acct = write_conf(<<'EOF');
 [box]
-type = passonly
-server = imap.example.com
-user = a@example.com
-pass = secret
-mbsync_channel = lists
-EOF
-is(load_config($solo), '', 'passonly without pulse still loads');
-is(pulse_snapshot_for_test()->{disabled}, 0, 'a blank pulse is enabled');
-is(pulse_snapshot_for_test()->{sweep}, 3600, 'that pulse waits 3600s');
-is_deeply(pulse_snapshot_for_test()->{channels}, ['lists'], 'the channel is scheduled');
-unlink $solo;
-
-my $held_po = write_conf(<<'EOF');
-[box]
-type = passonly
+type = account
 disabled = yes
 mbsync_channel = lists
-
-[slow]
-type = pulse
-channel0 = other
 EOF
-is(load_config($held_po), '', 'a disabled passonly section loads');
-is_deeply(pulse_snapshot_for_test()->{channels}, ['other'], 'a disabled passonly is not scheduled');
-like((grep { /^box: / } info_lines(time()))[0], qr/^box: disabled/, 'a disabled passonly stays disabled');
-unlink $held_po;
+is(load_config($held_acct), '', 'a disabled account loads');
+like((grep { /^box: / } info_lines(time()))[0], qr/^box: disabled/, 'a disabled account stays disabled');
+unlink $held_acct;
 
 my $bad_tunnel = write_conf(<<'EOF');
 [track]

@@ -122,7 +122,7 @@ pass = secret
 mbsync_channel = work
 
 [solo]
-type = passonly
+type = account
 server = solo.example
 user = u\@example.com
 pass = secret
@@ -175,7 +175,7 @@ ok(defined $inline, 'an inline IMAP store is rewritten');
 unlike($inline, qr/^Pass hidden$/m, 'the inline password is removed');
 my @solo_lines = grep { /^Tunnel / } split /\n/, $inline;
 is($solo_lines[0], 'Tunnel ' . _mbsync_dq(tunnel_shell('solo')),
-    'passonly is a tunnel section');
+    'an account is a tunnel section');
 
 my $path = prepare_tunnel_config('work:INBOX');
 ok(defined $path && -f $path, 'a private mbsyncrc is written');

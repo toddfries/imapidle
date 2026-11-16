@@ -16,11 +16,15 @@ use strict;
 use warnings;
 use File::Temp qw(tempfile tempdir);
 use Test::More;
+use Time::HiRes qw(time);
 
 require './imapidle';
 
 my $run = tempdir('imapidle-run-XXXX', CLEANUP => 1, TMPDIR => 1);
+my $state = tempdir('imapidle-state-XXXX', CLEANUP => 1, TMPDIR => 1);
 set_runtime_dir_for_test($run);
+set_state_dir_for_test($state);
+set_interval_spread_for_test(sub { 0 });
 
 sub write_conf {
     my ($text) = @_;
@@ -30,28 +34,46 @@ sub write_conf {
     return $path;
 }
 
-sub jobs {
-    my ($now) = @_;
-    return map { join(' ', @{ $_->{args} }) . ' wait=' . $_->{wait} } due_mbsync_jobs($now);
+sub row {
+    my ($box) = @_;
+    my ($found) = grep { $_->{box} eq $box } track_rows_for_test();
+    return $found;
+}
+
+{
+    package StatusIMAP;
+    sub new {
+        my ($class, $replies) = @_;
+        return bless { replies => $replies, cmds => [] }, $class;
+    }
+    sub IsConnected { 1 }
+    sub LastError   { '' }
+    sub tag_and_run {
+        my ($self, $cmd) = @_;
+        push @{ $self->{cmds} }, $cmd;
+        my ($box) = $cmd =~ /STATUS "((?:\\.|[^"\\])*)"/;
+        $box =~ s/\\"/"/g if defined $box;
+        $box =~ s/\\\\/\\/g if defined $box;
+        my $lines = $self->{replies}{$box // ''} // [];
+        return @$lines;
+    }
 }
 
 my $bad_sweep = write_conf(<<'EOF');
 [pulse]
 type = pulse
 sweep = soon
-channel0 = gm-ctf
+channel0 = knf
 EOF
 like(load_config($bad_sweep), qr/\[pulse\] bad sweep/, 'a non-numeric sweep is rejected');
-unlink $bad_sweep;
 
 my $gap = write_conf(<<'EOF');
 [pulse]
 type = pulse
-channel0 = gm-ctf
-channel2 = knf
+channel0 = knf
+channel2 = other
 EOF
 like(load_config($gap), qr/\[pulse\] gap before channel1/, 'a missing channel number is an error');
-unlink $gap;
 
 my $empty = write_conf(<<'EOF');
 [pulse]
@@ -59,7 +81,6 @@ type = pulse
 channel0 =
 EOF
 like(load_config($empty), qr/\[pulse\] empty channel0/, 'an empty channel is rejected');
-unlink $empty;
 
 my $colon = write_conf(<<'EOF');
 [pulse]
@@ -67,438 +88,542 @@ type = pulse
 channel0 = gm:ctf
 EOF
 like(load_config($colon), qr/\[pulse\] bad channel0/, 'a colon in a channel name is rejected');
-unlink $colon;
 
 my $dash = write_conf(<<'EOF');
 [pulse]
 type = pulse
-channel0 = -a
+channel0 = -V
 EOF
 like(load_config($dash), qr/\[pulse\] bad channel0/, 'a channel name may not be an mbsync flag');
-unlink $dash;
 
 my $dup = write_conf(<<'EOF');
+[knf]
+type = account
+server = imap.example.com
+user = a@example.com
+pass = secret
+
 [pulse]
 type = pulse
-channel0 = gm-ctf
-channel1 = gm-ctf
+channel0 = knf
+channel1 = knf
 EOF
-like(load_config($dup), qr/\[pulse\] duplicate channel gm-ctf/, 'a repeated channel is rejected');
-unlink $dup;
+like(load_config($dup), qr/\[pulse\] duplicate channel knf/, 'a repeated channel is rejected');
 
 my $held = write_conf(<<'EOF');
 [pulse]
 type = pulse
 disabled = yes
-sweep = no
+sweep = soon
+channel0 =
 EOF
 is(load_config($held), '', 'disabled = yes does not check the pulse keys');
 is(pulse_snapshot_for_test()->{disabled}, 1, 'the section is held');
 is_deeply([due_pulse_channels(1000)], [], 'a held section starts nothing');
-is_deeply([grep { /^pulse: / } info_lines(1000)], ['pulse: disabled'], 'state names the held section');
-unlink $held;
+is_deeply([grep { /^pulse: / } info_lines(1000)], ['pulse: pulse disabled'],
+    'state names the held section');
 
-my $only = write_conf(<<'EOF');
+my $unknown = write_conf(<<'EOF');
 [pulse]
 type = pulse
-channel0 = gm-ctf
-channel1 = knf
+channel0 = knf
 EOF
-is(load_config($only), '', 'a file with only pulse channels loads');
-is_deeply([account_names()], [], 'no IMAP account is required');
-is(pulse_snapshot_for_test()->{sweep}, 3600, 'an omitted sweep is 3600');
-is_deeply(pulse_snapshot_for_test()->{channels}, [qw(gm-ctf knf)], 'channels stay in order');
-is_deeply([due_pulse_channels(1000)], [qw(gm-ctf knf)], 'the first load is due together');
+like(load_config($unknown), qr/\[pulse\] unknown account knf/, 'a pulse name must be an account');
 
-my $now = time();
-set_pulse_next_for_test('gm-ctf', $now + 10);
-set_pulse_next_for_test('knf', $now + 100);
-my $wait = loop_timeout();
-cmp_ok($wait, '>', 8, 'the loop wakes for the nearer pulse channel');
-cmp_ok($wait, '<=', 10, 'the loop does not sleep past that channel');
-note_child_for_test(1, 'mbsync gm-ctf');
-note_child_for_test(2, 'mbsync knf');
-set_pulse_next_for_test('gm-ctf', $now - 5);
-set_pulse_next_for_test('knf', $now - 5);
-my $busy_wait = loop_timeout();
-cmp_ok($busy_wait, '>=', 29, 'a channel that is already running does not spin the loop');
-clear_children_for_test();
-unlink $only;
-
-my $path = write_conf(<<'EOF');
-[acct]
-type = idle
+my $folded = write_conf(<<'EOF');
+[knf]
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
-mbsync_channel = fdc-main
-folder0 = INBOX
 
 [pulse]
 type = pulse
-sweep = 3600
-channel0 = gm-ctf
-channel1 = knf
-channel2 = knfmobile
+folder0 = INBOX
+channel0 = knf
 EOF
-is(load_config($path), '', 'accounts and pulse channels load together');
-is(loaded_account('acct')->{mbsync_channel}, 'fdc-main', 'the account is unchanged');
-is_deeply(
-    [due_pulse_channels(1000)],
-    [qw(gm-ctf knf knfmobile)],
-    'every pulse channel is due on the first load',
-);
-is_deeply(
-    [grep { /: pulse sweep / } info_lines(1000)],
-    [
-        'gm-ctf: pulse sweep 3600s due',
-        'knf: pulse sweep 3600s due',
-        'knfmobile: pulse sweep 3600s due',
-    ],
-    'state shows each channel due',
-);
+like(load_config($folded), qr/\[pulse\] folder/, 'a pulse section cannot name a folder');
 
-clear_children_for_test();
-reset_schedule_for_test();
-note_child_for_test(9, 'mbsync gm-ctf');
-is_deeply(
-    [due_pulse_channels(1000)],
-    [qw(knf knfmobile)],
-    'a running channel does not start a second copy',
-);
-is_deeply(
-    [grep { /^gm-ctf: pulse / } info_lines(1000)],
-    ['gm-ctf: pulse sweep 3600s running'],
-    'state shows the running channel',
-);
-note_mail_event('gm-ctf', 'INBOX', 420, 0, 1000);
-is_deeply([jobs(1005)], [], 'a folder sync waits while the bare channel runs');
-ok(!defined next_schedule_delay(1005), 'that wait does not spin the loop');
-clear_children_for_test();
-is_deeply([jobs(1005)], ['gm-ctf:INBOX wait=0'], 'the folder sync runs once the channel is free');
-
-reset_schedule_for_test();
-clear_children_for_test();
-note_child_for_test(4, 'mbsync gm-ctf:INBOX');
-is_deeply(
-    [due_pulse_channels(1000)],
-    [qw(knf knfmobile)],
-    'the bare channel waits while a folder of that channel is syncing',
-);
-note_mail_event('fdc-main', 'INBOX', 420, 0, 1000);
-is_deeply(
-    [jobs(1005)],
-    ['fdc-main:INBOX wait=0'],
-    'a different channel is not delayed',
-);
-clear_children_for_test();
-is_deeply(
-    [due_pulse_channels(1000)],
-    [qw(gm-ctf knf knfmobile)],
-    'the bare channel starts once its folder sync is gone',
-);
-
-finish_pulse_channel('gm-ctf', 1009);
-finish_pulse_channel('knf', 1018);
-finish_pulse_channel('knfmobile', 1040);
-is(pulse_snapshot_for_test()->{next}{'gm-ctf'}, 4609, 'gm-ctf waits 3600s from its own exit');
-is(pulse_snapshot_for_test()->{next}{knf}, 4618, 'knf waits 3600s from its own exit');
-is(pulse_snapshot_for_test()->{next}{knfmobile}, 4640, 'knfmobile waits 3600s from its own exit');
-is_deeply([due_pulse_channels(4608)], [], 'nothing is due one second early');
-is_deeply([due_pulse_channels(4609)], ['gm-ctf'], 'only the channel whose wait ended is due');
-is_deeply([due_pulse_channels(4618)], [qw(gm-ctf knf)], 'each clock stays independent');
-is_deeply([due_pulse_channels(4640)], [qw(gm-ctf knf knfmobile)], 'a later exit is due later');
-is_deeply(
-    [grep { /^gm-ctf: pulse / } info_lines(1109)],
-    ['gm-ctf: pulse sweep 3600s next 3500s'],
-    'state shows the remaining wait',
-);
-
-my $edited = write_conf(<<'EOF');
-[acct]
-type = idle
+my $bare = write_conf(<<'EOF');
+[knf]
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
-mbsync_channel = fdc-main
-folder0 = INBOX
 
 [pulse]
 type = pulse
-sweep = 60
-channel0 = gm-ctf
-channel1 = archive
+channel = knf
 EOF
-is(reload_config_now($edited), '', 'reload accepts a new pulse list');
-my $snap = pulse_snapshot_for_test();
-is($snap->{sweep}, 60, 'reload stores the new sweep');
-is_deeply($snap->{channels}, [qw(gm-ctf archive)], 'channel order follows the file');
-is($snap->{next}{'gm-ctf'}, 4609, 'a channel that remains keeps its clock');
-is($snap->{next}{archive}, 0, 'a new channel is due immediately');
-ok(!exists $snap->{next}{knf}, 'a removed channel is not scheduled');
-finish_pulse_channel('gm-ctf', 5000);
-is(pulse_snapshot_for_test()->{next}{'gm-ctf'}, 5060, 'the new sweep applies when the run exits');
+like(load_config($bare), qr/\[pulse\] channel/, 'a pulse section uses channelN');
 
-my $bad = write_conf(<<'EOF');
-[acct]
-type = idle
-server = imap.example.com
-EOF
-isnt(reload_config_now($bad), '', 'a bad file is rejected');
-is(pulse_snapshot_for_test()->{next}{'gm-ctf'}, 5060, 'a rejected file keeps the pulse clock');
-is_deeply(
-    pulse_snapshot_for_test()->{channels},
-    [qw(gm-ctf archive)],
-    'a rejected file keeps the pulse channels',
-);
-unlink $bad;
-
-my $off = write_conf(<<'EOF');
-[acct]
-type = idle
+my $on_login = write_conf(<<'EOF');
+[knf]
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
-mbsync_channel = fdc-main
 folder0 = INBOX
-
-[pulse]
-type = pulse
-disabled = YES
-channel0 = gm-ctf
 EOF
-is(reload_config_now($off), '', 'reload accepts disabled = yes');
-is(pulse_snapshot_for_test()->{disabled}, 1, 'reload holds the section');
-is_deeply([due_pulse_channels(9000)], [], 'a held section stays idle');
-unlink $off;
+like(load_config($on_login), qr/\[knf\] folder/, 'a folder belongs on the idle section');
 
-is(reload_config_now($path), '', 'removing yes enables the section');
-is(pulse_snapshot_for_test()->{disabled}, 0, 'the section is active again');
-is(pulse_snapshot_for_test()->{sweep}, 3600, 'the saved sweep returns');
-is_deeply(
-    [due_pulse_channels(9000)],
-    [qw(gm-ctf knf knfmobile)],
-    'enabling the section makes every channel due',
-);
-
-my $gone = write_conf(<<'EOF');
-[acct]
-type = idle
+my $both = write_conf(<<'EOF');
+[knf]
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
-mbsync_channel = fdc-main
+
+[main]
+type = idle
+channel = knf
+server = other.example.com
 folder0 = INBOX
 EOF
-is(reload_config_now($gone), '', 'reload accepts a file with no pulse section');
-is_deeply(pulse_snapshot_for_test()->{channels}, [], 'dropping the section drops the channels');
-is_deeply([due_pulse_channels(9000)], [], 'nothing in pulse is due');
-unlink $gone;
-unlink $edited;
-unlink $path;
+like(load_config($both), qr/\[main\] sets both channel and server/, 'an idle section is a schedule or a login');
 
-my $boot = write_conf(<<'EOF');
-[acct]
-type = idle
+my $same = write_conf(<<'EOF');
+[knf]
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
-mbsync_channel = fdc-main
-folder0 = INBOX
-folder1 = Archive
 
-[held]
+[main]
 type = idle
-disabled = yes
+channel = knf
+folder0 = INBOX
 
 [pulse]
 type = pulse
 channel0 = knf
-channel1 = other
 EOF
-is(load_config($boot), '', 'startup order fixture loads');
-reset_schedule_for_test();
-clear_children_for_test();
-my $cap = track_cfg_for_test();
-$cap->{connections} = 2;
-install_track($cap, 0);
-set_foreground_for_test(1);
-my $primed = capture(sub { prime_named_folders(2000); });
-my $again  = capture(sub { prime_named_folders(2001); });
-set_foreground_for_test(0);
-like($primed, qr/acct    : startup sync INBOX Archive/, 'startup names the account folders');
-unlike($primed, qr/held: startup/, 'a disabled account is not synced at startup');
-is($again, '', 'startup sync is queued once');
+like(load_config($same), qr/\[pulse\] duplicate account knf/, 'one account is idle or pulse');
 
-my @forked;
-set_trigger_hook_for_test(sub {
-    my ($wait, $args, $meta) = @_;
-    push @forked, { wait => $wait, args => [@$args], pulse => $meta->{pulse} };
-    return hold_child_for_test(70000 + @forked, 'mbsync ' . join(' ', @$args));
-});
-set_live_for_test(0);
-pump_schedule(2000);
-is_deeply(\@forked, [], 'mbsync waits until this process is the one that stays');
-set_live_for_test(1);
-queue_folder('hotb', 'INBOX', 2000, 2000);
-pump_schedule(2000);
-is_deeply(
-    [map { join(' ', @{ $_->{args} }) } @forked],
-    ['fdc-main:Archive fdc-main:INBOX', 'knf'],
-    'one slot stays with the named folders and pulse uses the other',
-);
-is($forked[0]{wait}, 0, 'startup sync does not wait out the event delay');
-ok(!defined $forked[0]{pulse}, 'the named sync is not a pulse job');
-is($forked[1]{pulse}, 'knf', 'the spare slot is a pulse channel');
-ok(defined schedule_deadline('hotb'), 'the next named channel stays queued');
-is_deeply([due_pulse_channels(2000)], ['other'], 'a pulse channel with no free slot stays due');
-@forked = ();
-pump_schedule(2000);
-is_deeply(\@forked, [], 'a full pair does not start another mbsync');
+my $twice = write_conf(<<'EOF');
+[knf]
+type = account
+server = imap.example.com
+user = a@example.com
+pass = secret
 
-clear_children_for_test();
-@forked = ();
-reset_schedule_for_test();
-set_pulse_next_for_test('knf', 10**12);
-set_pulse_next_for_test('other', 10**12);
-queue_folder('fdc-main', 'INBOX', 2000, 2000);
-queue_folder('hotb', 'INBOX', 2000, 2000);
-pump_schedule(2000);
-is_deeply(
-    [map { join(' ', @{ $_->{args} }) } @forked],
-    ['fdc-main:INBOX', 'hotb:INBOX'],
-    'named folders use every slot when pulse is not due',
-);
+[a]
+type = pulse
+channel0 = knf
 
-clear_children_for_test();
-@forked = ();
-reset_schedule_for_test();
-$cap = track_cfg_for_test();
-$cap->{connections} = 1;
-install_track($cap, 0);
-set_pulse_next_for_test('knf', 0);
-set_pulse_next_for_test('other', 0);
-prime_named_folders(2000);
-pump_schedule(2000);
-is_deeply(
-    [map { join(' ', @{ $_->{args} }) } @forked],
-    ['fdc-main:Archive fdc-main:INBOX'],
-    'with one slot the named sync holds pulse',
-);
-is_deeply([due_pulse_channels(2000)], [qw(knf other)], 'pulse stays due on the only slot');
-clear_children_for_test();
-@forked = ();
-pump_schedule(2000);
-is_deeply(
-    [map { join(' ', @{ $_->{args} }) } @forked],
-    ['knf'],
-    'pulse starts once the only slot is free',
-);
+[b]
+type = pulse
+channel0 = knf
+EOF
+like(load_config($twice), qr/\[b\] duplicate account knf/, 'one account is on one pulse section');
 
-clear_children_for_test();
-@forked = ();
-reset_schedule_for_test();
-$cap = track_cfg_for_test();
-$cap->{connections} = 2;
-install_track($cap, 0);
-set_pulse_next_for_test('knf', 0);
-set_pulse_next_for_test('other', 0);
-queue_folder('fdc-main', 'INBOX', 2100, 2130);
-pump_schedule(2100);
-is_deeply(
-    [map { join(' ', @{ $_->{args} }) } @forked],
-    ['knf'],
-    'pulse uses the spare slot during a named-folder combine window',
-);
-is(next_schedule_delay(2100), 30, 'the named folder wakes the loop at its deadline');
-ok(!defined next_pulse_delay(2100), 'the held slot does not make the loop spin');
-is_deeply([due_pulse_channels(2100)], ['other'], 'the second pulse channel waits for a slot');
+my $clash = write_conf(<<'EOF');
+[one]
+type = account
+server = imap.example.com
+user = a@example.com
+pass = secret
+mbsync_channel = same
 
-reset_schedule_for_test();
-clear_children_for_test();
-$cap = track_cfg_for_test();
-$cap->{connections} = 1;
-install_track($cap, 0);
-queue_folder('fdc-main', 'INBOX', 3000, 3000);
-note_child_for_test(3, 'mbsync other:INBOX');
-ok(!defined next_schedule_delay(3000), 'a due named folder does not spin while every slot is taken');
+[two]
+type = account
+server = imap.example.com
+user = b@example.com
+pass = secret
+mbsync_channel = same
 
-set_trigger_hook_for_test(undef);
-set_foreground_for_test(0);
-unlink $boot;
+[main]
+type = idle
+channel = one
+folder0 = INBOX
 
-my $saved = write_conf(<<'EOF');
+[pulse]
+type = pulse
+channel0 = two
+EOF
+like(load_config($clash), qr/duplicate mbsync channel same/, 'two logins cannot share an mbsync channel');
+
+my $servers = write_conf(<<'EOF');
+[fdh]
+type = server
+host = mail.example.com
+port = 993
+proto = tls
+
+[plain]
+type = server
+host = localhost
+proto = notls
+
+[start]
+type = server
+host = mail.example.com
+proto = starttls
+
+[kept]
+type = account
+server = fdh
+user = a@example.com
+pass = secret
+proto = starttls
+
+[moved]
+type = account
+server = start
+user = a@example.com
+pass = secret
+port = 1993
+
+[clear]
+type = account
+server = plain
+user = a@example.com
+pass = secret
+
+[host]
+type = account
+server = imap.example.com
+user = a@example.com
+pass = secret
+EOF
+is(load_config($servers), '', 'server sections load') or diag(load_config($servers));
+is(loaded_account('kept')->{server}, 'mail.example.com', 'a server name becomes the host');
+is(loaded_account('kept')->{port}, 993, 'an explicit server port is kept when proto changes');
+is(loaded_account('kept')->{proto}, 'starttls', 'the account proto replaces the server proto');
+is(loaded_account('moved')->{port}, 1993, 'an account port replaces the server port');
+is(loaded_account('moved')->{proto}, 'starttls', 'starttls is the server proto');
+is(loaded_account('clear')->{proto}, 'notls', 'notls is a clear connection');
+is(loaded_account('clear')->{port}, 143, 'notls defaults to port 143');
+is(loaded_account('host')->{proto}, 'tls', 'a hostname is implicit TLS');
+is(loaded_account('host')->{port}, 993, 'a hostname uses port 993');
+my $nodes = ctl_nodes(1000);
+is($nodes->{'server.fdh.host'}, 'mail.example.com', 'the control socket shows the server host');
+is($nodes->{'server.fdh.port'}, 993, 'the control socket shows the server port');
+is($nodes->{'server.fdh.proto'}, 'tls', 'the control socket shows the server proto');
+is($nodes->{'account.kept.proto'}, 'starttls', 'the control socket shows the account proto');
+
+my $bad_proto = write_conf(<<'EOF');
+[fdh]
+type = server
+host = mail.example.com
+proto = maybe
+EOF
+like(load_config($bad_proto), qr/\[fdh\] bad proto/, 'a server proto must be tls, starttls, or notls');
+
+my $no_host = write_conf(<<'EOF');
+[fdh]
+type = server
+proto = tls
+EOF
+like(load_config($no_host), qr/\[fdh\] missing host/, 'a server section needs a host');
+
+my $ok = write_conf(<<'EOF');
+[knf]
+type = account
+server = imap.example.com
+user = a@example.com
+pass = secret
+
+[other]
+type = account
+server = imap.example.com
+user = b@example.com
+pass = secret
+mbsync_channel = otherbox
+
+[main]
+type = idle
+channel = knf
+folder0 = INBOX;priority=1
+folder1 = Archive
+
+[fast]
+type = pulse
+sweep = 100
+channel0 = other
+EOF
+is(load_config($ok), '', 'idle and pulse sections load') or diag(load_config($ok));
+ok(!loaded_account('main'), 'the idle section name is only a label');
+is(loaded_account('knf')->{role}, 'idle', 'channel= selects the idle account');
+is(loaded_account('knf')->{mbsync_channel}, 'knf', 'the mbsync channel stays on the account');
+is(loaded_account('knf')->{folders}[0]{name}, 'INBOX', 'folderN is watched');
+is(loaded_account('knf')->{folders}[0]{debounce}, 7, 'the idle folder keeps its priority');
+is(loaded_account('knf')->{folders}[1]{name}, 'Archive', 'a second folder is watched');
+is(loaded_account('other')->{role}, 'pulse', 'the pulse account does not idle');
+is_deeply(loaded_account('other')->{folders}, [], 'a pulse account has no IDLE folders');
+is(loaded_account('other')->{sweep}, 100, 'the pulse sweep is stored on the account');
+is(loaded_account('other')->{mbsync_channel}, 'otherbox', 'pulse runs that mbsync channel');
+my @info = info_lines(1000);
+ok((grep { $_ eq 'other: down server imap.example.com channel otherbox retry 0s' } @info),
+    'a pulse login with no socket is down');
+ok((grep { /^fast: pulse sweep 100s 1$/ } @info), 'state names the pulse section');
+
+my $legacy = write_conf(<<'EOF');
 [acct]
 type = idle
 server = imap.example.com
 user = a@example.com
 pass = secret
-mbsync_channel = fdc-main
+mbsync_channel = personal
 folder0 = INBOX
+EOF
+is(load_config($legacy), '', 'an inline idle section still loads');
+is(loaded_account('acct')->{proto}, 'tls', 'an inline idle login is implicit TLS');
+is(loaded_account('acct')->{port}, 993, 'an inline idle login uses port 993');
+is(loaded_account('acct')->{role}, 'idle', 'the inline section is the account');
 
-[pulse]
+my $pair = write_conf(<<'EOF');
+[knf]
+type = account
+server = imap.example.com
+user = a@example.com
+pass = secret
+
+[other]
+type = account
+server = imap.example.com
+user = b@example.com
+pass = secret
+
+[fast]
+type = pulse
+sweep = 100
+channel0 = other
+
+[slow]
 type = pulse
 sweep = 3600
-channel0 = gm-ctf
-channel1 = knf
-channel2 = knfmobile
+channel0 = knf
+hook = echo slow
 EOF
-my $pdir = tempdir('imapidle-pulse-XXXX', CLEANUP => 1, TMPDIR => 1);
-open my $pf, '>', "$pdir/pulse-last" or die "pulse-last: $!";
-print $pf "# channel\tlast\nknf\t1000\nknfmobile\t2000\n";
-close $pf;
-set_state_dir_for_test($pdir);
-is(load_config($saved), '', 'a fresh load reads pulse-last');
-is(pulse_snapshot_for_test()->{next}{knf}, 4600, 'knf waits sweep seconds after its saved exit');
-is(pulse_snapshot_for_test()->{next}{knfmobile}, 5600, 'knfmobile waits from its own saved exit');
-is(pulse_snapshot_for_test()->{next}{'gm-ctf'}, 0, 'a channel with no saved exit is due');
-is_deeply([due_pulse_channels(4500)], ['gm-ctf'], 'a recent exit is not due again after restart');
-is_deeply([due_pulse_channels(4600)], [qw(gm-ctf knf)], 'knf is due once its sweep has passed');
+is(load_config($pair), '', 'two pulse sections load') or diag(load_config($pair));
+is(loaded_account('knf')->{sweep}, 3600, 'slow sweep belongs to knf');
+is(loaded_account('other')->{sweep}, 100, 'fast sweep belongs to other');
+is(loaded_account('knf')->{pulse_hook}, 'echo slow', 'the section hook is stored on the account');
+is(ctl_nodes(1000)->{'pulse.slow.sweep'}, 3600, 'the control socket shows each sweep');
+is(ctl_nodes(1000)->{'pulse.fast.sweep'}, 100, 'the other sweep is its own node');
+
+reset_track_for_test();
+set_state_dir_for_test($state);
+set_interval_spread_for_test(sub { 0 });
+my $now = 10_000;
+apply_folder_list('knf', ['INBOX'], {}, 1, $now);
+my $inbox = row('INBOX');
+is($inbox->{pulse}, 1, 'a listed pulse mailbox is marked');
+is($inbox->{sweep}, 3600, 'the mailbox keeps its section sweep');
+is($inbox->{classified}, 0, 'a new mailbox waits for STATUS');
+is($inbox->{next}, $now, 'STATUS is due immediately');
+is(ctl_nodes($now)->{'track.box.knf.INBOX.pulse'}, 1, 'the control socket marks a pulse mailbox');
+
+set_track_due_for_test('knf', 'INBOX', 5000);
+apply_folder_list('knf', ['INBOX', 'Later'], {}, 1, $now);
+is(row('INBOX')->{next}, 5000, 'a later list keeps the mailbox clock');
+is(row('Later')->{next}, $now, 'a mailbox that appears later is due for STATUS');
+is(row('Later')->{classified}, 0, 'a new name is not classified yet');
+
+my @forked;
+set_trigger_hook_for_test(sub {
+    my ($wait, $args, $meta) = @_;
+    push @forked, { args => [@$args], meta => $meta };
+    return hold_child_for_test(80000 + @forked, 'mbsync ' . join(' ', @$args));
+});
+
+reset_track_for_test();
+set_state_dir_for_test($state);
+apply_folder_list('knf', ['INBOX'], {}, 1, $now);
+my $empty_imap = StatusIMAP->new({
+    INBOX => [qq{* STATUS "INBOX" (MESSAGES 0 UIDNEXT 4)\n}, 'A OK'],
+});
+set_primary_for_test('knf', 'knf', $empty_imap, 'PULSE');
+set_next_try_for_test($_, time() + 10000) for account_names();
+set_connections_for_test(1);
+hold_child_for_test(42, 'mbsync hot:INBOX');
+is(loop_timeout(), 0, 'a due pulse STATUS wakes while every mbsync slot is taken');
+@forked = ();
+pump_tracked($now);
+is_deeply(\@forked, [], 'STATUS does not start mbsync');
+ok(scalar @{ $empty_imap->{cmds} }, 'STATUS ran without a free slot');
+$inbox = row('INBOX');
+is($inbox->{classified}, 1, 'the first empty look is classified');
+is($inbox->{empty}, 1, 'no messages keeps the empty class');
+is($inbox->{next}, $now + 86400, 'an empty pulse mailbox waits a day, not the sweep');
+is($inbox->{confirm}, $now + 604800, 'the first empty look confirms in seven days');
+my $held_confirm = $inbox->{confirm};
 clear_children_for_test();
+
+set_track_due_for_test('knf', 'INBOX', $now - 1);
+@forked = ();
+pump_tracked($now);
+is_deeply(\@forked, [], 'a later empty look still skips mbsync');
+is(row('INBOX')->{confirm}, $held_confirm, 'a later empty look keeps the confirmation');
+
+$empty_imap->{replies}{INBOX} = [qq{* STATUS "INBOX" (MESSAGES 2 UIDNEXT 9)\n}, 'A OK'];
+set_track_due_for_test('knf', 'INBOX', $now - 1);
+@forked = ();
+pump_tracked($now);
+is($forked[0]{args}[0], 'knf:INBOX', 'mail in an empty pulse mailbox syncs now');
+is($forked[0]{meta}{pulse}, 'knf', 'the child is a pulse mailbox');
+clear_children_for_test();
+my $gain_id = $forked[0]{meta}{track};
+my $summary = "Channels: 1    Boxes: 1    Far: +1 *0 #0 -0    Near: +0 *0 #0 -0\n";
+finish_track_job({ track => $gain_id }, 0, 3, $summary, $now + 20);
+is(row('INBOX')->{next}, $now + 20 + 3600, 'the sweep starts when that mbsync exits');
+is(row('INBOX')->{empty}, 0, 'mail leaves the empty class');
+ok(-f "$state/pulse-last", 'the exit is stored for a later mailbox');
+my $saved_exit = $now + 20;
+like(do { local $/; open my $fh, '<', "$state/pulse-last" or die $!; <$fh> },
+    qr/^knf\t$saved_exit$/m, 'pulse-last records that exit');
+
+unlink "$state/pulse-last";
+set_state_dir_for_test($state);
+reset_track_for_test();
+clear_conns_for_test();
+clear_children_for_test();
+apply_folder_list('knf', ['Fresh'], {}, 1, $now + 30);
+my $mail_imap = StatusIMAP->new({
+    Fresh => [qq{* STATUS "Fresh" (MESSAGES 4 UIDNEXT 11)\n}, 'A OK'],
+});
+set_primary_for_test('knf', 'knf', $mail_imap, 'PULSE');
+@forked = ();
+pump_tracked($now + 30);
+is_deeply(\@forked, [], 'the first look at a mailbox with mail does not sync yet');
+my $fresh = row('Fresh');
+is($fresh->{classified}, 1, 'the first look classifies the mailbox');
+is($fresh->{await_sync}, 0, 'the first wait is not a sync');
+is($fresh->{next}, $now + 30 + 3600, 'the first wait is one sweep, spread by nothing here');
+
+reset_track_for_test();
+clear_conns_for_test();
+my $seed_at = $now + 20;
+open my $oldf, '>', "$state/pulse-last" or die $!;
+print $oldf "knf\t$seed_at\n";
+close $oldf;
+set_state_dir_for_test($state);
+my $late = $seed_at + 3600;
+apply_folder_list('knf', ['Seeded'], {}, 1, $late);
+my $seed_imap = StatusIMAP->new({
+    Seeded => [qq{* STATUS "Seeded" (MESSAGES 1 UIDNEXT 3)\n}, 'A OK'],
+});
+set_primary_for_test('knf', 'knf', $seed_imap, 'PULSE');
+@forked = ();
+pump_tracked($late);
+is($forked[0]{args}[0], 'knf:Seeded', 'a saved exit that is already a sweep old syncs now');
+clear_children_for_test();
+
+reset_track_for_test();
+clear_conns_for_test();
+my $future_exit = $now + 5000;
+open my $pf, '>', "$state/pulse-last" or die $!;
+print $pf "knf\t$future_exit\n";
+close $pf;
+set_state_dir_for_test($state);
+apply_folder_list('knf', ['Wait'], {}, 1, $future_exit + 10);
+my $wait_imap = StatusIMAP->new({
+    Wait => [qq{* STATUS "Wait" (MESSAGES 1 UIDNEXT 3)\n}, 'A OK'],
+});
+set_primary_for_test('knf', 'knf', $wait_imap, 'PULSE');
+@forked = ();
+pump_tracked($future_exit + 10);
+is_deeply(\@forked, [], 'a recent saved exit does not sync again');
+is(row('Wait')->{next}, $future_exit + 3600, 'the saved exit plus one sweep is the clock');
+
+set_pulse_box_for_test('knf', 'INBOX', $now, 3600);
+set_pulse_box_for_test('knf', 'Other', $now, 3600);
+clear_children_for_test();
+@forked = ();
+set_connections_for_test(4);
+pump_schedule($now);
+is(scalar(@forked), 1, 'one mailbox of a channel syncs at a time');
+like($forked[0]{args}[0] // '', qr/^knf:/, 'the job names the mailbox');
+
+clear_children_for_test();
+@forked = ();
+set_trigger_hook_for_test(sub { 0 });
+set_pulse_box_for_test('knf', 'INBOX', $now, 3600);
+pump_schedule($now);
+is(row('INBOX')->{next}, $now + 3600, 'a failed start still waits out the sweep');
+ok(!-f "$state/pulse-last" || do {
+    open my $fh, '<', "$state/pulse-last";
+    local $/;
+    my $body = <$fh>;
+    $body !~ /^knf\t$now$/m;
+}, 'a failed start does not record an exit');
+
+set_trigger_hook_for_test(sub {
+    my ($wait, $args, $meta) = @_;
+    push @forked, { args => [@$args], meta => $meta };
+    return hold_child_for_test(81000 + @forked, 'mbsync ' . join(' ', @$args));
+});
+clear_children_for_test();
+@forked = ();
 reset_schedule_for_test();
-set_trigger_hook_for_test(sub { return 0 });
-pump_pulse(4500);
-is(pulse_snapshot_for_test()->{next}{'gm-ctf'}, 8100, 'a failed start still waits out the sweep');
-unlike(slurp("$pdir/pulse-last"), qr/^gm-ctf\t/m, 'a failed start is not a saved exit');
-set_trigger_hook_for_test(undef);
-finish_pulse_channel('gm-ctf', 4500);
-is(pulse_snapshot_for_test()->{next}{'gm-ctf'}, 8100, 'an exit still starts the sweep wait');
-like(slurp("$pdir/pulse-last"), qr/^gm-ctf\t4500$/m, 'the exit is stored for the next start');
-like(slurp("$pdir/pulse-last"), qr/^knf\t1000$/m, 'another channel keeps its saved exit');
-set_state_dir_for_test($pdir);
-is(load_config($saved), '', 'a second start reads the exit just saved');
-is(pulse_snapshot_for_test()->{next}{'gm-ctf'}, 8100, 'restart does not run a channel still inside sweep');
-is_deeply([due_pulse_channels(8000)], [qw(knf knfmobile)], 'only channels past their sweep are due');
-open my $rew, '>', "$pdir/pulse-last" or die "rewrite pulse-last: $!";
-print $rew "# channel\tlast\nknf\t1\n";
-close $rew;
-is(reload_config_now($saved), '', 'reload does not reread pulse-last');
-is(pulse_snapshot_for_test()->{next}{knf}, 4600, 'reload keeps the clock already in memory');
-unlink $saved;
+set_connections_for_test(1);
+set_pulse_box_for_test('otherbox', 'INBOX', $now, 100);
+queue_folder('hot', 'INBOX', $now, $now);
+pump_schedule($now);
+is_deeply([map { $_->{args}[0] } @forked], ['hot:INBOX'], 'cap 1 gives the only slot to the named folder');
+is_deeply([due_pulse_channels($now)], ['otherbox'], 'the pulse mailbox stays due');
+ok(!defined next_pulse_delay($now), 'a full slot does not spin the pulse clock');
+
+clear_children_for_test();
+@forked = ();
+reset_schedule_for_test();
+set_connections_for_test(2);
+set_pulse_box_for_test('otherbox', 'INBOX', $now, 100);
+queue_folder('hot', 'INBOX', $now, $now);
+queue_folder('hot2', 'INBOX', $now, $now);
+pump_schedule($now);
+is(scalar(grep { $_->{args}[0] =~ /^hot/ } @forked), 1, 'cap 2 keeps one slot for the named folder');
+ok((grep { $_->{args}[0] eq 'otherbox:INBOX' } @forked), 'the other slot syncs the due pulse mailbox');
+
+clear_children_for_test();
+@forked = ();
+reset_schedule_for_test();
+set_connections_for_test(16);
+set_pulse_next_for_test('otherbox', 10**12);
+queue_folder('h1', 'INBOX', $now, $now);
+queue_folder('h2', 'INBOX', $now, $now);
+queue_folder('h3', 'INBOX', $now, $now);
+pump_schedule($now);
+is(scalar(@forked), 3, 'named folders use every slot while pulse is inside its sweep');
+
+clear_children_for_test();
+@forked = ();
+reset_schedule_for_test();
+set_pulse_box_for_test('otherbox', 'INBOX', $now, 100);
+set_pulse_box_for_test('knf', 'INBOX', $now, 3600);
+queue_folder('h1', 'INBOX', $now, $now);
+queue_folder('h2', 'INBOX', $now, $now);
+queue_folder('h3', 'INBOX', $now, $now);
+pump_schedule($now);
+is(scalar(grep { $_->{args}[0] =~ /^h\d:INBOX$/ } @forked), 1,
+    'cap 16 still keeps the other slots for pulse mailboxes');
+is(scalar(grep { $_->{meta}{pulse} } @forked), 2, 'two pulse channels sync beside that one named folder');
+
+my $edited = write_conf(<<'EOF');
+[knf]
+type = account
+server = imap.example.com
+user = a@example.com
+pass = secret
+
+[other]
+type = account
+server = imap.example.com
+user = b@example.com
+pass = secret
+
+[slow]
+type = pulse
+sweep = 50
+channel0 = knf
+EOF
+my $before = row('INBOX') ? row('INBOX')->{next} : $now;
+is(reload_config_now($edited), '', 'reload accepts a new sweep');
+my ($kept) = grep { $_->{channel} eq 'knf' && $_->{box} eq 'INBOX' } track_rows_for_test();
+is($kept->{sweep}, 50, 'a reload stores the new sweep on the mailbox');
+is($kept->{next}, $before, 'a reload keeps the mailbox clock');
+ok(!(grep { $_->{channel} eq 'otherbox' } track_rows_for_test()),
+    'a channel that leaves pulse drops its mailboxes');
 
 done_testing;
-
-sub slurp {
-    my ($file) = @_;
-    open my $in, '<', $file or die "read $file: $!";
-    local $/;
-    return scalar <$in>;
-}
-
-sub capture {
-    my ($code) = @_;
-    my ($tfh, $path) = tempfile('imapidle-cap-XXXX', UNLINK => 1, TMPDIR => 1);
-    close $tfh;
-    open my $old, '>&', \*STDERR or die "dup stderr: $!";
-    open STDERR, '>', $path or die "redirect stderr: $!";
-    my $err;
-    eval { $code->(); 1 } or $err = $@;
-    open STDERR, '>&', $old or die "restore stderr: $!";
-    close $old;
-    open my $in, '<', $path or die "read stderr: $!";
-    local $/;
-    my $buf = <$in> // '';
-    close $in;
-    die $err if $err;
-    return $buf;
-}

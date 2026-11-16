@@ -47,6 +47,12 @@ user = b\@example.com
 pass = secret
 mbsync_channel = quiet
 
+[knf]
+type = account
+server = imap.example.com
+user = k\@example.com
+pass = secret
+
 [pulse]
 type = pulse
 channel0 = knf
