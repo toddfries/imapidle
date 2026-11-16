@@ -567,19 +567,17 @@ The default is 3600.
 The next wake is that exit plus
 .Va sweep ,
 with no extra spread.
-The first time a mailbox is seen with mail, and no earlier exit
-is saved for that channel, the wait is
+The first time a mailbox is seen with mail, the wait is
 .Va sweep
-plus the same quarter spread used by backoff, so a herd of new
-mailboxes does not sync in the same second.
+plus the same quarter spread used by backoff.
+Each mailbox draws its own spread, so a herd of new mailboxes
+does not sync in the same second.
 An exit recorded in
 .Pa ~/.local/imapidle/pulse-last
-seeds only a mailbox that is not already in the track file.
-If that saved time plus
-.Va sweep
-is already past, the mailbox syncs now.
-If it is still ahead, that time is the clock, and no second
-spread is added.
+is the start of that wait for a mailbox that is not already in
+the track file.
+If that saved time plus the spread wait is already past, the
+mailbox syncs now.
 A mailbox that is already tracked keeps the clock in the track
 file.
 .Pp
@@ -933,7 +931,9 @@ A mailbox already stored in
 .Pa track
 keeps its own clock.
 A mailbox seen for the first time uses this time as the start
-of its sweep.
+of its first wait, which is
+.Va sweep
+plus a quarter spread drawn for that mailbox.
 .It Pa ~/.local/imapidle/mbsync-real
 Count and total real seconds for each
 .Sy mbsync

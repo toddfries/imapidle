@@ -527,6 +527,79 @@ pump_tracked($future_exit + 10);
 is_deeply(\@forked, [], 'a recent saved exit does not sync again');
 is(row('Wait')->{next}, $future_exit + 3600, 'the saved exit plus one sweep is the clock');
 
+my @spread_add;
+set_interval_spread_for_test(sub { shift @spread_add });
+my $herd_exit = $now + 8000;
+open my $hf, '>', "$state/pulse-last" or die $!;
+print $hf "knf\t$herd_exit\n";
+close $hf;
+set_state_dir_for_test($state);
+reset_track_for_test();
+clear_conns_for_test();
+clear_children_for_test();
+my $seen_at = $herd_exit + 100;
+@spread_add = (10, 400);
+apply_folder_list('knf', ['Academy', 'Archives'], {}, 1, $seen_at);
+my $herd_imap = StatusIMAP->new({
+    Academy  => [qq{* STATUS "Academy" (MESSAGES 3 UIDNEXT 8)\n}, 'A OK'],
+    Archives => [qq{* STATUS "Archives" (MESSAGES 2 UIDNEXT 5)\n}, 'A OK'],
+});
+set_primary_for_test('knf', 'knf', $herd_imap, 'PULSE');
+@forked = ();
+pump_tracked($seen_at);
+is_deeply(\@forked, [], 'a shared exit does not sync the herd on the first look');
+is(row('Academy')->{next}, $herd_exit + 3610, 'the first mailbox adds its own spread');
+is(row('Archives')->{next}, $herd_exit + 4000, 'the next mailbox draws a different spread');
+isnt(row('Academy')->{next}, row('Archives')->{next}, 'two mailboxes do not share one due time');
+
+unlink "$state/pulse-last";
+set_state_dir_for_test($state);
+reset_track_for_test();
+clear_conns_for_test();
+my $open_at = $now + 9000;
+@spread_add = (10, 400);
+apply_folder_list('knf', ['Academy', 'Archives'], {}, 1, $open_at);
+set_primary_for_test('knf', 'knf', $herd_imap, 'PULSE');
+@forked = ();
+pump_tracked($open_at);
+is_deeply(\@forked, [], 'a herd with no saved exit waits out its first sweep');
+is(row('Academy')->{next}, $open_at + 3610, 'with no saved exit the first mailbox still spreads');
+is(row('Archives')->{next}, $open_at + 4000, 'with no saved exit the next mailbox spreads apart');
+
+my $old_exit = $now + 12000;
+open my $of, '>', "$state/pulse-last" or die $!;
+print $of "knf\t$old_exit\n";
+close $of;
+set_state_dir_for_test($state);
+reset_track_for_test();
+clear_conns_for_test();
+my $bare_past = $old_exit + 3600 + 50;
+@spread_add = (400);
+apply_folder_list('knf', ['Late'], {}, 1, $bare_past);
+my $late_imap = StatusIMAP->new({
+    Late => [qq{* STATUS "Late" (MESSAGES 1 UIDNEXT 2)\n}, 'A OK'],
+});
+set_primary_for_test('knf', 'knf', $late_imap, 'PULSE');
+@forked = ();
+pump_tracked($bare_past);
+is_deeply(\@forked, [], 'a spread that is still ahead does not sync yet');
+is(row('Late')->{next}, $old_exit + 4000, 'the mailbox waits out its own spread');
+
+reset_track_for_test();
+clear_conns_for_test();
+clear_children_for_test();
+my $elapsed = $old_exit + 3610;
+@spread_add = (10);
+apply_folder_list('knf', ['Due'], {}, 1, $elapsed);
+my $due_imap = StatusIMAP->new({
+    Due => [qq{* STATUS "Due" (MESSAGES 1 UIDNEXT 2)\n}, 'A OK'],
+});
+set_primary_for_test('knf', 'knf', $due_imap, 'PULSE');
+@forked = ();
+pump_tracked($elapsed);
+is($forked[0]{args}[0], 'knf:Due', 'a spread that has already elapsed syncs now');
+set_interval_spread_for_test(sub { 0 });
+
 set_pulse_box_for_test('knf', 'INBOX', $now, 3600);
 set_pulse_box_for_test('knf', 'Other', $now, 3600);
 clear_children_for_test();

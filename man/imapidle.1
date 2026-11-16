@@ -492,11 +492,15 @@ seconds after its own
 .Sy mbsync
 exits.
 The first time that mailbox is seen with mail, the wait adds the
-same quarter spread used by backoff, so a herd of new mailboxes
-does not sync in one second.
+same quarter spread used by backoff.
+Each mailbox draws its own spread, so a herd of new mailboxes
+does not sync in the same second.
 A time saved in
 .Pa pulse-last
-applies only to a mailbox that is not already in the track file.
+is the start of that first wait when the mailbox is not already
+in the track file.
+If that time plus the spread wait is already past, the mailbox
+syncs now.
 One mailbox of a channel runs at a time.
 A bare channel and a
 .Ar channel:box
@@ -897,8 +901,9 @@ A mailbox already listed in
 .Pa track
 keeps its own clock.
 A mailbox seen for the first time uses this time as the start
-of its
-.Va sweep .
+of its first wait, which is
+.Va sweep
+plus a quarter spread drawn for that mailbox.
 .It Pa ~/tmp/pause
 .It Pa ~/tmp/pause.mail
 .It Pa ~/tmp/pause.imapidle

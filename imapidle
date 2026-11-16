@@ -2124,6 +2124,8 @@ sub _arm_new_pulse_row {
     $rec->{empty}       = 0;
     delete $rec->{confirm};
     delete $rec->{confirming};
+    # The channel exit is only a start time. The quarter spread is
+    # drawn once per mailbox when the first STATUS finds mail.
     if (exists $PULSE_LAST{$channel}) {
         $rec->{seed} = $PULSE_LAST{$channel};
     } else {
@@ -6276,9 +6278,10 @@ sub _finish_pulse_box {
     log_info("$channel: $box pulse next in ${sweep}s");
 }
 
-# First STATUS that finds mail. A saved channel exit is used as-is.
-# Otherwise the first wait is the sweep plus a quarter spread, and
-# this mailbox is not synced yet.
+# First STATUS that finds mail. The wait is the sweep plus a quarter
+# spread drawn for this mailbox. A saved channel exit is the start of
+# that wait. Several mailboxes that share the exit still draw apart.
+# If that time is already past, this mailbox syncs now.
 sub _classify_pulse_mail {
     my ($rec, $channel, $box, $now) = @_;
     $rec->{classified} = 1;
@@ -6290,24 +6293,19 @@ sub _classify_pulse_mail {
     $rec->{interval} = $sweep;
     my $seed = $rec->{seed};
     delete $rec->{seed};
-    if (defined $seed && $seed =~ /^[\d.]+$/) {
-        my $due = $seed + $sweep;
-        if ($due <= $now) {
-            $rec->{await_sync} = 1;
-            $rec->{next}       = $now;
-            return;
-        }
-        $rec->{await_sync} = 0;
-        $rec->{next}       = $due;
-        my $in = int($due - $now);
-        $in = 0 if $in < 0;
-        log_info("$channel: $box sweep in ${in}s");
+    my $spread = with_quarter_spread($sweep);
+    my $due = $now + $spread;
+    $due = $seed + $spread if defined $seed && $seed =~ /^[\d.]+$/;
+    if ($due <= $now) {
+        $rec->{await_sync} = 1;
+        $rec->{next}       = $now;
         return;
     }
-    my $spread = with_quarter_spread($sweep);
     $rec->{await_sync} = 0;
-    $rec->{next}       = $now + $spread;
-    log_info("$channel: $box sweep in ${spread}s");
+    $rec->{next}       = $due;
+    my $in = int($due - $now);
+    $in = 0 if $in < 0;
+    log_info("$channel: $box sweep in ${in}s");
 }
 
 sub finish_track_job {
