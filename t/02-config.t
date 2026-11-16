@@ -129,11 +129,19 @@ mbsync_channel = no
 [short]
 type = idle
 server = imap.example.com
+
+[zbox]
+type = idle
+folder0 = INBOX
 EOF
 $err = load_config($bad);
 like($err, qr/\[broken\] set only one of pass or pass_cmd/, 'both forms are an error');
-like($err, qr/\[short\] missing user, mbsync_channel/, 'missing keys are named');
-like($err, qr/\[short\] missing pass or pass_cmd/, 'missing secret is named');
+like($err, qr/\[short\] missing channel/, 'an idle section needs channel');
+unlike($err, qr/\[short\] missing user/, 'the idle error does not ask for user');
+unlike($err, qr/\[short\] missing pass/, 'the idle error does not ask for pass');
+like($err, qr/\[zbox\] missing channel/, 'folders without channel need channel');
+unlike($err, qr/\[zbox\] missing user/, 'a folder list does not ask for user');
+unlike($err, qr/\[zbox\] missing pass/, 'a folder list does not ask for pass');
 is_deeply([account_names()], [], 'one bad account rejects the file');
 
 my $run = `perl imapidle -c $bad 2>&1`;
@@ -187,7 +195,9 @@ my $no = write_conf(<<'EOF');
 type = idle
 disabled = no
 EOF
-like(load_config($no), qr/\[nope\] missing server, user, mbsync_channel/, 'no does not skip required keys');
+like(load_config($no), qr/\[nope\] missing channel/, 'no does not skip the channel');
+unlike(load_config($no), qr/missing user/, 'disabled=no does not ask for user');
+unlike(load_config($no), qr/missing pass/, 'disabled=no does not ask for pass');
 unlink $no;
 
 my $xo = write_conf(<<'EOF');

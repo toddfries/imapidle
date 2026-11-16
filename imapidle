@@ -1783,6 +1783,16 @@ sub parse_config_file {
             $fresh{$section} = _held_account($row, 'idle');
             next;
         }
+        # A channel= idle section has no login of its own. Asking for
+        # user and pass here hides the missing channel.
+        my $inline = (defined $row->{user} && $row->{user} ne '')
+            || (defined $row->{pass} && $row->{pass} ne '')
+            || (defined $row->{pass_cmd} && $row->{pass_cmd} ne '')
+            || (defined $row->{mbsync_channel} && $row->{mbsync_channel} ne '');
+        unless ($inline) {
+            push @problems, "[$section] missing channel";
+            next;
+        }
         my ($has_pw, $has_cmd, $auth) = _login_secrets($section, $row, \@problems, 1);
         my $channel = $row->{mbsync_channel} // '';
         push @problems, "[$section] bad mbsync_channel"

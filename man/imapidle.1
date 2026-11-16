@@ -928,6 +928,12 @@ An inline
 .Cm idle
 section also requires
 .Va mbsync_channel .
+An
+.Cm idle
+section that sets neither
+.Va channel
+nor a login is missing
+.Va channel .
 The message is written to standard error.
 The process does not fork.
 After the main loop has started, the process exits 0 on
