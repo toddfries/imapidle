@@ -606,22 +606,32 @@ sub _default_port {
 sub _parse_folders {
     my ($section, $row, $problems, $default_inbox) = @_;
     my $bad = sub { push @$problems, "[$section] $_[0]"; };
-    my @folders;
-    my $i = 0;
-    while (exists $row->{"folder$i"}) {
-        my $folder = parse_folder_spec($row->{"folder$i"});
-        unless ($folder) {
-            $bad->("empty folder$i");
-            return;
-        }
-        if ($folder->{bad}) {
-            $bad->($folder->{bad});
-            return;
-        }
-        push @folders, $folder;
-        $i++;
+    my $max = -1;
+    for my $key (keys %$row) {
+        next unless $key =~ /^folder(\d+)$/;
+        $max = $1 + 0 if $1 > $max;
     }
-    if (!@folders && $default_inbox) {
+    my @folders;
+    if ($max >= 0) {
+        for my $i (0 .. $max) {
+            unless (exists $row->{"folder$i"}) {
+                $bad->("gap before folder$i");
+                return;
+            }
+            my $folder = parse_folder_spec($row->{"folder$i"});
+            unless ($folder) {
+                $bad->("empty folder$i");
+                return;
+            }
+            if ($folder->{bad}) {
+                $bad->($folder->{bad});
+                return;
+            }
+            push @folders, $folder;
+        }
+        return \@folders;
+    }
+    if ($default_inbox) {
         my $spec = $row->{folder};
         $spec = 'INBOX' unless defined $spec && $spec ne '';
         my $folder = parse_folder_spec($spec);
@@ -851,6 +861,8 @@ sub _parse_pulse_section {
             }
             push @channels, $ch;
         }
+    } else {
+        $bad->('missing channel0');
     }
     return {
         name     => $name,
