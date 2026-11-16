@@ -943,50 +943,74 @@ The file mode is 0600 when
 creates it.
 .El
 .Sh EXAMPLES
-A password stored in the file, with a hot inbox and a lazy archive:
+Two servers.
+An omitted
+.Va port
+on
+.Cm tls
+is 993:
 .Bd -literal -offset indent
-[personal]
-type = idle
-server = imap.example.com
-port = 993
-user = you@example.com
-pass = secret
-mbsync_channel = personal
-folder0 = INBOX;priority=1
-folder1 = Archive;priority=9
-folder2 = INBOX.2026-11;5;3600
-.Ed
-.Pp
-The same shape when a command prints the password.
-.Sy pizauth show personal
-is only an example of such a command:
-.Bd -literal -offset indent
-[work]
-type = idle
-server = imap.example.com
-user = you@work.example
-pass_cmd = pizauth show work
-mbsync_channel = work
-folder = INBOX
-priority = 3
-.Ed
-.Pp
-A shared server, a login that does not idle, and a sweep of
-that login's mailboxes.
-.Va mbsync_channel
-is omitted, so it is the account name:
-.Bd -literal -offset indent
-[fdh]
+[mail]
 type = server
 host = mail.example.com
 proto = tls
 
-[lists]
+[office]
+type = server
+host = outlook.office365.com
+proto = tls
+.Ed
+.Pp
+Three accounts name those servers.
+An omitted
+.Va mbsync_channel
+is the section name.
+.Sy pizauth show work
+is only an example of a command that prints the password:
+.Bd -literal -offset indent
+[personal]
 type = account
-server = fdh
-user = you@lists.example
+server = mail
+user = you@example.com
 pass = secret
 
+[work]
+type = account
+server = mail
+user = you@work.example
+pass_cmd = pizauth show work
+
+[lists]
+type = account
+server = office
+user = you@lists.example
+pass = secret
+.Ed
+.Pp
+Watching starts when an idle or pulse section names the account.
+Two idle sections each set
+.Va channel
+to one account and list that account's folders.
+The section name is only a label.
+.Va folder2
+is priority 5 and resyncs after 3600 seconds:
+.Bd -literal -offset indent
+[hot]
+type = idle
+channel = personal
+folder0 = INBOX;priority=1
+folder1 = Archive;priority=9
+folder2 = INBOX.2026-11;5;3600
+
+[desk]
+type = idle
+channel = work
+folder0 = INBOX;priority=3
+.Ed
+.Pp
+A pulse section names the remaining account.
+The mailbox list comes from the server:
+.Bd -literal -offset indent
 [slow]
 type = pulse
 sweep = 7200
