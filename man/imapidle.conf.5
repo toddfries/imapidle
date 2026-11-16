@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 15 2026 $
+.Dd $Mdocdate: November 16 2026 $
 .Dt IMAPIDLE.CONF 5
 .Os
 .Sh NAME
@@ -104,6 +104,7 @@ and
 .Va pass_cmd ,
 a bad port, an empty
 .Va folderN ,
+a resync time below 60 seconds,
 or a bad
 .Cm pulse
 or
@@ -237,16 +238,48 @@ The account keeps one connection and sends
 .Cm STATUS
 for each configured folder.
 A server that supports either extension ignores this key.
+.It Va hyperdelete
+.Cm yes
+starts a sync when a watched folder reports a removal.
+Any other value, or omitting the key, leaves that removal until
+the next arrival or the folder's resync time.
+The comparison ignores case.
+The global section sets the default for an idle account that
+omits the key.
+An idle section that names the key uses its own value.
+A reload applies it without reconnecting.
 .It Va folder0 , folder1 , ...
 Mailbox names, starting at
 .Va folder0
 with no gaps.
-A value is either
+A value is a mailbox name, and may add a priority and a resync
+time, separated by semicolons.
+.Bd -literal -offset indent
+name
+name;priority=N
+name;priority=N;seconds
+name;priority;seconds
+.Ed
+.Pp
+A missing priority is 5.
+The two-field form is
 .Ar name
 or
 .Ar name;priority=N .
-Any other suffix is ignored.
-A missing priority is 5.
+A two-field suffix other than
+.Ar priority=N
+leaves the priority at 5, so
+.Ar INBOX;1
+stays at 5.
+A bare priority number is the middle field when a resync time
+follows it, as in
+.Ar INBOX.2026-11;5;3600 .
+An unrecognized priority word is ignored and the priority stays 5.
+The resync time is whole seconds, at least 60, and defaults to
+43200, which is 12 hours.
+A smaller value rejects the file.
+The priority gap still applies, so a short resync time waits out
+that gap before the folder is synced.
 .It Va folder
 Used only when no
 .Va folderN
@@ -292,15 +325,15 @@ runs for that folder:
 .Pp
 A folder is ready when it has never been included in a run, or when the
 minimum time since its last run has passed.
-An event for a ready folder starts a 5 second wait on that
+An arrival for a ready folder starts a 5 second wait on that
 .Va mbsync_channel .
-Events for other folders of the same channel during those 5 seconds join
-one invocation, and do not start the 5 seconds over:
+Arrivals for other folders of the same channel during those 5 seconds
+join one invocation, and do not start the 5 seconds over:
 .Bd -literal -offset indent
 mbsync channel:INBOX channel:Archive
 .Ed
 .Pp
-An event that arrives before the minimum time has passed is kept.
+An arrival before the minimum time has passed is kept.
 When the minimum time expires,
 .Nm imapidle
 schedules
@@ -310,11 +343,13 @@ That scheduling does not add another 5 seconds, unless the channel
 already has a combine window open, in which case the folder joins it.
 .Cm INBOX
 at priority 5 is included in a run.
-A further event for that mailbox during the next 420 seconds does not
+A further arrival for that mailbox during the next 420 seconds does not
 start another run immediately.
 At the end of those 420 seconds the folder is scheduled.
-If no event arrives during those 420 seconds, the folder stays ready,
-and the next event starts the 5 second wait.
+If no new mail arrives during those 420 seconds, the folder stays
+quiet until new mail arrives or its resync time elapses.
+Either one starts the 5 second wait when the priority gap has
+passed.
 .Pp
 The
 .Va wait
@@ -427,6 +462,10 @@ still limits hot folders, tracked mailboxes, and pulse channels.
 Any other value for
 .Va disabled
 leaves tracking active.
+.Va hyperdelete
+set to
+.Cm yes
+is the default for an idle account that omits the key.
 .Pp
 Values are whole numbers.
 .Va min ,
@@ -698,6 +737,7 @@ pass = secret
 mbsync_channel = personal
 folder0 = INBOX;priority=1
 folder1 = Archive;priority=9
+folder2 = INBOX.2026-11;5;3600
 .Ed
 .Pp
 The same shape when a command prints the password.

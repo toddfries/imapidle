@@ -14,7 +14,7 @@
 
 use strict;
 use warnings;
-use File::Temp qw(tempfile);
+use File::Temp qw(tempfile tempdir);
 use Test::More;
 
 require './imapidle';
@@ -100,7 +100,7 @@ is_deeply(
 );
 
 ok(mail_event_line('* 1 EXISTS'), 'EXISTS is mail');
-ok(mail_event_line('* 12 FETCH (FLAGS (\Seen))'), 'FETCH is mail');
+ok(mail_event_line('* 12 FETCH (FLAGS (\Seen))'), 'FETCH is still a mailbox notice');
 ok(mail_event_line('* STATUS INBOX (MESSAGES 2)'), 'STATUS is mail');
 ok(!mail_event_line('* OK Still here'), 'IDLE keepalive is not mail');
 ok(!mail_event_line('+ idling'), 'IDLE continuation is not mail');
@@ -123,6 +123,79 @@ my $kept = capture(sub { note_mail_event('ch1', 'INBOX', 420, 0, 1100); });
 set_foreground_for_test(0);
 like($kept, qr/ch1 +: kept  INBOX next sync in 325s at \Q@{[_clock(1425)]}\E/,
     'a kept event names the action, then the folder and the clock time');
+
+my $box = { messages => 10 };
+ok(!idle_sync_decision($box, '* 4 EXPUNGE', 0), 'a removal does not sync');
+is($box->{messages}, 9, 'a removal lowers the remembered total');
+ok(idle_sync_decision($box, '* 10 EXISTS', 0), 'an arrival back to the old total still syncs');
+is($box->{messages}, 10, 'the arrival is the new total');
+ok(!idle_sync_decision($box, '* 10 EXISTS', 0), 'the same total does not sync again');
+ok(!idle_sync_decision($box, '* 2 FETCH (FLAGS (\Seen))', 0), 'a flag update does not sync');
+is($box->{messages}, 10, 'a flag update leaves the total');
+ok(!idle_sync_decision($box, '* 1 RECENT', 0), 'RECENT does not sync');
+ok(idle_sync_decision($box, '* 3 EXPUNGE', 1), 'hyperdelete syncs a removal');
+is($box->{messages}, 9, 'hyperdelete still lowers the total');
+
+my $gone = { messages => 10 };
+ok(!idle_sync_decision($gone, '* VANISHED 8:10', 0), 'VANISHED does not sync');
+is($gone->{messages}, 7, 'VANISHED lowers the total by the uid span');
+ok(idle_sync_decision($gone, '* 8 EXISTS', 0), 'EXISTS above the lowered total syncs');
+my $hist = { messages => 10 };
+ok(!idle_sync_decision($hist, '* VANISHED (EARLIER) 1:3', 0),
+    'an earlier vanished set is history');
+is($hist->{messages}, 10, 'history does not change the total');
+
+my $lost = { messages => 10 };
+ok(!idle_sync_decision($lost, '* VANISHED *', 0), 'an open uid set does not sync');
+ok(!defined $lost->{messages}, 'an open uid set forgets the total');
+ok(idle_sync_decision($lost, '* 9 EXISTS', 0), 'the next total syncs once');
+is($lost->{messages}, 9, 'that total is the new baseline');
+
+my $shrink = { messages => 10 };
+ok(idle_sync_decision($shrink, '* 8 EXISTS', 1), 'hyperdelete syncs a smaller total');
+is($shrink->{messages}, 8, 'the smaller total is remembered');
+
+my $quiet = { mode => 'IDLE', messages => 4 };
+my @quiet = _idle_mail_lines($quiet, '* 1 EXPUNGE', '* 1 FETCH (FLAGS (\Seen))');
+is(scalar @quiet, 0, 'an IDLE folder leaves a removal and a flag change');
+is($quiet->{messages}, 3, 'the IDLE removal is still remembered');
+my $noted = { mode => 'NOTIFY', messages => 4 };
+my @noted = _idle_mail_lines($noted, '* 1 FETCH (FLAGS (\Seen))');
+is(scalar @noted, 1, 'NOTIFY still treats a flag change as mail');
+
+my $fresh = {};
+ok(!idle_sync_decision($fresh, '* 4 EXISTS', 0), 'the first total is a baseline');
+is($fresh->{messages}, 4, 'the baseline is remembered');
+ok(idle_sync_decision($fresh, '* 5 EXISTS', 0), 'a higher total syncs');
+
+reset_schedule_for_test();
+my $aged = tempdir('imapidle-age-XXXX', CLEANUP => 1, TMPDIR => 1);
+set_runtime_dir_for_test($aged);
+set_state_dir_for_test($aged);
+set_learned_for_test("$aged/learned");
+set_foreground_for_test(0);
+my ($cfh, $cpath) = tempfile('imapidle-age-XXXX', SUFFIX => '.conf', TMPDIR => 1);
+print $cfh <<'EOF';
+[acct]
+type = idle
+server = imap.example.com
+user = a@example.com
+pass = secret
+mbsync_channel = ch
+hyperdelete = yes
+folder0 = INBOX;5;3600
+EOF
+close $cfh;
+is(load_config($cpath), '', 'the resync config loads');
+my $from_acct = { mode => 'IDLE', name => 'acct', messages => 4 };
+my @from_acct = _idle_mail_lines($from_acct, '* 2 EXPUNGE');
+is(scalar @from_acct, 1, 'the account hyperdelete syncs a removal');
+is($from_acct->{messages}, 3, 'that removal lowers the IDLE total');
+note_mail_event('ch', 'INBOX', 420, 0, 1000);
+is_deeply([jobs(1005)], ['ch:INBOX wait=0'], 'the first run still waits out the combine window');
+is_deeply([jobs(4604)], [], 'the resync ceiling has not elapsed');
+is_deeply([jobs(4605)], [], 'the ceiling opens the combine window');
+is_deeply([jobs(4610)], ['ch:INBOX wait=0'], 'the folder syncs when the ceiling elapses');
 
 done_testing;
 

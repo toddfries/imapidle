@@ -114,7 +114,7 @@ A file that would be rejected at startup is logged and the
 running accounts and pulse channels stay as they are.
 An account whose server, port, user, secret, or channel changed
 is disconnected and connected again.
-Folder names and priorities apply to the connection already open.
+Folder names, priorities, and resync times apply to the connection already open.
 A folder that is new, and not already covered by
 .Cm NOTIFY ,
 is connected on that wake.
@@ -126,8 +126,9 @@ each line goes to standard error.
 A daemonized process writes the same lines to
 .Xr syslog 3
 instead.
-The lines name each account and connection, each folder's priority,
-when that folder was last synced, tracked mailboxes, any
+The lines name each account and connection, each folder's priority
+and resync time, when that folder was last synced, tracked
+mailboxes, any
 .Sy mbsync
 child, and each pulse channel.
 With
@@ -628,8 +629,8 @@ Priority is the minimum time between
 .Sy mbsync
 runs for one folder.
 A folder that has never been included in a run, or whose minimum time
-since that run has already passed, is ready: the next event starts the
-5 second channel wait described above.
+since that run has already passed, is ready: the next arrival starts
+the 5 second channel wait described above.
 A continuation or a tagged reply is logged and does not schedule a
 run.
 A server keepalive such as
@@ -640,20 +641,52 @@ was armed again are logged only with
 .Fl v .
 They do not schedule a run either.
 .Pp
-An event that arrives before the minimum time has passed is kept.
+An arrival that comes in before the minimum time has passed is kept.
 When that time expires, the folder is scheduled on the next wake.
 That scheduling does not add another 5 seconds, unless the channel
 already has a combine window open, in which case the folder joins it.
-If the minimum time passes with no further event, the folder stays
-ready until the next event.
+If the minimum time passes with no further arrival, the folder stays
+quiet until new mail arrives or its resync time elapses.
 For example,
 .Cm INBOX
-at priority 5 is included in a run, and another event for that mailbox
-arrives during the following 420 seconds.
-That event does not start a second run immediately.
+at priority 5 is included in a run, and another arrival for that
+mailbox comes in during the following 420 seconds.
+That arrival does not start a second run immediately.
 When the 420 seconds end, the folder is scheduled.
-If those 420 seconds pass with no event, the next event is what
-schedules the run, after the 5 second wait.
+If those 420 seconds pass quietly, the next arrival schedules the
+run, after the 5 second wait.
+The folder is also scheduled when its resync time has passed since
+its last sync.
+The default is 12 hours, and the priority gap still applies.
+.Pp
+A watched
+.Cm IDLE
+folder is synced when new mail arrives.
+The server announces the message total with
+.Cm EXISTS .
+That total is remembered from the mailbox selection.
+A later
+.Cm EXISTS
+starts a sync when the total is higher than the remembered number.
+A removal is remembered as well, so one deletion and one arrival can
+bring the announced total back to a familiar number and still start
+a sync.
+.Va hyperdelete
+set to
+.Cm yes
+also starts a sync when a message is removed.
+.Cm EXPUNGE
+and
+.Cm VANISHED
+update the remembered total.
+.Cm FETCH
+and
+.Cm RECENT
+leave it unchanged.
+Those four wait for the next arrival or the resync time.
+A
+.Cm NOTIFY
+session still schedules each notice it was asked to watch.
 .Sh FILES
 .Bl -tag -width Ds
 .It Pa ~/.config/imapidle/imapidle.conf

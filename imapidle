@@ -516,21 +516,33 @@ sub calculate_debounce {
     return 180 + ($p - 3) * 120;
 }
 
+sub default_resync { 12 * 3600 }
+
 sub parse_folder_spec {
     my ($val) = @_;
     return unless defined $val;
-    my ($name, $fvars) = split /;/, $val, 2;
+    my ($name, $pri, $age) = split /;/, $val, 3;
     return unless defined $name && $name ne '';
     my $priority = 5;
-    if (defined $fvars) {
-        my ($key, $v) = split /\s*=\s*/, $fvars, 2;
-        $priority = $v if $key && $key eq 'priority' && defined $v && $v =~ /^-?\d+$/;
+    if (defined $pri && $pri ne '') {
+        if ($pri =~ /^priority\s*=\s*(-?\d+)$/) {
+            $priority = $1 + 0;
+        } elsif (defined $age && $age ne '' && $pri =~ /^-?\d+$/) {
+            # name;1 stays priority 5. A bare number is the priority
+            # only when the resync time follows it: name;1;3600.
+            $priority = $pri + 0;
+        }
     }
-    $priority += 0;
+    my $resync = default_resync();
+    if (defined $age && $age ne '') {
+        return { bad => 'bad resync' } if $age !~ /^\d+$/ || $age < 60;
+        $resync = $age + 0;
+    }
     return {
         name     => $name,
         priority => $priority,
         debounce => calculate_debounce($priority),
+        resync   => $resync,
     };
 }
 
@@ -1355,6 +1367,19 @@ sub parse_config_file {
 
     my (%fresh, @problems);
     my ($pulse_name, $pulse_row, $global_name, $global_row);
+    # Account names can sort before the global section. Read its
+    # hyperdelete here so an account that omits the key still inherits it.
+    my $hyper_default = 0;
+    for my $section (keys %{$cfg}) {
+        next if $section eq '_';
+        my $row = $cfg->{$section};
+        next unless ref $row eq 'HASH';
+        my $type = lc($row->{type} // '');
+        $type =~ s/^\s+|\s+$//g;
+        next unless $type eq 'global';
+        $hyper_default = _config_disabled($row->{hyperdelete}) ? 1 : 0;
+        last;
+    }
     for my $section (sort keys %{$cfg}) {
         next if $section eq '_';
         my $row = $cfg->{$section};
@@ -1435,6 +1460,11 @@ sub parse_config_file {
                     $bad_folder = 1;
                     last;
                 }
+                if ($folder->{bad}) {
+                    $bad->($folder->{bad});
+                    $bad_folder = 1;
+                    last;
+                }
                 push @folders, $folder;
                 $i++;
             }
@@ -1446,8 +1476,8 @@ sub parse_config_file {
                 my $spec = $row->{folder};
                 $spec = 'INBOX' unless defined $spec && $spec ne '';
                 my $folder = parse_folder_spec($spec);
-                unless ($folder) {
-                    $bad->('bad folder');
+                unless ($folder && !$folder->{bad}) {
+                    $bad->($folder && $folder->{bad} ? $folder->{bad} : 'bad folder');
                     next;
                 }
                 my $priority = $row->{priority} // $folder->{priority};
@@ -1460,6 +1490,11 @@ sub parse_config_file {
 
         my $wait = $row->{wait} // 0;
         $wait = 0 unless $wait =~ /^\d+$/;
+        my $hyper = $hyper_default;
+        if (exists $row->{hyperdelete}) {
+            $hyper = _config_disabled($row->{hyperdelete}) ? 1 : 0;
+        }
+
         my $poll = 60;
         if (exists $row->{poll}) {
             if (!defined $row->{poll} || $row->{poll} !~ /^\d+$/ || $row->{poll} < 60) {
@@ -1483,6 +1518,7 @@ sub parse_config_file {
             folders        => \@folders,
             wait           => $wait + 0,
             poll           => $poll,
+            hyperdelete    => $hyper,
             hook           => _hook_value($row->{hook}),
             backoff        => 5,
             next_try       => 0,
@@ -3236,8 +3272,26 @@ sub arm_idle {
         wait         => $acc->{wait},
         last_success => time(),
         last_idle    => time(),
+        messages     => selected_exists($imap),
     });
     log_info("$name: IDLE $folder->{name} (priority $folder->{priority})");
+}
+
+# The SELECT reply's EXISTS is the baseline. A later unsolicited
+# EXISTS is compared with it. Mail::IMAPClient keeps that line in Results.
+sub selected_exists {
+    my ($imap) = @_;
+    return unless $imap && $imap->can('Results');
+    my $n;
+    my $ok = eval {
+        for my $line ($imap->Results) {
+            next unless defined $line;
+            $n = $1 + 0 if $line =~ /^\*\s+(\d+)\s+EXISTS\b/i;
+        }
+        1;
+    };
+    return if !$ok;
+    return $n;
 }
 
 sub adopt_notify {
@@ -4136,8 +4190,69 @@ sub take_due_batches {
 sub due_mbsync_jobs {
     my ($now, $limit) = @_;
     $now //= time();
+    promote_resync($now);
     promote_pending($now);
     return take_due_batches($now, $limit);
+}
+
+# A watched folder has no other clock. After resync seconds with no
+# sync, queue one the same way an arrival would.
+sub promote_resync {
+    my ($now) = @_;
+    $now //= time();
+    for my $name (sort keys %accounts) {
+        my $acc = $accounts{$name} or next;
+        next if $acc->{config_disabled} || $acc->{disabled};
+        next if ($acc->{role} // '') ne 'idle';
+        my $channel = $acc->{mbsync_channel} // '';
+        next if $channel eq '';
+        for my $folder (@{ $acc->{folders} // [] }) {
+            my $box = $folder->{name} // '';
+            next if $box eq '';
+            my $id = _box_id($channel, $box);
+            my $limit = $folder->{resync};
+            $limit = default_resync() unless defined $limit && $limit >= 60;
+            my $last = $box_last_run{$id} // 0;
+            next unless $last;
+            next if $now < $last + $limit;
+            next if $box_pending{$id};
+            next if _in_batch($channel, $box);
+            note_mail_event(
+                $channel, $box,
+                $folder->{debounce} // 0,
+                $acc->{wait} // 0,
+                $now,
+            );
+        }
+    }
+}
+
+sub next_resync_delay {
+    my ($now) = @_;
+    $now //= time();
+    my $wait;
+    for my $name (keys %accounts) {
+        my $acc = $accounts{$name} or next;
+        next if $acc->{config_disabled} || $acc->{disabled};
+        next if ($acc->{role} // '') ne 'idle';
+        my $channel = $acc->{mbsync_channel} // '';
+        next if $channel eq '';
+        for my $folder (@{ $acc->{folders} // [] }) {
+            my $box = $folder->{name} // '';
+            next if $box eq '';
+            my $id = _box_id($channel, $box);
+            my $last = $box_last_run{$id} // 0;
+            next unless $last;
+            next if $box_pending{$id};
+            next if _in_batch($channel, $box);
+            my $limit = $folder->{resync};
+            $limit = default_resync() unless defined $limit && $limit >= 60;
+            my $d = $last + $limit - $now;
+            $d = 0 if $d < 0;
+            $wait = $d if !defined $wait || $d < $wait;
+        }
+    }
+    return $wait;
 }
 
 sub next_schedule_delay {
@@ -5554,7 +5669,8 @@ sub pump_schedule {
 }
 
 # Server keepalive and command replies are not mail. EXISTS, EXPUNGE,
-# FETCH, RECENT, VANISHED, and STATUS are.
+# FETCH, RECENT, VANISHED, and STATUS are notices. On an IDLE folder
+# only a higher EXISTS, a STATUS line, or hyperdelete's removals schedule.
 sub mail_event_line {
     my ($line) = @_;
     return 0 unless defined $line && $line ne '';
@@ -5564,6 +5680,90 @@ sub mail_event_line {
     return 1 if $line =~ /^\*\s+\d+\s+(EXISTS|EXPUNGE|FETCH|RECENT)\b/i;
     return 1 if $line =~ /^\*\s+(VANISHED|STATUS)\b/i;
     return 0;
+}
+
+# UID set from VANISHED. Undef when a '*' or a bad token makes the
+# size unknowable, so the next EXISTS is treated as a fresh baseline
+# that still schedules once.
+sub vanished_count {
+    my ($set) = @_;
+    return if !defined $set || $set eq '';
+    my $n = 0;
+    for my $part (split /,/, $set) {
+        return if $part =~ /\*/;
+        if ($part =~ /^(\d+):(\d+)$/) {
+            return if $1 < 1 || $2 < 1;
+            my ($lo, $hi) = $1 <= $2 ? ($1, $2) : ($2, $1);
+            $n += $hi - $lo + 1;
+        } elsif ($part =~ /^(\d+)$/) {
+            return if $1 < 1;
+            $n++;
+        } else {
+            return;
+        }
+    }
+    return $n;
+}
+
+# Updates the remembered remote total. Returns 1 when this line should
+# schedule mbsync. $hyper makes a live removal schedule as well.
+sub idle_sync_decision {
+    my ($conn, $line, $hyper) = @_;
+    return 0 unless $conn && defined $line && $line ne '';
+    if ($line =~ /^\*\s+(\d+)\s+EXISTS\b/i) {
+        my $n = $1 + 0;
+        if ($conn->{messages_lost} || !defined $conn->{messages}) {
+            my $sync = $conn->{messages_lost} ? 1 : 0;
+            $conn->{messages} = $n;
+            $conn->{messages_lost} = 0;
+            return $sync;
+        }
+        my $prev = $conn->{messages} + 0;
+        $conn->{messages} = $n;
+        return 1 if $n > $prev;
+        return 1 if $hyper && $n < $prev;
+        return 0;
+    }
+    if ($line =~ /^\*\s+\d+\s+EXPUNGE\b/i) {
+        if (defined $conn->{messages} && $conn->{messages} > 0) {
+            $conn->{messages}--;
+        }
+        return $hyper ? 1 : 0;
+    }
+    if ($line =~ /^\*\s+VANISHED\b/i) {
+        if ($line !~ /\(EARLIER\)/i) {
+            my $set;
+            $set = $1 if $line =~ /^\*\s+VANISHED\s+(\S+)\s*$/i;
+            my $n = vanished_count($set);
+            if (!defined $n) {
+                $conn->{messages_lost} = 1;
+                delete $conn->{messages};
+            } elsif (defined $conn->{messages}) {
+                $conn->{messages} -= $n;
+                $conn->{messages} = 0 if $conn->{messages} < 0;
+            }
+        }
+        return $hyper && $line !~ /\(EARLIER\)/i ? 1 : 0;
+    }
+    return 1 if $line =~ /^\*\s+STATUS\b/i && mail_event_line($line);
+    return 0;
+}
+
+sub _idle_mail_lines {
+    my ($conn, @lines) = @_;
+    if (($conn->{mode} // '') ne 'IDLE') {
+        return grep { mail_event_line($_) } @lines;
+    }
+    my $hyper = $conn->{hyperdelete} ? 1 : 0;
+    if (!$hyper) {
+        my $acc = $accounts{ $conn->{name} // '' };
+        $hyper = 1 if $acc && $acc->{hyperdelete};
+    }
+    my @hit;
+    for my $line (@lines) {
+        push @hit, $line if idle_sync_decision($conn, $line, $hyper);
+    }
+    return @hit;
 }
 
 sub mailbox_from_line {
@@ -5624,7 +5824,7 @@ sub process_notification {
                 trace_imap_line($conn->{name}, $line);
             }
         }
-        my @mail_lines = grep { mail_event_line($_) } @lines;
+        my @mail_lines = _idle_mail_lines($conn, @lines);
         if (@mail_lines) {
             for my $folder (folders_for_lines($conn, @mail_lines)) {
                 note_mail_event(
@@ -5662,7 +5862,7 @@ sub handle_ready {
 sub _queue_mail_lines {
     my ($conn, @lines) = @_;
     return unless $conn;
-    my @mail = grep { mail_event_line($_) } @lines;
+    my @mail = _idle_mail_lines($conn, @lines);
     return unless @mail;
     for my $folder (folders_for_lines($conn, @mail)) {
         note_mail_event(
@@ -5781,6 +5981,8 @@ sub loop_timeout {
     }
     my $sched = next_schedule_delay($now);
     $wait = $sched if defined $sched && $sched < $wait;
+    my $resync_wait = next_resync_delay($now);
+    $wait = $resync_wait if defined $resync_wait && $resync_wait < $wait;
     my $off = next_pulse_delay($now);
     $wait = $off if defined $off && $off < $wait;
     my $track_wait = next_track_delay($now);
@@ -6179,7 +6381,9 @@ sub _folder_info_line {
     my ($name, $acc, $folder, $now) = @_;
     my $channel = $acc->{mbsync_channel};
     my $id      = _box_id($channel, $folder->{name});
-    my $bits    = "priority $folder->{priority} gap $folder->{debounce}s";
+    my $resync  = $folder->{resync};
+    $resync = default_resync() unless defined $resync && $resync >= 60;
+    my $bits    = "priority $folder->{priority} gap $folder->{debounce}s resync ${resync}s";
     my $last    = $box_last_run{$id} // 0;
     if ($last) {
         my $ago = int($now - $last);
@@ -6428,12 +6632,16 @@ sub ctl_nodes {
         _ctl_put(\%n, "$base.fails", $acc->{fails} // 0);
         _ctl_put(\%n, "$base.pass_wait", int($acc->{secret_wait} // 0));
         _ctl_put(\%n, "$base.hook", ($acc->{hook} // '') ne '' ? 1 : 0);
+        _ctl_put(\%n, "$base.hyperdelete", $acc->{hyperdelete} ? 1 : 0);
         _ctl_put(\%n, "$base.folders", scalar @{ $acc->{folders} // [] });
         _ctl_put(\%n, "$base.covered", account_covered($name) ? 1 : 0);
         for my $folder (@{ $acc->{folders} // [] }) {
             my $fb = "$base.folder." . ctl_enc($folder->{name});
             _ctl_put(\%n, "$fb.priority", $folder->{priority});
             _ctl_put(\%n, "$fb.debounce", $folder->{debounce});
+            my $resync = $folder->{resync};
+            $resync = default_resync() unless defined $resync && $resync >= 60;
+            _ctl_put(\%n, "$fb.resync", $resync);
         }
     }
     for my $key (sort keys %conns) {
@@ -6447,6 +6655,7 @@ sub ctl_nodes {
         _ctl_put(\%n, "$base.poll_next", int($conn->{poll_next} // 0));
         _ctl_put(\%n, "$base.started", int($conn->{started} // 0));
         _ctl_put(\%n, "$base.last_success", int($conn->{last_success} // 0));
+        _ctl_put(\%n, "$base.messages", $conn->{messages}) if defined $conn->{messages};
     }
     for my $id (sort keys %track) {
         my ($ch, $box) = split /\0/, $id, 2;
@@ -6510,10 +6719,34 @@ sub ctl_nodes {
     return \%n;
 }
 
-# Writable nodes are shutdown and pause. Everything else is a readout.
+# Writable nodes are shutdown, pause, and a folder's resync seconds.
 # shutdown=1 is the signal path: this process exits, and no file is left
 # to hold the next start. pause=1 is remembered here and OR'd with a
-# pause file. pause=0 clears only this latch.
+# pause file. pause=0 clears only this latch. resync is how long a
+# watched folder may go since its last sync.
+sub ctl_parts {
+    my ($s) = @_;
+    my @parts;
+    my $cur = '';
+    my $i   = 0;
+    my $len = length($s // '');
+    while ($i < $len) {
+        if (substr($s, $i, 2) eq '..') {
+            $cur .= '.';
+            $i += 2;
+        } elsif (substr($s, $i, 1) eq '.') {
+            push @parts, $cur;
+            $cur = '';
+            $i++;
+        } else {
+            $cur .= substr($s, $i, 1);
+            $i++;
+        }
+    }
+    push @parts, $cur;
+    return @parts;
+}
+
 sub ctl_set {
     my ($name, $value) = @_;
     if ($name eq 'shutdown') {
@@ -6524,6 +6757,20 @@ sub ctl_set {
     if ($name eq 'pause') {
         return 'bad value' unless defined $value && ($value eq '0' || $value eq '1');
         $CTL_PAUSE = $value eq '1' ? 1 : 0;
+        return;
+    }
+    my @part = ctl_parts($name);
+    if (@part == 5 && $part[0] eq 'account' && $part[2] eq 'folder' && $part[4] eq 'resync') {
+        return 'bad value' unless defined $value && $value =~ /^\d+$/ && $value >= 60;
+        my $acc = $accounts{ $part[1] } or return "unknown oid $name";
+        my $found;
+        for my $folder (@{ $acc->{folders} // [] }) {
+            next unless ($folder->{name} // '') eq $part[3];
+            $folder->{resync} = $value + 0;
+            $found = 1;
+            last;
+        }
+        return "unknown oid $name" unless $found;
         return;
     }
     return 'read-only';

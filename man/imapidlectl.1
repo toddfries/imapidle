@@ -61,6 +61,12 @@ the way a pause file does.
 .Ar pause=0
 clears a pause that was set this way.
 A pause file is left in place and still pauses.
+.Ar account.name.folder.box.resync
+sets how long that watched folder may go since its last sync.
+The value is whole seconds, at least 60.
+The default is 43200.
+A dot inside the mailbox name is still doubled.
+A reload reads the value from the configuration again.
 Every other node is read-only.
 .Pp
 The reply is one node per line.

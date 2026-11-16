@@ -61,6 +61,14 @@ is(ctl_reply('account.acct.server'), "account.acct.server=imap.example.com\n",
 my $folder = ctl_reply('account.acct.folder.INBOX..Sent');
 like($folder, qr/^account\.acct\.folder\.INBOX\.\.Sent\.priority=5$/m, 'a prefix lists the mailbox');
 like($folder, qr/^account\.acct\.folder\.INBOX\.\.Sent\.debounce=/m, 'the prefix includes the gap');
+like($all, qr/^account\.acct\.hyperdelete=0$/m, 'hyperdelete is off');
+like($folder, qr/^account\.acct\.folder\.INBOX\.\.Sent\.resync=43200$/m, 'the resync ceiling is a node');
+is(ctl_reply('account.acct.folder.INBOX..Sent.resync=120'),
+    "account.acct.folder.INBOX..Sent.resync=120\n", 'resync can be set');
+is(loaded_account('acct')->{folders}[0]{resync}, 120, 'the running folder keeps the new ceiling');
+is(ctl_reply('account.acct.folder.INBOX..Sent.resync=10'), "error bad value\n",
+    'resync rejects a value below 60');
+is(loaded_account('acct')->{folders}[0]{resync}, 120, 'the rejected ceiling stays');
 unlike($folder, qr/^account\.acct\.server=/m, 'the prefix stops at the component');
 
 is(ctl_reply('no.such'), "error unknown oid no.such\n", 'an unknown name is an error');

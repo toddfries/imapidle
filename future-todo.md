@@ -6,12 +6,6 @@ These options are not in the program. Each leaf says what that option would do.
 
 The boot script finds the process by matching the perl command line. It does not read a pid file. This option writes the daemon pid after the handoff and removes that file on shutdown, so another program can signal that process from the number in the file.
 
-## Mail events
-
-### EXISTS only
-
-Schedule mbsync when the server sends EXISTS, the new message total. A FETCH that only updates flags, such as Seen or Flagged, would stay in the log and would not arm a run. EXPUNGE, RECENT, and VANISHED would stay out of that trigger as well. The STATUS probe and the poll fallback would keep their own clocks.
-
 ## Logging
 
 ### Log level

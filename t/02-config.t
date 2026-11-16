@@ -74,6 +74,8 @@ is($good->{folders}[0]{debounce}, 7, 'folder0 debounce');
 is($good->{folders}[1]{name}, 'Archive', 'folder1 name');
 is($good->{folders}[1]{priority}, 5, 'folder1 default priority');
 is($good->{folders}[1]{debounce}, 420, 'folder1 debounce');
+is($good->{folders}[1]{resync}, default_resync(), 'a folder resync defaults to 12h');
+is($good->{hyperdelete}, 0, 'hyperdelete defaults off');
 
 my $cmd = loaded_account('cmd');
 is($cmd->{pass_cmd}, "printf '%s\\n' tok", 'pass_cmd kept');
@@ -363,5 +365,71 @@ mbsync_channel = ch
 EOF
 like(load_config($bad_to), qr/\[track\] bad tunnel_timeout/, 'tunnel timeout must be at least 1');
 unlink $bad_to;
+
+my $aged = write_conf(<<'EOF');
+[track]
+type = global
+hyperdelete = yes
+
+[acct]
+type = idle
+server = imap.example.com
+user = a@example.com
+pass = secret
+mbsync_channel = ch
+hyperdelete = no
+folder0 = INBOX.2026-11;1;3600
+folder1 = Archive;priority=9;7200
+EOF
+is(load_config($aged), '', 'a positional folder age loads');
+is(loaded_account('acct')->{hyperdelete}, 0, 'the account hyperdelete wins');
+is(loaded_account('acct')->{folders}[0]{priority}, 1, 'the middle field is the priority');
+is(loaded_account('acct')->{folders}[0]{debounce}, 7, 'priority 1 is still 7s');
+is(loaded_account('acct')->{folders}[0]{resync}, 3600, 'the third field is the resync ceiling');
+is(loaded_account('acct')->{folders}[1]{resync}, 7200, 'priority=N accepts a following age');
+unlink $aged;
+
+my $legacy = write_conf(<<'EOF');
+[acct]
+type = idle
+server = imap.example.com
+user = a@example.com
+pass = secret
+mbsync_channel = ch
+folder0 = INBOX;1
+EOF
+is(load_config($legacy), '', 'a two-field bare number loads');
+is(loaded_account('acct')->{folders}[0]{priority}, 5, 'a bare number without a resync time stays priority 5');
+is(loaded_account('acct')->{folders}[0]{resync}, default_resync(), 'that folder keeps the 12h resync');
+unlink $legacy;
+
+my $global_hyper = write_conf(<<'EOF');
+[track]
+type = global
+hyperdelete = yes
+
+[acct]
+type = idle
+server = imap.example.com
+user = a@example.com
+pass = secret
+mbsync_channel = ch
+folder0 = INBOX
+EOF
+is(load_config($global_hyper), '', 'a global hyperdelete loads');
+is(loaded_account('acct')->{hyperdelete}, 1, 'an account inherits global hyperdelete');
+unlink $global_hyper;
+
+my $bad_age = write_conf(<<'EOF');
+[acct]
+type = idle
+server = imap.example.com
+user = a@example.com
+pass = secret
+mbsync_channel = ch
+folder0 = INBOX;5;10
+EOF
+like(load_config($bad_age), qr/bad resync/, 'a resync below 60 seconds is rejected');
+unlink $bad_age;
 
 done_testing;
