@@ -35,7 +35,7 @@ use POSIX qw(:sys_wait_h :signal_h _exit setsid);
 use Sys::Syslog qw(:standard :macros);
 use Time::HiRes qw(time);
 
-my $VERSION = '0.2';
+my $VERSION = '0.3';
 my $CONFIG_DIR;
 my $CONFIG_FILE;
 my $SELF_PATH = abs_path($0) // $0;

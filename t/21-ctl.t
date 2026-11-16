@@ -45,7 +45,7 @@ close $fh;
 is(load_config($conf), '', 'config loads');
 
 my $all = ctl_reply('all');
-like($all, qr/^version=0\.2$/m, 'version is a node');
+like($all, qr/^version=0\.3$/m, 'version is a node');
 like($all, qr/^account\.acct\.server=imap\.example\.com$/m, 'the server is a node');
 like($all, qr/^account\.acct\.user=a\@example\.com$/m, 'the user is a node');
 like($all, qr/^account\.acct\.hook=1$/m, 'a hook is present without its text');
@@ -109,7 +109,7 @@ while (1) {
     $got .= $chunk;
 }
 close $cli;
-is($got, "version=0.2\n", 'the socket returns the node');
+is($got, "version=0.3\n", 'the socket returns the node');
 
 my $pid = fork();
 die "fork: $!" unless defined $pid;
