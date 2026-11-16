@@ -1,15 +1,39 @@
 # future-todo
 
-Parked from imap-idle-notify-session-extraction.md. Todd asked for a password command and for one failure to stay inside that account. Those two are in imapidle, as pass_cmd and per-account retry. A missing required config key exits 1 before the daemon starts. SIGHUP re-reads the config. The rest stays parked until he asks.
+These options are not in the program. Each leaf says what that option would do.
 
-- Pidfile and an OpenBSD rc.d script. Why: no pidfile yet. Saving: skip rc integration until the foreground run looks right.
-- Max concurrent mbsync processes. Why: forks are unlimited. Saving: a semaphore is unused until more than one account is syncing.
-- Trigger only on EXISTS, ignore flag-only events. Why: every drained line can arm mbsync. Saving: filter after a live trace shows which lines matter.
-- Log level switch beyond -d. Why: -d copies every line to stderr. Saving: no second logger until a real run is noisy.
+## Pidfile
 
-Parked 2026-11-14 when the STATUS probe was chosen. The aim is to stop spending mbsync on mailboxes that contain no messages, so mailboxes that have messages can use the slots. The probe that shipped asks STATUS (MESSAGES UIDNEXT) on the primary connection and waits a day when the count is zero.
+The boot script finds the process by matching the perl command line. It does not read a pid file. This option writes the daemon pid after the handoff and removes that file on shutdown, so another program can signal that process from the number in the file.
 
-- Token bucket per class. Why: the empty class gets one token per mailbox per day, refilled smoothly, and cannot spend them as a burst. Mailboxes with messages keep the interval formula and the connection cap. Saving: a budget is more machinery than a due time.
-- One empty proof, then a day, and a live mailbox wins the slot. Why: a priority bit on the row, not a second list. The first zero-message sync sets the wait, and one new message returns it to the short interval. Saving: it still runs mbsync to learn the count.
-- Hash empty mailboxes onto a minute of the day and run them only while nothing with mail is due. Why: a restart does not line them up, and a child exit does not wake an empty mailbox while a live one is waiting. Saving: that is a scheduler of its own.
-- Two groups, the Outlook send/receive shape and a per-channel mbsync timer. Why: active folders stay on a short timer and everything else is daily, with membership after one empty sync. Saving: the daily group herds unless the due times are spread.
+## Mail events
+
+### EXISTS only
+
+Schedule mbsync when the server sends EXISTS, the new message total. A FETCH that only updates flags, such as Seen or Flagged, would stay in the log and would not arm a run. EXPUNGE, RECENT, and VANISHED would stay out of that trigger as well. The STATUS probe and the poll fallback would keep their own clocks.
+
+## Logging
+
+### Log level
+
+Choose how much a background process writes, without staying in the foreground. Today -d keeps the process in the foreground and copies every line to stderr, and -v adds the IDLE keepalive and the re-arm line. A level would select quiet, normal, or the keepalive noise while the process still daemonizes.
+
+## Empty mailboxes
+
+The aim is to leave mbsync slots for mailboxes that contain messages. The program asks STATUS (MESSAGES UIDNEXT) on the primary connection and waits the empty interval, one day unless the config sets another value, when the count is zero and UIDNEXT is unchanged. The leaves below are other schedulers for that same aim.
+
+### Token bucket
+
+Each empty mailbox earns one token a day. The refill is smooth, so the empty class cannot spend a day's tokens as one burst after a restart. Mailboxes that contain messages keep the interval formula and the connection cap.
+
+### One empty proof
+
+The first sync that sees zero messages sets that mailbox's wait to a day and marks the row. A mailbox that has messages takes a free slot ahead of a marked row. One new message clears the mark and returns the mailbox to the short interval. The count still comes from running mbsync.
+
+### Minute of the day
+
+Hash each empty mailbox onto one minute of the day, so a restart does not make them all due together. Run one only while no mailbox that has messages is due. A child exit does not wake an empty mailbox while a live one is waiting.
+
+### Two groups
+
+Keep folders that have had mail on a short timer. Put the rest on a daily timer after one empty sync. Spread the daily due times so that group does not start together.
