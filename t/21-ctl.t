@@ -140,4 +140,30 @@ like($text, qr/^pid=\d+\n\z/, 'imapidlectl prints the node');
 ctl_close();
 ok(!-e "$dir/imapidle.sock", 'shutdown removes the socket');
 
+set_ctl_path_for_test(undef);
+{
+    local $ENV{HOME} = $dir;
+    is(ctl_socket_path(), "$dir/var/run/imapidle.sock", 'the socket lives in ~/var/run');
+    ok(!-d "$dir/var", 'the run directory starts absent');
+    ctl_listen();
+    ok(-d "$dir/var/run", 'a missing run directory is created');
+    is(((stat "$dir/var/run")[2] // 0) & 0777, 0700, 'the new run directory is mode 0700');
+    ok(-S "$dir/var/run/imapidle.sock", 'the default socket is opened');
+    ctl_close();
+    ok(!-e "$dir/var/run/imapidle.sock", 'close removes the default socket');
+}
+
+mkdir "$dir/ro" or die "mkdir ro: $!";
+chmod 0555, "$dir/ro" or die "chmod ro: $!";
+set_ctl_path_for_test("$dir/ro/imapidle.sock");
+ctl_listen();
+ok(!-e "$dir/ro/imapidle.sock", 'an unwritable directory leaves no socket');
+chmod 0755, "$dir/ro";
+
+open my $block, '>', "$dir/notdir" or die "notdir: $!";
+close $block;
+set_ctl_path_for_test("$dir/notdir/imapidle.sock");
+ctl_listen();
+ok(!-e "$dir/notdir/imapidle.sock", 'a path that is not a directory leaves no socket');
+
 done_testing;

@@ -26,7 +26,7 @@ getopts('s:', \%opt) or die "usage: imapidlectl [-s path] [name ...]\n";
 my $path = $opt{s};
 if (!defined $path || $path eq '') {
     die "imapidlectl: HOME is not set\n" unless defined $ENV{HOME} && $ENV{HOME} ne '';
-    $path = "$ENV{HOME}/tmp/imapidle.sock";
+    $path = "$ENV{HOME}/var/run/imapidle.sock";
 }
 
 my @query = @ARGV;

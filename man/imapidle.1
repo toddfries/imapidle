@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 15 2026 $
+.Dd $Mdocdate: November 16 2026 $
 .Dt IMAPIDLE 1
 .Os
 .Sh NAME
@@ -139,10 +139,14 @@ On a terminal, Ctrl-T sends this signal.
 A
 .Ux
 socket at
-.Pa ~/tmp/imapidle.sock
+.Pa ~/var/run/imapidle.sock
 answers
 .Sy imapidlectl(1) .
-The mode is 0600.
+The socket mode is 0600.
+The directory is created mode 0700 when it is missing.
+If the directory cannot be created, or the socket cannot
+be opened, the process keeps running and answers no
+control client.
 One line in, then
 .Ar name Ns = Ns Ar value
 lines, then the connection closes.

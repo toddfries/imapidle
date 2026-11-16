@@ -13,7 +13,7 @@
 .\" WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-.Dd $Mdocdate: November 15 2026 $
+.Dd $Mdocdate: November 16 2026 $
 .Dt IMAPIDLECTL 1
 .Os
 .Sh NAME
@@ -29,7 +29,7 @@ asks the running
 .Sy imapidle(1)
 for the values it holds in memory.
 The default socket is
-.Pa ~/tmp/imapidle.sock .
+.Pa ~/var/run/imapidle.sock .
 .Fl s
 names another socket.
 .Pp
@@ -70,7 +70,7 @@ and
 exits 1.
 .Sh FILES
 .Bl -tag -width Ds
-.It Pa ~/tmp/imapidle.sock
+.It Pa ~/var/run/imapidle.sock
 The default socket.
 Mode 0600.
 .El

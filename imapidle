@@ -6552,9 +6552,8 @@ sub ctl_reply {
 
 sub ctl_socket_path {
     return $CTL_PATH if defined $CTL_PATH && $CTL_PATH ne '';
-    my $dir = runtime_dir();
-    return unless defined $dir && $dir ne '';
-    return "$dir/imapidle.sock";
+    return unless defined $ENV{HOME} && $ENV{HOME} ne '';
+    return "$ENV{HOME}/var/run/imapidle.sock";
 }
 
 sub set_ctl_path_for_test { $CTL_PATH = $_[0]; }
@@ -6682,7 +6681,13 @@ sub ctl_listen {
     return unless defined $path && $path ne '';
     return if $CTL_LISTEN;
     my $dir = dirname($path);
-    make_path($dir, { mode => 0755 }) if $dir ne '' && !-d $dir;
+    if ($dir ne '' && !-d $dir) {
+        my $made = eval { make_path($dir, { mode => 0700 }); 1 };
+        if (!$made || !-d $dir) {
+            log_warn('ctl: directory not created');
+            return;
+        }
+    }
     if (-e $path) {
         my $probe = IO::Socket::UNIX->new(Type => SOCK_STREAM, Peer => $path);
         if ($probe) {

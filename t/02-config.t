@@ -14,11 +14,14 @@
 
 use strict;
 use warnings;
-use File::Temp qw(tempfile);
+use File::Temp qw(tempfile tempdir);
 use MIME::Base64 qw(decode_base64);
 use Test::More;
 
 require './imapidle';
+
+my $rundir = tempdir('imapidle-cfg-XXXX', CLEANUP => 1, TMPDIR => 1);
+set_runtime_dir_for_test($rundir);
 
 is(calculate_debounce(0), 7,    'priority 0 uses the priority 1 gap');
 is(calculate_debounce(1), 7,    'priority 1 is 7s');
