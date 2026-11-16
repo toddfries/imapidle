@@ -67,7 +67,24 @@ The value is whole seconds, at least 60.
 The default is 43200.
 A dot inside the mailbox name is still doubled.
 A reload reads the value from the configuration again.
-Every other node is read-only.
+.Ar account.name.hyperdelete
+is 1 to sync a removal, or 0 to leave it until the next arrival
+or that folder's resync time.
+A reload reads this value from the configuration again.
+.Ar limit.server.port.user.cap
+is how many sessions this process may hold for that server,
+port, and user.
+The value is a whole number.
+Zero is allowed.
+.Ar limit.server.port.user.probe
+is when one extra session may be tried, in seconds since
+the epoch.
+Zero tries on the next login.
+A dot inside the server or the user is doubled.
+Both values are kept in
+.Pa ~/.local/imapidle/conn-limit
+and a reload leaves them in place.
+A write this process does not apply is an error.
 .Pp
 The reply is one node per line.
 An unknown name or a rejected write is an error on standard error,

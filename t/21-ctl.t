@@ -71,6 +71,17 @@ is(loaded_account('acct')->{folders}[0]{resync}, 120, 'the running folder keeps 
 is(ctl_reply('account.acct.folder.INBOX..Sent.resync=10'), "error bad value\n",
     'resync rejects a value below 60');
 is(loaded_account('acct')->{folders}[0]{resync}, 120, 'the rejected ceiling stays');
+is(ctl_reply('account.acct.hyperdelete=1'), "account.acct.hyperdelete=1\n",
+    'hyperdelete can be set');
+is(loaded_account('acct')->{hyperdelete}, 1, 'the running account syncs removals');
+is(ctl_reply('account.acct.hyperdelete=0'), "account.acct.hyperdelete=0\n",
+    'hyperdelete can be cleared');
+is(loaded_account('acct')->{hyperdelete}, 0, 'the running account leaves removals');
+is(ctl_reply('account.acct.hyperdelete=yes'), "error bad value\n",
+    'hyperdelete is 0 or 1');
+is(loaded_account('acct')->{hyperdelete}, 0, 'a rejected hyperdelete write stays');
+is(ctl_reply('account.missing.hyperdelete=1'), "error unknown oid account.missing.hyperdelete\n",
+    'an unknown account has no hyperdelete node');
 unlike($folder, qr/^account\.acct\.server=/m, 'the prefix stops at the component');
 
 is(ctl_reply('no.such'), "error unknown oid no.such\n", 'an unknown name is an error');

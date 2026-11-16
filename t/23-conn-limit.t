@@ -217,6 +217,42 @@ is($nodes->{'limit.imap..example..com.993.a@example..com.probe'},
 my $dump = join("\n", map { "$_=$nodes->{$_}" } sort keys %$nodes);
 unlike($dump, qr/secret/, 'the limit nodes do not include the password');
 unlike($dump, qr/pass_cmd/, 'the limit nodes do not include a password command');
+ok(conn_limit_blocked(loaded_account('acct'), time()),
+    'cap 0 with a future probe blocks');
+my $lim = 'limit.imap..example..com.993.a@example..com';
+is(ctl_reply("$lim.cap=3"), "$lim.cap=3\n", 'the cap can be set');
+is(conn_limit_row_for_test('acct')->{cap}, 3, 'the running cap follows the write');
+ok(!conn_limit_blocked(loaded_account('acct'), time()),
+    'a cap above the open count allows a login');
+is(ctl_reply("$lim.cap=0"), "$lim.cap=0\n", 'the cap can be cleared');
+ok(conn_limit_blocked(loaded_account('acct'), time()),
+    'a zero cap waits for its probe');
+is(ctl_reply("$lim.probe=0"), "$lim.probe=0\n", 'the probe time can be set');
+is(conn_limit_row_for_test('acct')->{probe}, 0, 'the next extra try is due');
+ok(!conn_limit_blocked(loaded_account('acct'), time()),
+    'a due probe allows one extra login');
+is(conn_limit_row_for_test('acct')->{server_max}, 5,
+    'setting the cap leaves the server number');
+open my $wrote, '<', $limit_file or die "reread conn-limit: $!";
+my $saved = do { local $/; <$wrote> };
+close $wrote;
+like($saved, qr/^imap\.example\.com\t993\ta\@example\.com\t0\t0\t5$/m,
+    'a control write is stored in conn-limit');
+is(ctl_reply("$lim.cap=no"), "error bad value\n", 'the cap rejects a word');
+is(ctl_reply("$lim.probe=1.5"), "error bad value\n", 'the probe rejects a fraction');
+is(conn_limit_row_for_test('acct')->{cap}, 0, 'a rejected cap write stays');
+is(conn_limit_row_for_test('acct')->{probe}, 0, 'a rejected probe write stays');
+is(ctl_reply('limit.no..such.993.nobody.cap=1'),
+    "error unknown oid limit.no..such.993.nobody.cap\n",
+    'an unknown limit cannot be created');
+is(ctl_reply("$lim.server_max=9"), "error read-only\n",
+    'the server number is not applied');
+is(conn_limit_row_for_test('acct')->{server_max}, 5, 'the server number stays');
+my $restored = int(time() + 604800);
+is(ctl_reply("$lim.probe=$restored"), "$lim.probe=$restored\n",
+    'the probe can be set ahead again');
+ok(conn_limit_blocked(loaded_account('acct'), time()),
+    'the restored probe blocks again');
 
 my @info = info_lines($now);
 my ($line) = grep { /^limit:/ } @info;

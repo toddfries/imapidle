@@ -8045,11 +8045,13 @@ sub ctl_nodes {
     return \%n;
 }
 
-# Writable nodes are shutdown, pause, and a folder's resync seconds.
-# shutdown=1 is the signal path: this process exits, and no file is left
-# to hold the next start. pause=1 is remembered here and OR'd with a
-# pause file. pause=0 clears only this latch. resync is how long a
-# watched folder may go since its last sync.
+# Writes this process applies. shutdown=1 is the signal path: this
+# process exits, and no file is left to hold the next start. pause=1
+# is remembered here and OR'd with a pause file. pause=0 clears only
+# this latch. resync is how long a watched folder may go since its
+# last sync. hyperdelete is that account's removal flag. A connection
+# cap and its next probe are the learned limit for one server, port,
+# and user. A write that is not applied here is refused.
 sub ctl_parts {
     my ($s) = @_;
     my @parts;
@@ -8097,6 +8099,23 @@ sub ctl_set {
             last;
         }
         return "unknown oid $name" unless $found;
+        return;
+    }
+    if (@part == 3 && $part[0] eq 'account' && $part[2] eq 'hyperdelete') {
+        return 'bad value' unless defined $value && ($value eq '0' || $value eq '1');
+        my $acc = $accounts{ $part[1] } or return "unknown oid $name";
+        $acc->{hyperdelete} = $value eq '1' ? 1 : 0;
+        return;
+    }
+    if (@part == 5 && $part[0] eq 'limit'
+        && ($part[4] eq 'cap' || $part[4] eq 'probe')) {
+        return 'bad value' unless defined $part[2] && $part[2] =~ /^\d+$/;
+        return 'bad value' unless defined $value && $value =~ /^\d+$/;
+        return 'unknown oid ' . $name if $part[1] eq '' || $part[3] eq '';
+        my $key = join("\0", $part[1], $part[2] + 0, $part[3]);
+        my $row = $CONN_LIMIT{$key} or return "unknown oid $name";
+        $row->{$part[4]} = $value + 0;
+        _conn_limit_save();
         return;
     }
     return 'read-only';
