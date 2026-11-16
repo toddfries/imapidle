@@ -499,6 +499,21 @@ and
 .Cm UIDNEXT .
 No messages, including the first answer, waits a day
 and does not sync.
+The first time that mailbox is empty, a confirmation is
+set seven days out.
+One quarter of those seven days is X, and a random value
+modulo X is added, the same spread a longer tracked wait
+uses.
+A mailbox that is still empty when that time arrives runs
+.Sy mbsync
+once, in case mail was added on this machine.
+After a quiet confirmation the mailbox waits a day to be
+asked again, and another seven days plus that spread
+before the next confirmation.
+Mail in the
+.Sy mbsync
+summary leaves the empty class and follows the interval
+above.
 A count above zero, or a changed
 .Cm UIDNEXT ,
 runs
@@ -508,8 +523,9 @@ A failed
 .Cm STATUS
 closes that connection and syncs the mailbox
 instead of asking again immediately.
-On shutdown the next wake, the interval, and
-.Cm UIDNEXT
+On shutdown the next wake, the interval,
+.Cm UIDNEXT ,
+and the empty confirmation time
 are written with the time the next folder list is due.
 A later start uses those clocks.
 It still logs in, idles each configured folder, and syncs

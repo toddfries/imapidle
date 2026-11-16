@@ -472,8 +472,9 @@ Values are whole numbers.
 .Va list ,
 .Va id ,
 .Va capability ,
+.Va empty ,
 and
-.Va empty
+.Va confirm
 must be at least 60.
 .Va max
 must be at least
@@ -508,6 +509,12 @@ The default is 21600.
 .It Va empty
 Seconds before a mailbox with no messages is asked again.
 The default is 86400, one day.
+.It Va confirm
+Seconds before an empty mailbox is synced once, to catch
+mail added on this machine.
+The default is 604800, seven days.
+The first assignment, and each later confirmation, adds
+the same quarter spread used when a tracked wait grows.
 .It Va list
 Seconds between mailbox lists on the primary IMAP connection.
 The default is 259200, three days.
@@ -791,6 +798,7 @@ messages = 5
 initial = 1800
 max = 21600
 empty = 86400
+confirm = 604800
 list = 259200
 id = 604800
 capability = 604800

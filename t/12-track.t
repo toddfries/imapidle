@@ -48,6 +48,7 @@ is($cfg->{min}, 600, 'the floor defaults to 10 minutes');
 is($cfg->{messages}, 5, 'the message target defaults to 5');
 is($cfg->{initial}, 1800, 'the first interval defaults to 30 minutes');
 is($cfg->{empty}, 86400, 'an empty mailbox waits a day');
+is($cfg->{confirm}, 604800, 'an empty mailbox confirms in seven days');
 ok((!grep { $_ eq 'track' } account_names()), 'track is not an account');
 
 my $over = write_conf(<<'EOF');
@@ -85,6 +86,33 @@ folder0 = INBOX
 type = global
 empty = 10
 EOF
+
+like(load_config(write_conf(<<'EOF')), qr/\[track\] bad confirm/, 'confirm below 60 is rejected');
+[acct]
+type = idle
+server = imap.example.com
+user = a@example.com
+pass = secret
+mbsync_channel = ch
+folder0 = INBOX
+[track]
+type = global
+confirm = 10
+EOF
+
+is(load_config(write_conf(<<'EOF')), '', 'confirm can be set');
+[acct]
+type = idle
+server = imap.example.com
+user = a@example.com
+pass = secret
+mbsync_channel = ch
+folder0 = INBOX
+[track]
+type = global
+confirm = 120
+EOF
+is(track_cfg_for_test()->{confirm}, 120, 'confirm overrides the seven days');
 
 like(load_config(write_conf(<<'EOF')), qr/\[track\] bad min/, 'min below 60 is rejected');
 [acct]
@@ -339,6 +367,10 @@ ok(!defined $outside, 'rand spread stays inside the added quarter')
     or diag("outside 3600..4049: $outside");
 cmp_ok(scalar keys %seen, '>', 1, 'rand draws are not one repeated value');
 set_interval_spread_for_test(sub { 0 });
+is(with_quarter_spread(1000), 1000, 'a quarter spread of zero leaves the seconds');
+set_interval_spread_for_test(sub { $_[0] - 1 });
+is(with_quarter_spread(1000), 1249, 'a quarter spread adds one less than a quarter');
+set_interval_spread_for_test(sub { 0 });
 
 reset_mbsync_real_for_test();
 reset_conn_time_for_test();
@@ -459,6 +491,9 @@ is($status_imap->{idle}, 1, 'IDLE resumes after STATUS');
 my ($empty_row) = grep { $_->{box} eq 'Empty' } track_rows_for_test();
 cmp_ok($empty_row->{next} - $status_now, '>=', 86399, 'the empty mailbox waits a day');
 cmp_ok($empty_row->{next} - $status_now, '<=', 86401, 'the empty wait is one day');
+cmp_ok($empty_row->{confirm} - $status_now, '>=', 604799, 'the first empty look confirms in seven days');
+cmp_ok($empty_row->{confirm} - $status_now, '<=', 604801, 'the confirm wait is seven days');
+my $held_confirm = $empty_row->{confirm};
 
 clear_children_for_test();
 @status_forked = ();
@@ -466,6 +501,8 @@ set_track_due_for_test('fdc', 'Full', $status_now + 86400);
 set_track_due_for_test('fdc', 'Empty', $status_now - 1);
 pump_tracked($status_now);
 is_deeply(\@status_forked, [], 'the same UIDNEXT still skips mbsync');
+($empty_row) = grep { $_->{box} eq 'Empty' } track_rows_for_test();
+is($empty_row->{confirm}, $held_confirm, 'a later empty look keeps the confirmation');
 
 clear_children_for_test();
 @status_forked = ();
@@ -473,6 +510,9 @@ $status_imap->{replies}{Empty} = [qq{* STATUS "Empty" (MESSAGES 0 UIDNEXT 8)\n},
 set_track_due_for_test('fdc', 'Empty', $status_now - 1);
 pump_tracked($status_now);
 is_deeply(\@status_forked, ['fdc:Empty'], 'a new UIDNEXT runs mbsync');
+($empty_row) = grep { $_->{box} eq 'Empty' } track_rows_for_test();
+is($empty_row->{empty}, 0, 'a moved UIDNEXT leaves the empty class');
+ok(!defined $empty_row->{confirm}, 'a moved UIDNEXT drops the confirmation');
 
 clear_children_for_test();
 clear_conns_for_test();
@@ -489,6 +529,163 @@ is_deeply([sort @status_forked], ['left:One', 'right:Two'],
 set_trigger_hook_for_test(undef);
 clear_children_for_test();
 clear_conns_for_test();
+
+# An empty mailbox syncs once when its confirmation comes due.
+{
+    reset_track_for_test();
+    reset_schedule_for_test();
+    clear_children_for_test();
+    clear_conns_for_test();
+    set_interval_spread_for_test(sub { 0 });
+    set_connections_for_test(4);
+    set_next_try_for_test($_, time() + 100000) for account_names();
+    my $week_now = time();
+    set_track_due_for_test('fdc', 'Quiet', $week_now - 1);
+    my $week_imap = StatusIMAP->new({
+        Quiet => [qq{* STATUS "Quiet" (MESSAGES 0 UIDNEXT 4)\n}, 'A OK'],
+    });
+    set_primary_for_test('weekacct', 'fdc', $week_imap, 'IDLE');
+    my @week_forked;
+    set_trigger_hook_for_test(sub {
+        my ($wait, $args, $meta) = @_;
+        push @week_forked, $args->[0];
+        return hold_child_for_test(73100 + @week_forked, 'mbsync ' . $args->[0]);
+    });
+    pump_tracked($week_now);
+    is_deeply(\@week_forked, [], 'a new empty mailbox does not sync before its week');
+    my ($quiet) = grep { $_->{box} eq 'Quiet' } track_rows_for_test();
+    my $quiet_id = set_track_due_for_test('fdc', 'Quiet', $week_now + 86400);
+    set_track_confirm_for_test('fdc', 'Quiet', $week_now - 1);
+    @week_forked = ();
+    $week_imap->{cmds} = [];
+    pump_tracked($week_now);
+    is_deeply(\@week_forked, ['fdc:Quiet'], 'a due confirmation syncs an empty mailbox');
+    is_deeply($week_imap->{cmds}, [], 'a confirmation that is not due for STATUS skips the probe');
+    ($quiet) = grep { $_->{box} eq 'Quiet' } track_rows_for_test();
+    is($quiet->{confirming}, 1, 'the confirmation is marked until mbsync exits');
+    clear_children_for_test();
+    my $zero_line = "Channels: 1    Boxes: 1    Far: +0 *0 #0 -0    Near: +0 *0 #0 -0\n";
+    finish_track_job({ track => $quiet_id }, 0, 2, $zero_line, $week_now);
+    ($quiet) = grep { $_->{box} eq 'Quiet' } track_rows_for_test();
+    is($quiet->{empty}, 1, 'a quiet confirmation stays empty');
+    is($quiet->{confirming}, 0, 'the confirmation mark clears when mbsync exits');
+    cmp_ok($quiet->{next} - $week_now, '>=', 86399, 'the next STATUS is a day out');
+    cmp_ok($quiet->{next} - $week_now, '<=', 86401, 'the next STATUS is one day');
+    cmp_ok($quiet->{confirm} - $week_now, '>=', 604799, 'the next confirmation is seven days out');
+    cmp_ok($quiet->{confirm} - $week_now, '<=', 604801, 'the next confirmation is seven days');
+    @week_forked = ();
+    pump_tracked($week_now);
+    is_deeply(\@week_forked, [], 'a quiet confirmation does not sync again');
+
+    set_track_due_for_test('fdc', 'Quiet', $week_now - 1);
+    set_track_confirm_for_test('fdc', 'Quiet', $week_now - 1);
+    @week_forked = ();
+    $week_imap->{cmds} = [];
+    pump_tracked($week_now);
+    is_deeply(\@week_forked, ['fdc:Quiet'], 'a due STATUS and confirmation sync after the probe');
+    is(scalar @{ $week_imap->{cmds} }, 1, 'the probe runs before that confirmation');
+    clear_children_for_test();
+    finish_track_job({ track => $quiet_id }, 0, 2, $zero_line, $week_now);
+
+    my $local_id = set_track_due_for_test('fdc', 'Local', $week_now + 86400);
+    set_track_confirm_for_test('fdc', 'Local', $week_now - 1);
+    @week_forked = ();
+    pump_tracked($week_now);
+    is_deeply(\@week_forked, ['fdc:Local'], 'the next confirmation syncs once');
+    clear_children_for_test();
+    my $near = "Channels: 1    Boxes: 1    Far: +0 *0 #0 -0    Near: +1 *0 #0 -0\n";
+    finish_track_job({ track => $local_id }, 0, 2, $near, $week_now);
+    my ($local) = grep { $_->{box} eq 'Local' } track_rows_for_test();
+    is($local->{empty}, 0, 'local mail leaves the empty class');
+    ok(!defined $local->{confirm}, 'local mail drops the confirmation');
+    cmp_ok($local->{next} - $week_now, '>=', 1799, 'local mail follows the tracked interval');
+    cmp_ok($local->{next} - $week_now, '<=', 1801, 'the tracked interval is the first wait');
+
+    my $miss_id = set_track_due_for_test('fdc', 'Miss', $week_now + 5000);
+    finish_track_job({ track => $miss_id }, 1, 2, "gave up\n", $week_now);
+    finish_track_job({ track => $miss_id }, 1, 2, "gave up\n", $week_now);
+    set_track_confirm_for_test('fdc', 'Miss', $week_now - 1);
+    set_track_due_for_test('fdc', 'Miss', $week_now + 5000);
+    @week_forked = ();
+    pump_tracked($week_now);
+    clear_children_for_test();
+    finish_track_job({ track => $miss_id }, 1, 2, "gave up\n", $week_now);
+    my ($miss) = grep { $_->{box} eq 'Miss' } track_rows_for_test();
+    is($miss->{interval}, 3600, 'three missed confirmations still adjust the interval');
+    is($miss->{empty}, 1, 'a missed confirmation stays empty');
+    cmp_ok($miss->{next} - $week_now, '>=', 86399, 'a missed confirmation asks STATUS in a day');
+    cmp_ok($miss->{confirm} - $week_now, '>=', 604799, 'a missed confirmation waits another week');
+
+    my $starts = 0;
+    set_trigger_hook_for_test(sub { $starts++; return 0 });
+    set_track_due_for_test('fdc', 'Quiet', $week_now + 5000);
+    set_track_confirm_for_test('fdc', 'Quiet', $week_now - 1);
+    pump_tracked($week_now);
+    is($starts, 1, 'a due confirmation tries to start');
+    ($quiet) = grep { $_->{box} eq 'Quiet' } track_rows_for_test();
+    cmp_ok($quiet->{confirm} - $week_now, '>=', 1799, 'a confirmation that does not start waits out the first interval');
+    cmp_ok($quiet->{confirm} - $week_now, '<=', 1801, 'that retry is the first interval');
+    is($quiet->{confirming}, 0, 'a confirmation that does not start is not left marked');
+    pump_tracked($week_now);
+    is($starts, 1, 'a confirmation that does not start is not retried immediately');
+
+    reset_track_for_test();
+    clear_conns_for_test();
+    clear_children_for_test();
+    set_connections_for_test(4);
+    my $herd_n = 0;
+    set_interval_spread_for_test(sub { $herd_n++ ? 40000 : 10 });
+    set_track_due_for_test('fdc', 'Early', $week_now - 1);
+    set_track_due_for_test('fdc', 'Late', $week_now - 1);
+    my $herd = StatusIMAP->new({
+        Early => [qq{* STATUS "Early" (MESSAGES 0 UIDNEXT 1)\n}, 'A OK'],
+        Late  => [qq{* STATUS "Late" (MESSAGES 0 UIDNEXT 1)\n}, 'A OK'],
+    });
+    set_primary_for_test('herdacct', 'fdc', $herd, 'IDLE');
+    set_trigger_hook_for_test(sub { 0 });
+    pump_tracked($week_now);
+    my ($early) = grep { $_->{box} eq 'Early' } track_rows_for_test();
+    my ($late) = grep { $_->{box} eq 'Late' } track_rows_for_test();
+    is($late->{confirm} - $early->{confirm}, 39990, 'empty mailboxes do not share one confirmation');
+    is(scalar @{ $herd->{cmds} }, 2, 'both empty mailboxes are asked');
+
+    reset_track_for_test();
+    clear_conns_for_test();
+    clear_children_for_test();
+    my $short = track_cfg_for_test();
+    $short->{confirm} = 120;
+    install_track($short, 0);
+    set_interval_spread_for_test(sub { 0 });
+    set_track_due_for_test('fdc', 'Tiny', $week_now - 1);
+    my $tiny = StatusIMAP->new({
+        Tiny => [qq{* STATUS "Tiny" (MESSAGES 0 UIDNEXT 2)\n}, 'A OK'],
+    });
+    set_primary_for_test('tinyacct', 'fdc', $tiny, 'IDLE');
+    pump_tracked($week_now);
+    my ($tiny_row) = grep { $_->{box} eq 'Tiny' } track_rows_for_test();
+    cmp_ok($tiny_row->{confirm} - $week_now, '>=', 119, 'a set confirm is the confirmation wait');
+    cmp_ok($tiny_row->{confirm} - $week_now, '<=', 121, 'the set confirm is two minutes');
+    my $nodes = ctl_nodes($week_now);
+    is($nodes->{'track.confirm'}, 120, 'the control socket shows the confirm interval');
+    ok(defined $nodes->{'track.box.fdc.Tiny.confirm'}, 'the control socket shows a mailbox confirmation');
+
+    reset_track_for_test();
+    reset_schedule_for_test();
+    set_connections_for_test(4);
+    set_next_try_for_test($_, time() + 100000) for account_names();
+    {
+        my $ps = pulse_snapshot_for_test();
+        set_pulse_next_for_test($_, time() + 100000) for @{ $ps->{channels} // [] };
+    }
+    set_track_due_for_test('fdc', 'Held', time() + 100000);
+    set_track_confirm_for_test('fdc', 'Held', time() - 1);
+    hold_child_for_test(73150, 'mbsync fdc:Other');
+    cmp_ok(loop_timeout(), '>=', 29, 'a due empty confirmation does not spin while its channel is busy');
+    clear_children_for_test();
+    set_trigger_hook_for_test(undef);
+    clear_conns_for_test();
+    set_interval_spread_for_test(sub { 0 });
+}
 
 # A DONE the server rejects must not be sent again, and the lap must sleep.
 {
@@ -595,6 +792,7 @@ reset_track_for_test();
 my $clock_now = time();
 set_track_due_for_test('fdc', 'Saved', $clock_now + 4000);
 set_track_uid_for_test('fdc', 'Saved', 15, 7200);
+set_track_confirm_for_test('fdc', 'Saved', $clock_now + 700000);
 set_track_due_for_test('fdc', "Odd\tName", $clock_now + 50);
 set_track_uid_for_test('fdc', "Odd\tName", 0, 600);
 set_track_due_for_test('fdc', 'a:b', $clock_now + 10);
@@ -606,8 +804,11 @@ my ($saved_row) = grep { $_->{box} eq 'Saved' } track_rows_for_test();
 is($saved_row->{next}, $clock_now + 4000, 'a saved wake is restored');
 is($saved_row->{interval}, 7200, 'a saved interval is restored');
 is($saved_row->{uidnext}, 15, 'a saved UIDNEXT is restored');
+is($saved_row->{confirm}, $clock_now + 700000, 'a saved confirmation is restored');
+is($saved_row->{empty}, 1, 'a saved confirmation stays empty');
 my ($odd_row) = grep { $_->{box} eq "Odd\tName" } track_rows_for_test();
 is($odd_row->{uidnext}, 0, 'a zero UIDNEXT is restored');
+is($odd_row->{empty}, 0, 'a mailbox without a confirmation is not empty');
 ok((!grep { $_->{box} eq 'a:b' } track_rows_for_test()),
     'a colon name is not stored');
 is(list_next_for_test('fdc'), $clock_now + 80000, 'the LIST clock is restored');
@@ -631,6 +832,7 @@ apply_folder_list('fdc', ['Saved', 'Newbox'], { INBOX => 1 }, 1, $clock_now);
 ($saved_row) = grep { $_->{box} eq 'Saved' } track_rows_for_test();
 is($saved_row->{next}, $clock_now + 4000, 'a later list keeps the saved wake');
 is($saved_row->{uidnext}, 15, 'a later list keeps the saved UIDNEXT');
+is($saved_row->{confirm}, $clock_now + 700000, 'a later list keeps the confirmation');
 my ($new_row) = grep { $_->{box} eq 'Newbox' } track_rows_for_test();
 is($new_row->{next}, $clock_now + 1800, 'a new mailbox still starts at initial');
 reset_track_for_test();

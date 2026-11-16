@@ -625,6 +625,7 @@ sub _blank_track {
         capability     => 604800,
         connections    => 2,
         empty          => 86400,
+        confirm        => 604800,
         tunnel         => 0,
         tunnel_timeout => 3600,
         mbsyncrc       => '',
@@ -643,7 +644,7 @@ sub _parse_track_section {
     my $bad = sub { push @$problems, "[$name] $_[0]"; };
     $cfg->{disabled} = 1 if _config_disabled($row->{disabled});
 
-    for my $key (qw(min messages initial max list id capability connections empty)) {
+    for my $key (qw(min messages initial max list id capability connections empty confirm)) {
         next unless exists $row->{$key};
         if (!defined $row->{$key} || $row->{$key} !~ /^\d+$/) {
             $bad->("bad $key");
@@ -656,6 +657,7 @@ sub _parse_track_section {
     $bad->('bad id')          if $cfg->{id} < 60;
     $bad->('bad capability')  if $cfg->{capability} < 60;
     $bad->('bad empty')       if $cfg->{empty} < 60;
+    $bad->('bad confirm')     if $cfg->{confirm} < 60;
     $bad->('bad messages')    if $cfg->{messages} < 1;
     $bad->('bad connections') if $cfg->{connections} < 1;
     $bad->('bad max')         if $cfg->{max} < $cfg->{min};
@@ -730,6 +732,15 @@ sub _spread_added {
 
 sub set_interval_spread_for_test { $INTERVAL_SPREAD = $_[0]; }
 
+# The seconds being set, plus rand() in 0 .. quarter-1.
+# Backoff passes the added span. An empty confirmation passes
+# the whole interval.
+sub with_quarter_spread {
+    my ($seconds) = @_;
+    $seconds = 0 unless defined $seconds && $seconds > 0;
+    return int($seconds + _spread_added($seconds) + 0.5);
+}
+
 # Mailbox wait after mbsync exits. samples are {msgs, dur, span}.
 sub next_mailbox_interval {
     my ($current, $samples, $cfg) = @_;
@@ -750,7 +761,9 @@ sub next_mailbox_interval {
     } else {
         $next = $current * 2;
     }
-    $next += _spread_added($next - $current) if $next > $current;
+    if ($next > $current) {
+        $next = $current + with_quarter_spread($next - $current);
+    }
     $next = $cfg->{min} if $next < $cfg->{min};
     $next = $cfg->{max} if $next > $cfg->{max};
     return int($next + 0.5);
@@ -1123,8 +1136,9 @@ sub save_stat_files {
     _stat_save($CONN_TIME_FILE,   \%CONN_TIME)   if defined $CONN_TIME_FILE;
 }
 
-# Next wake, interval, and UIDNEXT, plus when LIST is next due.
-# Written on shutdown so a restart does not STATUS the herd together.
+# Next wake, interval, UIDNEXT, and the empty confirmation,
+# plus when LIST is next due. Written on shutdown so a restart
+# does not STATUS or confirm the herd together.
 sub save_track_file {
     return unless defined $TRACK_FILE && $TRACK_FILE ne '';
     my $dir = dirname($TRACK_FILE);
@@ -1136,7 +1150,7 @@ sub save_track_file {
         return;
     };
     print $fh "# list\tchannel\twhen\n";
-    print $fh "# box\tchannel\tmailbox\tnext\tinterval\tuidnext\n";
+    print $fh "# box\tchannel\tmailbox\tnext\tinterval\tuidnext\tconfirm\n";
     for my $ch (sort keys %list_next) {
         next if !defined $ch || $ch eq '' || $ch =~ /[\s\\\/]/;
         my $when = $list_next{$ch};
@@ -1155,9 +1169,14 @@ sub save_track_file {
         my $uid = '';
         $uid = $rec->{uidnext}
             if defined $rec->{uidnext} && $rec->{uidnext} =~ /^\d+\z/;
+        my $confirm = '';
+        $confirm = _stat_num($rec->{confirm})
+            if $rec->{empty}
+            && defined $rec->{confirm}
+            && $rec->{confirm} =~ /^\d+(?:\.\d+)?\z/;
         print $fh join("\t",
             'box', $ch, _encode_box($box),
-            _stat_num($next), _stat_num($interval), $uid,
+            _stat_num($next), _stat_num($interval), $uid, $confirm,
         ), "\n";
     }
     close $fh;
@@ -1180,7 +1199,7 @@ sub load_track_file {
             next;
         }
         next unless $kind eq 'box';
-        my ($ch, $box, $next, $interval, $uid) = @f;
+        my ($ch, $box, $next, $interval, $uid, $confirm) = @f;
         next unless defined $ch && $ch ne '' && $ch !~ /[\s\\\/]/;
         next unless defined $box && $box ne '';
         $box = _decode_box($box);
@@ -1196,6 +1215,10 @@ sub load_track_file {
         };
         $track{$id}{uidnext} = $uid + 0
             if defined $uid && $uid =~ /^\d+\z/;
+        if (defined $confirm && $confirm =~ /^\d+(?:\.\d+)?\z/) {
+            $track{$id}{confirm} = $confirm + 0;
+            $track{$id}{empty}   = 1;
+        }
     }
     close $fh;
 }
@@ -5285,6 +5308,31 @@ sub tracked_deferred {
     return 0;
 }
 
+# Sooner of the STATUS wake and, while empty, the confirmation.
+sub _track_when {
+    my ($rec) = @_;
+    my $when = $rec->{next} // 0;
+    if ($rec->{empty} && defined $rec->{confirm} && $rec->{confirm} < $when) {
+        $when = $rec->{confirm};
+    }
+    return $when;
+}
+
+sub _confirm_due {
+    my ($rec, $now) = @_;
+    return 0 unless $rec && $rec->{empty} && defined $rec->{confirm};
+    return $rec->{confirm} <= $now ? 1 : 0;
+}
+
+# One log for the run that checks an empty mailbox for local mail.
+sub _arm_confirm {
+    my ($channel, $box, $rec) = @_;
+    return unless $rec && !$rec->{confirming};
+    $rec->{confirming} = 1;
+    $rec->{await_sync} = 1;
+    log_info("$channel: $box confirm");
+}
+
 sub due_tracked {
     my ($now) = @_;
     $now //= time();
@@ -5292,11 +5340,11 @@ sub due_tracked {
     my @due;
     for my $id (keys %track) {
         my $rec = $track{$id} or next;
-        next if ($rec->{next} // 0) > $now;
+        next unless ($rec->{next} // 0) <= $now || _confirm_due($rec, $now);
         my ($ch, $box) = split /\0/, $id, 2;
         next if !defined $ch || !defined $box || $box eq '';
         next if tracked_deferred($ch, $box, $now);
-        push @due, { id => $id, channel => $ch, box => $box, next => $rec->{next} // 0 };
+        push @due, { id => $id, channel => $ch, box => $box, next => _track_when($rec) };
     }
     return sort { $a->{next} <=> $b->{next} || $a->{box} cmp $b->{box} } @due;
 }
@@ -5309,6 +5357,8 @@ sub finish_track_job {
     my ($channel, $box) = split /\0/, $id, 2;
     $list_next{$channel} = 0 if defined $channel && $channel ne '' && $status;
     my $row = $track{$id} or return;
+    my $confirming = $row->{confirming} ? 1 : 0;
+    $row->{confirming} = 0;
     $row->{await_sync} = 0;
     my $msgs = mbsync_new_messages($text);
     if (!defined $msgs) {
@@ -5344,6 +5394,19 @@ sub finish_track_job {
                     . "($sum_m new in ${sum_s}s, sync ${sync}s)");
             }
         }
+    }
+    if ($confirming && $row->{empty}) {
+        if (defined $msgs && $msgs > 0) {
+            $row->{empty} = 0;
+            delete $row->{confirm};
+            $row->{next} = $now + $row->{interval};
+        } else {
+            my $gap  = $track_cfg->{empty} // 86400;
+            my $week = $track_cfg->{confirm} // 604800;
+            $row->{next}    = $now + $gap;
+            $row->{confirm} = $now + with_quarter_spread($week);
+        }
+        return;
     }
     $row->{next} = $now + $row->{interval};
 }
@@ -5548,14 +5611,26 @@ sub _probe_channel {
             $rec->{uidnext}  = $uidnext;
             $rec->{messages} = $messages;
             if (status_stays_empty($messages, $uidnext, $prev)) {
-                $rec->{empty}      = 1;
+                $rec->{empty} = 1;
+                unless (defined $rec->{confirm}) {
+                    my $week = $track_cfg->{confirm} // 604800;
+                    $rec->{confirm} = $now + with_quarter_spread($week);
+                }
+                if ($rec->{confirm} <= $now) {
+                    _arm_confirm($channel, $box, $rec);
+                    $sync_n++;
+                    next;
+                }
                 $rec->{await_sync} = 0;
+                $rec->{confirming} = 0;
                 $rec->{next}       = $now + $gap;
                 $empty_n++;
                 next;
             }
             $rec->{empty}      = 0;
             $rec->{await_sync} = 1;
+            delete $rec->{confirm};
+            $rec->{confirming} = 0;
             $sync_n++;
             log_info("$channel: $box has mail") if $was_empty;
         }
@@ -5618,6 +5693,9 @@ sub pump_tracked {
         last if slots_for_cold($now) <= 0;
         next if _needs_probe($job->{id}, $now);
         next if $started{ $job->{channel} } || channel_busy($job->{channel});
+        my $row = $track{ $job->{id} };
+        _arm_confirm($job->{channel}, $job->{box}, $row)
+            if $row && _confirm_due($row, $now);
         my $pid = trigger_mbsync(0, "$job->{channel}:$job->{box}", {
             track   => $job->{id},
             capture => 1,
@@ -5625,9 +5703,18 @@ sub pump_tracked {
         if ($pid) {
             $started{ $job->{channel} } = 1;
         } else {
-            my $row = $track{ $job->{id} } or next;
-            $row->{next}       = $now + ($track_cfg->{initial} // 1800);
-            $row->{await_sync} = 0;
+            $row = $track{ $job->{id} } or next;
+            if ($row->{confirming}) {
+                $row->{confirming} = 0;
+                $row->{await_sync} = 0;
+                my $retry = $now + ($track_cfg->{initial} // 1800);
+                $row->{confirm} = $retry
+                    if !defined $row->{confirm} || $row->{confirm} <= $now;
+                $row->{next} = $retry if ($row->{next} // 0) <= $now;
+            } else {
+                $row->{next}       = $now + ($track_cfg->{initial} // 1800);
+                $row->{await_sync} = 0;
+            }
         }
     }
 }
@@ -6197,7 +6284,7 @@ sub next_track_delay {
     unless ($track_cfg->{disabled} || slots_for_cold($now) <= 0) {
         for my $id (keys %track) {
             my $rec = $track{$id} or next;
-            my $d = ($rec->{next} // 0) - $now;
+            my $d = _track_when($rec) - $now;
             if ($d <= 0) {
                 my ($ch, $box) = split /\0/, $id, 2;
                 next if !defined $ch || !defined $box || $box eq '';
@@ -6790,7 +6877,7 @@ sub ctl_nodes {
         _ctl_put(\%n, 'track.disabled', $track_cfg->{disabled} ? 1 : 0);
         _ctl_put(\%n, 'track.tunnel', $track_cfg->{tunnel} ? 1 : 0);
         _ctl_put(\%n, 'track.hook', ($track_cfg->{hook} // '') ne '' ? 1 : 0);
-        for my $k (qw(connections min messages initial max list id capability empty tunnel_timeout)) {
+        for my $k (qw(connections min messages initial max list id capability empty confirm tunnel_timeout)) {
             _ctl_put(\%n, "track.$k", $track_cfg->{$k} // 0);
         }
     }
@@ -6857,6 +6944,7 @@ sub ctl_nodes {
         _ctl_put(\%n, "$base.next", int($rec->{next} // 0));
         _ctl_put(\%n, "$base.interval", int($rec->{interval} // 0));
         _ctl_put(\%n, "$base.uidnext", defined $rec->{uidnext} ? $rec->{uidnext} : '');
+        _ctl_put(\%n, "$base.confirm", int($rec->{confirm})) if defined $rec->{confirm};
         _ctl_put(\%n, "$base.samples", scalar @{ $rec->{samples} // [] });
         _ctl_put(\%n, "$base.fails", $rec->{fails} // 0);
     }
@@ -7563,11 +7651,14 @@ sub track_rows_for_test {
         push @rows, {
             channel  => $ch,
             box      => $box,
-            interval => $rec->{interval},
-            next     => $rec->{next},
-            uidnext  => $rec->{uidnext},
-            fails    => $rec->{fails} // 0,
-            samples  => scalar @{ $rec->{samples} // [] },
+            interval   => $rec->{interval},
+            next       => $rec->{next},
+            uidnext    => $rec->{uidnext},
+            confirm    => $rec->{confirm},
+            empty      => $rec->{empty} ? 1 : 0,
+            confirming => $rec->{confirming} ? 1 : 0,
+            fails      => $rec->{fails} // 0,
+            samples    => scalar @{ $rec->{samples} // [] },
         };
     }
     return @rows;
@@ -7614,6 +7705,15 @@ sub set_track_uid_for_test {
     return unless $track{$id};
     $track{$id}{uidnext}  = $uid if defined $uid;
     $track{$id}{interval} = $interval if defined $interval;
+}
+
+sub set_track_confirm_for_test {
+    my ($channel, $box, $when) = @_;
+    my $id = _track_key($channel, $box);
+    return unless $track{$id};
+    $track{$id}{empty}   = 1;
+    $track{$id}{confirm} = $when;
+    return $id;
 }
 
 sub folder_names_for_test {
