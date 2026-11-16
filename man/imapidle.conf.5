@@ -932,6 +932,15 @@ Count and total real seconds for each
 command.
 .It Pa ~/.local/imapidle/conn-time
 Count and total connected seconds for each IMAP session.
+.It Pa ~/.local/imapidle/conn-limit
+How many IMAP sessions this user may open on a server and port.
+One line is the server, the port, the user, that count, the next
+time one extra session may be tried, and the server's own number
+when the refusal included one.
+A reload leaves the table in place.
+The file mode is 0600 when
+.Nm imapidle
+creates it.
 .El
 .Sh EXAMPLES
 A password stored in the file, with a hot inbox and a lazy archive:

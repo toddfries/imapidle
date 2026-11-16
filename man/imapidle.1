@@ -442,6 +442,34 @@ so a due mailbox does not busy-poll.
 A shutdown file uses the same finish path as
 .Dv SIGTERM .
 .Pp
+An IMAP server can refuse a login when this user and address
+already hold every connection it allows.
+.Nm
+remembers how many of its own sessions were open for that
+server, port, and user, and does not open another until a week
+has passed.
+It then tries one extra session.
+A refusal keeps the remembered count and waits another week.
+A success raises that count by one.
+The number in the server message is stored and is not the cap,
+because other programs share the server's limit.
+The refusal is not a connect failure, does not drop a session
+already open, and does not shorten the loop sleep.
+The counts are kept in
+.Pa ~/.local/imapidle/conn-limit .
+This is separate from
+.Va connections ,
+which limits
+.Sy mbsync
+processes.
+.Sy SIGINFO
+and
+.Sy imapidlectl(1)
+show the count, when the next try is due, and the server's
+number when one was given.
+See
+.Sy imapidle.conf(5) .
+.Pp
 One or more
 .Cm pulse
 sections each name accounts and a

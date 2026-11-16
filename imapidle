@@ -69,6 +69,14 @@ my %list_next;
 my %colon_noted;
 my %CONN_TIME;
 my %MBSYNC_REAL;
+# server, port, and user. Dovecot's cap is per user and source address.
+# cap is how many of our sessions were already open at the refusal.
+# server_max is the number in the message and is not enforced.
+my %CONN_LIMIT;
+my %CONN_LIMIT_HOLD;
+my %CONN_LIMIT_PROBING;
+my $CONN_LIMIT_FILE;
+my $LOGIN_FOR_TEST;
 my $pause_announced = 0;
 my $shutdown_reason = '';
 my $shutdown_waiting = 0;
@@ -3303,8 +3311,16 @@ sub imap_transport {
     return $ssl;
 }
 
+sub set_login_hook_for_test { $LOGIN_FOR_TEST = $_[0]; }
+
 sub login_imap {
     my ($name, $acc, $password) = @_;
+    # Tests die with a server refusal or return a session. A real
+    # login, including --tunnel, stays on the path below.
+    if ($LOGIN_FOR_TEST) {
+        my @got = $LOGIN_FOR_TEST->($name, $acc, $password);
+        return @got if @got;
+    }
     my $socket = imap_transport($name, $acc);
     cloexec($socket);
 
@@ -4014,12 +4030,264 @@ sub drop_conn {
     mark_retry($name) unless $no_retry;
 }
 
+# One week, plus the same quarter spread as an empty-mailbox confirm.
+sub conn_limit_week { 604800 }
+
+# The refusal text, including Perl's "at file line" suffix. A plain
+# authentication NO is not this.
+sub conn_limit_error {
+    my ($err) = @_;
+    return 0 unless defined $err && $err ne '';
+    return 1 if $err =~ /maximum number of connections/i;
+    return 1 if $err =~ /mail_max_userip_connections/i;
+    return 1 if $err =~ /too many simultaneous connections/i;
+    return 1 if $err =~ /too many connections/i;
+    return 0;
+}
+
+sub conn_limit_stop {
+    my ($err) = @_;
+    return 0 unless defined $err && $err ne '';
+    return 1 if $err =~ /^connection limit\b/;
+    return conn_limit_error($err);
+}
+
+sub _conn_limit_server_max {
+    my ($err) = @_;
+    return unless defined $err;
+    return $1 + 0 if $err =~ /mail_max_userip_connections\s*=\s*(\d+)/i;
+    return;
+}
+
+sub _conn_limit_key {
+    my ($acc) = @_;
+    return unless ref $acc eq 'HASH';
+    my $server = $acc->{server};
+    my $user   = $acc->{user};
+    return if !defined $server || $server eq '';
+    return if !defined $user || $user eq '';
+    return if !defined $acc->{port};
+    return join("\0", $server, $acc->{port} + 0, $user);
+}
+
+# Sessions already in the table. Holds are separate so a login that
+# has not landed yet still reserves its slot.
+sub _conn_limit_sessions {
+    my ($key) = @_;
+    return 0 unless defined $key;
+    my $n = 0;
+    for my $conn (values %conns) {
+        my $acc = $accounts{ $conn->{name} // '' } or next;
+        my $k = _conn_limit_key($acc) or next;
+        $n++ if $k eq $key;
+    }
+    return $n;
+}
+
+sub _conn_limit_open {
+    my ($key) = @_;
+    return _conn_limit_sessions($key) + ($CONN_LIMIT_HOLD{$key} // 0);
+}
+
+# True when another login would pass the learned cap and this week’s
+# extra attempt is not due. Does not mark that attempt.
+sub conn_limit_blocked {
+    my ($acc, $now) = @_;
+    my $key = _conn_limit_key($acc) or return 0;
+    return 1 if $CONN_LIMIT_PROBING{$key};
+    my $row = $CONN_LIMIT{$key} or return 0;
+    return 0 unless defined $row->{cap};
+    return 0 if _conn_limit_open($key) < $row->{cap};
+    $now //= time();
+    my $probe = $row->{probe} // 0;
+    return 0 if $probe <= $now;
+    return 1;
+}
+
+# Seconds until a blocked account may try again. A probe already in
+# flight does not pull the sleep down to zero.
+sub _conn_limit_wait {
+    my ($acc, $now) = @_;
+    $now //= time();
+    my $key = _conn_limit_key($acc) or return 30;
+    my $row = $CONN_LIMIT{$key};
+    my $probe = $row ? ($row->{probe} // 0) : 0;
+    my $left = $probe - $now;
+    return 30 if $CONN_LIMIT_PROBING{$key} && $left <= 0;
+    return $left > 0 ? $left : 0;
+}
+
+sub conn_limit_begin {
+    my ($name, $acc) = @_;
+    my $key = _conn_limit_key($acc) or return;
+    my $open = _conn_limit_open($key);
+    my $row = $CONN_LIMIT{$key};
+    my $extra = 0;
+    if ($row && defined $row->{cap} && $open >= $row->{cap}) {
+        $CONN_LIMIT_PROBING{$key} = 1;
+        $extra = 1;
+    }
+    $CONN_LIMIT_HOLD{$key} = ($CONN_LIMIT_HOLD{$key} // 0) + 1;
+    return { key => $key, extra => $extra, name => $name };
+}
+
+sub _conn_limit_release {
+    my ($hold) = @_;
+    return unless $hold && defined $hold->{key};
+    my $key = $hold->{key};
+    my $n = $CONN_LIMIT_HOLD{$key} // 0;
+    if ($n <= 1) {
+        delete $CONN_LIMIT_HOLD{$key};
+    } else {
+        $CONN_LIMIT_HOLD{$key} = $n - 1;
+    }
+}
+
+sub _conn_limit_schedule {
+    my ($row, $now) = @_;
+    $now //= time();
+    $row->{probe} = $now + with_quarter_spread(conn_limit_week());
+}
+
+sub _conn_limit_log {
+    my ($name, $row) = @_;
+    my $cap = $row->{cap} // 0;
+    my $left = int(($row->{probe} // 0) - time());
+    $left = 0 if $left < 0;
+    my $msg = "$name: connection limit $cap";
+    $msg .= ", server $row->{server_max}" if defined $row->{server_max};
+    $msg .= ", probe in ${left}s";
+    log_warn($msg);
+}
+
+sub _conn_limit_note_refusal {
+    my ($key, $err, $name) = @_;
+    my $row = $CONN_LIMIT{$key};
+    my $max = _conn_limit_server_max($err);
+    if (!$row || !defined $row->{cap}) {
+        $row = { cap => _conn_limit_sessions($key) };
+    }
+    $row->{server_max} = $max if defined $max;
+    _conn_limit_schedule($row);
+    $CONN_LIMIT{$key} = $row;
+    delete $CONN_LIMIT_PROBING{$key};
+    _conn_limit_save();
+    _conn_limit_log($name, $row);
+}
+
+# The new session is already in %conns. An extra success raises the
+# cap to that count and waits another week.
+sub conn_limit_success {
+    my ($hold) = @_;
+    return unless $hold;
+    my $extra = $hold->{extra};
+    my $key = $hold->{key};
+    _conn_limit_release($hold);
+    return unless $extra;
+    my $row = $CONN_LIMIT{$key} or return;
+    return unless defined $row->{cap};
+    my $n = _conn_limit_sessions($key);
+    $row->{cap} = $n if $n > $row->{cap};
+    _conn_limit_schedule($row);
+    delete $CONN_LIMIT_PROBING{$key};
+    _conn_limit_save();
+}
+
+# 1 when this failure is the server cap. The caller must not retry it.
+# Any other failure of an extra attempt leaves the week unspent.
+sub conn_limit_fail {
+    my ($hold, $err) = @_;
+    return 0 unless $hold;
+    my $extra = $hold->{extra};
+    my $key = $hold->{key};
+    my $name = $hold->{name};
+    _conn_limit_release($hold);
+    if (conn_limit_error($err)) {
+        _conn_limit_note_refusal($key, $err, $name);
+        return 1;
+    }
+    delete $CONN_LIMIT_PROBING{$key} if $extra;
+    return 0;
+}
+
+sub _conn_limit_save {
+    return unless defined $CONN_LIMIT_FILE && $CONN_LIMIT_FILE ne '';
+    my $dir = dirname($CONN_LIMIT_FILE);
+    make_path($dir, { mode => 0700 }) if $dir ne '' && $dir ne '.';
+    my $old = umask 077;
+    open my $fh, '>', $CONN_LIMIT_FILE or do {
+        umask $old;
+        log_error("Cannot write $CONN_LIMIT_FILE: $!");
+        return;
+    };
+    print $fh "# server\tport\tuser\tcap\tprobe\tserver_max\n";
+    for my $key (sort keys %CONN_LIMIT) {
+        my ($server, $port, $user) = split /\0/, $key, 3;
+        next unless defined $server && $server ne '' && index($server, "\t") < 0;
+        next unless defined $user && $user ne '' && index($user, "\t") < 0;
+        my $row = $CONN_LIMIT{$key} or next;
+        next unless defined $row->{cap} && $row->{cap} =~ /^\d+$/;
+        my $probe = $row->{probe} // 0;
+        next unless $probe =~ /^\d+(?:\.\d+)?\z/;
+        my $max = '';
+        $max = $row->{server_max} if defined $row->{server_max} && $row->{server_max} =~ /^\d+$/;
+        print $fh join("\t", $server, $port + 0, $user, $row->{cap} + 0,
+            _stat_num($probe), $max), "\n";
+    }
+    close $fh;
+    umask $old;
+}
+
+sub _conn_limit_load {
+    return unless defined $CONN_LIMIT_FILE && -f $CONN_LIMIT_FILE;
+    open my $fh, '<', $CONN_LIMIT_FILE or return;
+    while (<$fh>) {
+        chomp;
+        next if /^\s*#/ || /^\s*$/;
+        my @f = split /\t/, $_, -1;
+        next unless @f == 6;
+        my ($server, $port, $user, $cap, $probe, $max) = @f;
+        next if !defined $server || $server eq '' || index($server, "\t") >= 0;
+        next if !defined $user || $user eq '' || index($user, "\t") >= 0;
+        next unless defined $port && $port =~ /^\d+$/;
+        next unless defined $cap && $cap =~ /^\d+$/;
+        next unless defined $probe && $probe =~ /^\d+(?:\.\d+)?\z/;
+        my $key = join("\0", $server, $port + 0, $user);
+        my $row = { cap => $cap + 0, probe => $probe + 0 };
+        $row->{server_max} = $max + 0 if defined $max && $max =~ /^\d+$/;
+        $CONN_LIMIT{$key} = $row;
+    }
+    close $fh;
+}
+
+sub _conn_limit_info_lines {
+    my ($now) = @_;
+    $now //= time();
+    my @lines;
+    for my $key (sort keys %CONN_LIMIT) {
+        my ($server, $port, $user) = split /\0/, $key, 3;
+        next unless defined $user && $user ne '';
+        my $row = $CONN_LIMIT{$key} or next;
+        my $left = int(($row->{probe} // 0) - $now);
+        $left = 0 if $left < 0;
+        my $line = "limit: $server:$port $user cap "
+            . ($row->{cap} // 0) . " probe ${left}s";
+        $line .= " server $row->{server_max}" if defined $row->{server_max};
+        push @lines, $line;
+    }
+    return @lines;
+}
+
 sub connect_idle_folders {
     my ($name, $folders, $password) = @_;
     my $acc = $accounts{$name} or return 0;
     my $failed = 0;
     for my $folder (@$folders) {
         _abandon_startup();
+        if (conn_limit_blocked($acc)) {
+            return $failed ? 0 : -1;
+        }
+        my $hold = conn_limit_begin($name, $acc);
         my $ok = eval {
             my ($socket, $imap) = create_imap_connection($name, $acc, $folder->{name}, $password);
             if (_shutdown_wanted()) {
@@ -4029,10 +4297,17 @@ sub connect_idle_folders {
             arm_idle($name, $acc, $folder, $socket, $imap);
             1;
         };
+        my $err = $@;
         _abandon_startup();
-        next if $ok;
+        if ($ok) {
+            conn_limit_success($hold);
+            next;
+        }
+        if (conn_limit_fail($hold, $err)) {
+            return $failed ? 0 : -1;
+        }
         $failed = 1;
-        log_error("$name: $folder->{name}: " . scrub($@, $password));
+        log_error("$name: $folder->{name}: " . scrub($err, $password));
     }
     return $failed ? 0 : 1;
 }
@@ -4081,6 +4356,8 @@ sub _connect_pulse {
         mark_retry($name) unless defined $cmd && $cmd ne '';
         return 0;
     }
+    return 1 if conn_limit_blocked($acc);
+    my $hold = conn_limit_begin($name, $acc);
     my $ok = eval {
         my ($socket, $imap) = login_imap($name, $acc, $password);
         if (_shutdown_wanted()) {
@@ -4094,8 +4371,28 @@ sub _connect_pulse {
         adopt_pulse($name, $acc, $socket, $imap);
         1;
     };
+    my $err = $@;
     _abandon_startup();
-    return _settle_account($name, $ok, $@, $password);
+    if (!$ok) {
+        return 1 if $hold && conn_limit_fail($hold, $err);
+        return _settle_account($name, 0, $err, $password);
+    }
+    conn_limit_success($hold);
+    return _settle_account($name, 1, '', $password);
+}
+
+sub _limit_idle_result {
+    my ($name, $rc) = @_;
+    if ($rc < 0) {
+        note_success($name) if account_covered($name);
+        return 1;
+    }
+    if ($rc && account_covered($name)) {
+        note_success($name);
+        return 1;
+    }
+    mark_retry($name);
+    return $rc ? 1 : 0;
 }
 
 sub connect_account {
@@ -4106,12 +4403,14 @@ sub connect_account {
     return 1 if ($acc->{role} // '') eq 'account';
     if (($acc->{role} // '') eq 'pulse') {
         return 1 if $conns{"$name:PULSE"};
+        return 1 if conn_limit_blocked($acc);
         return _connect_pulse($name);
     }
     return 1 if account_covered($name);
 
     my @need = grep { !$conns{"$name:$_->{name}"} } @{ $acc->{folders} };
     return 1 unless @need;
+    return 1 if conn_limit_blocked($acc);
 
     my $password = account_pass($name);
     if (!defined $password) {
@@ -4124,12 +4423,12 @@ sub connect_account {
 
     my $partial = grep { index($_, "$name:") == 0 } keys %conns;
     if ($partial && _account_primary($name)) {
-        my $ok = connect_idle_folders($name, \@need, $password);
+        my $rc = connect_idle_folders($name, \@need, $password);
         _abandon_startup();
-        $ok && account_covered($name) ? note_success($name) : mark_retry($name);
-        return $ok;
+        return _limit_idle_result($name, $rc);
     }
 
+    my $hold = conn_limit_begin($name, $acc);
     my $ok = eval {
         my ($socket, $imap) = login_imap($name, $acc, $password);
         if (_shutdown_wanted()) {
@@ -4155,25 +4454,50 @@ sub connect_account {
                 arm_idle($name, $acc, $folder, $socket, $imap);
                 my $key = "$name:$folder->{name}";
                 $conns{$key}{primary} = 1 if $conns{$key};
+                conn_limit_success($hold);
+                $hold = undef;
                 my @rest = @need[1 .. $#need];
-                connect_idle_folders($name, \@rest, $password) or die 'IDLE failed' if @rest;
+                if (@rest) {
+                    my $rc = connect_idle_folders($name, \@rest, $password);
+                    die "connection limit\n" if $rc < 0;
+                    die 'IDLE failed' if !$rc;
+                }
             }
             1;
         };
         if (!$held) {
             my $err = $@;
+            if ($err =~ /^connection limit\b/) {
+                die $err;
+            }
             close_session($imap, $socket) unless _session_held($socket);
             die $err || 'connect failed';
         }
+        if ($hold) {
+            conn_limit_success($hold);
+            $hold = undef;
+        }
         1;
     };
+    my $err = $@;
     _abandon_startup();
-    return _settle_account($name, $ok, $@, $password);
+    if ($hold && conn_limit_fail($hold, $err)) {
+        return 1;
+    }
+    if ($err && $err =~ /^connection limit\b/) {
+        note_success($name) if account_covered($name);
+        return 1;
+    }
+    return _settle_account($name, $ok, $err, $password);
 }
 
 sub _settle_account {
     my ($name, $ok, $err, $password) = @_;
     if (!$ok) {
+        if (conn_limit_stop($err)) {
+            note_success($name) if account_covered($name);
+            return 1;
+        }
         log_error("$name: connect failed: " . scrub($err, $password));
         mark_retry($name);
         return 0;
@@ -6096,6 +6420,7 @@ sub _close_for_shutdown {
     _release_imap_sessions();
     save_stat_files();
     save_track_file();
+    _conn_limit_save();
     ctl_close();
     my $dir = $STATE_DIR;
     if (!defined $dir || $dir eq '') {
@@ -6870,8 +7195,9 @@ sub housekeeping {
         next if account_covered($name);
         next if ($accounts{$name}{next_try} // 0) > $now;
         eval { connect_account($name) };
-        if ($@) {
-            log_error("$name: reconnect: " . scrub($@));
+        if (my $err = $@) {
+            next if conn_limit_stop($err);
+            log_error("$name: reconnect: " . scrub($err));
             mark_retry($name);
         }
     }
@@ -6890,6 +7216,17 @@ sub loop_timeout {
             next;
         }
         next if account_covered($name);
+        # A learned cap must not busy-poll. The week stays out of
+        # next_try so a dropped session can be replaced up to the cap.
+        # A real backoff and a nearer probe wait for the later one.
+        if (conn_limit_blocked($acc, $now)) {
+            my $defer = _conn_limit_wait($acc, $now);
+            my $due = $acc->{next_try} // 0;
+            my $retry = $due > $now ? ($due - $now) : 0;
+            my $d = $defer > $retry ? $defer : $retry;
+            $wait = $d if $d < $wait;
+            next;
+        }
         my $due = $acc->{next_try} // $now;
         my $d   = $due - $now;
         $d = 0 if $d < 0;
@@ -7257,6 +7594,7 @@ sub info_lines {
             push @lines, _folder_info_line($name, $acc, $folder, $now);
         }
     }
+    push @lines, _conn_limit_info_lines($now);
     push @lines, _track_info_lines($now);
     push @lines, _pulse_info_lines($now);
     for my $pid (@kids) {
@@ -7573,6 +7911,16 @@ sub ctl_nodes {
         _ctl_put(\%n, "$base.host", $srv->{host} // '');
         _ctl_put(\%n, "$base.port", $srv->{port} // 0);
         _ctl_put(\%n, "$base.proto", $srv->{proto} // 'tls');
+    }
+    for my $key (sort keys %CONN_LIMIT) {
+        my ($server, $port, $user) = split /\0/, $key, 3;
+        next unless defined $user && $user ne '';
+        my $row = $CONN_LIMIT{$key} or next;
+        my $base = 'limit.' . ctl_enc($server) . '.' . ctl_enc($port) . '.' . ctl_enc($user);
+        _ctl_put(\%n, "$base.cap", $row->{cap} // 0);
+        _ctl_put(\%n, "$base.probe", int($row->{probe} // 0));
+        _ctl_put(\%n, "$base.server_max", $row->{server_max})
+            if defined $row->{server_max};
     }
     for my $sec (@PULSE_SECTIONS) {
         my $label = $sec->{name} // 'pulse';
@@ -7995,6 +8343,8 @@ sub open_state_dir {
         if !defined $PULSE_LAST_FILE || $PULSE_LAST_FILE eq '';
     $TRACK_FILE = "$STATE_DIR/track"
         if !defined $TRACK_FILE || $TRACK_FILE eq '';
+    $CONN_LIMIT_FILE = "$STATE_DIR/conn-limit"
+        if !defined $CONN_LIMIT_FILE || $CONN_LIMIT_FILE eq '';
     my $known   = "$STATE_DIR/known_hosts";
     my $learned = "$STATE_DIR/learned";
     if (defined $CONFIG_DIR && $CONFIG_DIR ne '') {
@@ -8008,6 +8358,7 @@ sub open_state_dir {
     load_track_file();
     _pulse_last_load();
     _apply_pulse_last();
+    _conn_limit_load();
 }
 
 sub startup_fail {
@@ -8068,7 +8419,9 @@ sub run {
     _abandon_startup();
     for my $name (sort keys %accounts) {
         eval { connect_account($name) };
-        log_error("$name: startup: " . scrub($@)) if $@;
+        if (my $err = $@) {
+            log_error("$name: startup: " . scrub($err)) unless conn_limit_stop($err);
+        }
     }
 
     _abandon_startup();
@@ -8249,6 +8602,36 @@ sub set_conn_imap_for_test {
     return $conn;
 }
 
+sub set_conn_primary_for_test {
+    my ($key) = @_;
+    return 0 unless defined $key && $conns{$key};
+    $conns{$key}{primary} = 1;
+    return 1;
+}
+
+sub clear_conn_limit_for_test {
+    %CONN_LIMIT = ();
+    %CONN_LIMIT_HOLD = ();
+    %CONN_LIMIT_PROBING = ();
+}
+
+sub conn_limit_row_for_test {
+    my ($name) = @_;
+    my $acc = $accounts{$name} or return;
+    my $key = _conn_limit_key($acc) or return;
+    my $row = $CONN_LIMIT{$key} or return;
+    return { %$row };
+}
+
+sub set_conn_limit_probe_for_test {
+    my ($name, $when) = @_;
+    my $acc = $accounts{$name} or return 0;
+    my $key = _conn_limit_key($acc) or return 0;
+    return 0 unless $CONN_LIMIT{$key};
+    $CONN_LIMIT{$key}{probe} = $when;
+    return 1;
+}
+
 sub plant_idle_for_test {
     my ($name, $folder, $debounce, $channel) = @_;
     my $key = "$name:$folder";
@@ -8324,9 +8707,11 @@ sub set_state_dir_for_test {
     $TRACK_FILE       = "$dir/track";
     $KNOWN_HOSTS      = "$dir/known_hosts";
     $LEARNED          = "$dir/learned";
+    $CONN_LIMIT_FILE  = "$dir/conn-limit";
     load_track_file();
     _pulse_last_load();
     _apply_pulse_last();
+    _conn_limit_load();
 }
 
 sub set_runtime_dir_for_test { $RUNTIME_DIR = $_[0]; }
