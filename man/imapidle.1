@@ -70,6 +70,11 @@ It stays disabled until that value is removed and the file is
 reloaded.
 An account that has monitored a mailbox keeps retrying after a later
 failure, with the wait growing by half each time up to 900 seconds.
+Three authentication failures in a row wait one week instead.
+.Sy imapidlectl(1)
+.Ar account.name.next_try
+schedules that login again.
+Zero tries on the next loop.
 A failing
 .Va pass_cmd
 uses its own wait.
@@ -195,6 +200,8 @@ and the notice that
 .Cm IDLE
 was armed again.
 They are omitted by default.
+The first look at a host also logs the authentication
+mechanisms that server offers, once.
 The flag applies when the process is a daemon and with
 .Fl d .
 .El
@@ -229,6 +236,13 @@ Broken to fit this page, it looks like:
     ECDHE-RSA-AES256-GCM-SHA384 ci 256b skey 4096b
     comp 0 fp match
 .Ed
+.Pp
+.Fl v
+adds one companion line the first time a host is seen.
+It lists the authentication mechanisms that server offered,
+numbered like the certificate line
+.Pq 01.auth ,
+and later connections do not repeat it.
 .Pp
 The spaces before the colon are that padding.
 With no accounts loaded the name column is eight characters, so

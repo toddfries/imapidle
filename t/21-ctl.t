@@ -77,6 +77,21 @@ is(loaded_account('acct')->{hyperdelete}, 1, 'the running account syncs removals
 is(ctl_reply('account.acct.hyperdelete=0'), "account.acct.hyperdelete=0\n",
     'hyperdelete can be cleared');
 is(loaded_account('acct')->{hyperdelete}, 0, 'the running account leaves removals');
+like($all, qr/^account\.acct\.next_try=0$/m, 'the next login is a node');
+like($all, qr/^account\.acct\.auth_fails=0$/m, 'authentication failures start at zero');
+is(ctl_reply('account.acct.next_try=1700000000'),
+    "account.acct.next_try=1700000000\n", 'the next login can be scheduled');
+is(account_next_try('acct'), 1700000000, 'the running account keeps that time');
+is(ctl_reply('account.acct.next_try=0'), "account.acct.next_try=0\n",
+    'zero tries on the next loop');
+is(account_next_try('acct'), 0, 'the scheduled login was cleared');
+is(ctl_reply('account.acct.next_try=soon'), "error bad value\n",
+    'a next login must be a whole number');
+is(ctl_reply('account.missing.next_try=0'),
+    "error unknown oid account.missing.next_try\n",
+    'an unknown account has no login time');
+is(ctl_reply('account.acct.auth_fails=0'), "error read-only\n",
+    'the authentication streak is not a setting');
 is(ctl_reply('account.acct.hyperdelete=yes'), "error bad value\n",
     'hyperdelete is 0 or 1');
 is(loaded_account('acct')->{hyperdelete}, 0, 'a rejected hyperdelete write stays');

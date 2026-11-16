@@ -212,6 +212,7 @@ sub cloexec {
 my %CERT_SEEN;
 my %CERT_INDEX;
 my $CERT_SEQ = 0;
+my %AUTH_SEEN;
 
 sub _cert_stamp {
     my @t = gmtime();
@@ -338,6 +339,57 @@ sub _announce_cert {
     log_info("[tls]: $n.cert +$fp") if $kind eq 'new' || $kind eq 'change';
     log_info("[tls]: $n.cert -$old") if $kind eq 'change';
 }
+
+# AUTH= tokens, in the order the server listed them.
+sub _auth_tokens {
+    my %seen;
+    my @out;
+    for my $text (@_) {
+        next unless defined $text;
+        while ($text =~ /AUTH=([A-Z0-9._-]+)/ig) {
+            my $mech = uc $1;
+            next if $seen{$mech}++;
+            push @out, $mech;
+        }
+    }
+    return @out;
+}
+
+# One line per host:port for this process, and only with -v. The
+# same host number as the certificate line. A later connection
+# does not repeat it.
+sub _announce_auth {
+    my ($server, $port, @mechs) = @_;
+    return unless $VERBOSE;
+    return unless defined $server && $server ne '' && defined $port;
+    my $hostkey = "$server:$port";
+    return if $AUTH_SEEN{$hostkey};
+    $AUTH_SEEN{$hostkey} = 1;
+    $CERT_INDEX{$hostkey} //= ++$CERT_SEQ;
+    my $n = sprintf('%02d', $CERT_INDEX{$hostkey});
+    my $list = @mechs ? join(' ', @mechs) : 'none';
+    log_info("[tls]: $n.auth $hostkey $list");
+}
+
+sub _note_server_auth {
+    my ($server, $port, $imap, @caps) = @_;
+    return unless $VERBOSE;
+    return unless defined $server && $server ne '' && defined $port;
+    return if $AUTH_SEEN{"$server:$port"};
+    if (!@caps) {
+        return unless $imap && eval { $imap->IsConnected };
+        @caps = eval { $imap->capability };
+        return if $@ || !@caps;
+    }
+    my @mechs = _auth_tokens(@caps);
+    if (!@mechs && ref $imap->{CAPABILITY} eq 'HASH'
+        && ref $imap->{CAPABILITY}{AUTH} eq 'ARRAY') {
+        @mechs = _auth_tokens(map { "AUTH=$_" } @{ $imap->{CAPABILITY}{AUTH} });
+    }
+    _announce_auth($server, $port, @mechs);
+}
+
+sub reset_auth_seen_for_test { %AUTH_SEEN = (); }
 
 sub approve_fingerprint {
     my ($server, $port, $fingerprint, $tls) = @_;
@@ -3374,8 +3426,11 @@ sub login_imap {
     $login{Readmoremethod} = \&imap_read_more;
     my $imap = ImapidleClient->new(%login);
     $socket->blocking(0) if $socket && $socket->can('blocking');
+    # CAPABILITY clears LastError. Keep the login failure.
+    my $login_err = $imap ? $imap->LastError : $@;
+    _note_server_auth($acc->{server}, $acc->{port}, $imap) if $imap;
     unless ($imap && $imap->IsAuthenticated) {
-        my $err = _scrub_login(($imap ? $imap->LastError : $@), $acc, $password);
+        my $err = _scrub_login($login_err, $acc, $password);
         imap_logout($imap);
         $socket->close;
         die "IMAP login: $err";
@@ -3558,6 +3613,7 @@ sub consider_capability {
     return 0 unless cap_is_due($server, $port, $now);
     my @caps = eval { $imap->capability };
     return 0 if $@ || !@caps;
+    _note_server_auth($server, $port, $imap, @caps);
     my $hash = capability_hash(@caps);
     my $has      = grep { uc($_) eq 'NOTIFY' } @caps;
     my $has_idle = grep { uc($_) eq 'IDLE' } @caps;
@@ -3974,6 +4030,50 @@ sub next_disable_for {
     return $n;
 }
 
+# One week, with no extra spread. The operator schedules the next
+# try with account.NAME.next_try once the login is fixed.
+sub auth_week { 604800 }
+
+# The server rejected the login. A timeout or a dropped socket is not
+# this, and neither is a connection-limit refusal.
+sub auth_failure_error {
+    my ($err) = @_;
+    return 0 unless defined $err && $err ne '';
+    return 1 if $err =~ /authenticationfailed/i;
+    return 1 if $err =~ /authentication failed/i;
+    return 1 if $err =~ /authenticate failed/i;
+    return 1 if $err =~ /invalid credentials/i;
+    return 1 if $err =~ /\blogin failed\b/i;
+    return 0;
+}
+
+# A timeout or a refused socket ends the authentication streak.
+# The week-long backoff must not become the next ordinary retry.
+sub _clear_auth_streak {
+    my ($name) = @_;
+    my $acc = $accounts{$name} or return;
+    $acc->{auth_fails} = 0;
+    $acc->{backoff} = 5 if ($acc->{backoff} // 0) > 900;
+}
+
+# The first two authentication failures use the connect backoff.
+# The third in a row, and each one after it, waits one week.
+# A different failure clears the streak.
+sub note_auth_failure {
+    my ($name) = @_;
+    my $acc = $accounts{$name} or return;
+    return if $acc->{disabled} || $acc->{config_disabled};
+    $acc->{auth_fails} = ($acc->{auth_fails} // 0) + 1;
+    if ($acc->{auth_fails} < 3) {
+        mark_retry($name);
+        return;
+    }
+    my $b = auth_week();
+    $acc->{backoff}  = $b;
+    $acc->{next_try} = time() + $b;
+    log_error("$name: auth failed, retry in ${b}s at " . _clock($acc->{next_try}));
+}
+
 sub mark_retry {
     my ($name) = @_;
     my $acc = $accounts{$name} or return;
@@ -4020,11 +4120,12 @@ sub lift_account_disable {
 sub note_success {
     my ($name) = @_;
     my $acc = $accounts{$name} or return;
-    $acc->{backoff}  = 5;
-    $acc->{next_try} = 0;
-    $acc->{fails}    = 0;
-    $acc->{up}       = 1;
-    $acc->{disabled} = 0;
+    $acc->{backoff}    = 5;
+    $acc->{next_try}   = 0;
+    $acc->{fails}      = 0;
+    $acc->{auth_fails} = 0;
+    $acc->{up}         = 1;
+    $acc->{disabled}   = 0;
     delete $acc->{disable_for};
 }
 
@@ -4330,6 +4431,11 @@ sub connect_idle_folders {
         if (conn_limit_fail($hold, $err)) {
             return $failed ? 0 : -1;
         }
+        if (auth_failure_error($err)) {
+            log_error("$name: $folder->{name}: " . scrub($err, $password));
+            note_auth_failure($name);
+            return -2;
+        }
         $failed = 1;
         log_error("$name: $folder->{name}: " . scrub($err, $password));
     }
@@ -4407,6 +4513,7 @@ sub _connect_pulse {
 
 sub _limit_idle_result {
     my ($name, $rc) = @_;
+    return 0 if $rc < -1;
     if ($rc < 0) {
         note_success($name) if account_covered($name);
         return 1;
@@ -4453,6 +4560,7 @@ sub connect_account {
     }
 
     my $hold = conn_limit_begin($name, $acc);
+    my $auth_stop = 0;
     my $ok = eval {
         my ($socket, $imap) = login_imap($name, $acc, $password);
         if (_shutdown_wanted()) {
@@ -4483,12 +4591,17 @@ sub connect_account {
                 my @rest = @need[1 .. $#need];
                 if (@rest) {
                     my $rc = connect_idle_folders($name, \@rest, $password);
+                    if ($rc < -1) {
+                        $auth_stop = 1;
+                        return 0;
+                    }
                     die "connection limit\n" if $rc < 0;
                     die 'IDLE failed' if !$rc;
                 }
             }
             1;
         };
+        return 0 if $auth_stop;
         if (!$held) {
             my $err = $@;
             if ($err =~ /^connection limit\b/) {
@@ -4505,6 +4618,7 @@ sub connect_account {
     };
     my $err = $@;
     _abandon_startup();
+    return 0 if $auth_stop;
     if ($hold && conn_limit_fail($hold, $err)) {
         return 1;
     }
@@ -4523,7 +4637,12 @@ sub _settle_account {
             return 1;
         }
         log_error("$name: connect failed: " . scrub($err, $password));
-        mark_retry($name);
+        if (auth_failure_error($err)) {
+            note_auth_failure($name);
+        } else {
+            _clear_auth_streak($name);
+            mark_retry($name);
+        }
         return 0;
     }
     if (account_covered($name)) {
@@ -7218,7 +7337,12 @@ sub housekeeping {
         if (my $err = $@) {
             next if conn_limit_stop($err);
             log_error("$name: reconnect: " . scrub($err));
-            mark_retry($name);
+            if (auth_failure_error($err)) {
+                note_auth_failure($name);
+            } else {
+                _clear_auth_streak($name);
+                mark_retry($name);
+            }
         }
     }
 }
@@ -7451,15 +7575,17 @@ sub reload_config_now {
         $new->{backoff}     = $old->{backoff}     // 5;
         $new->{next_try}    = $old->{next_try}    // 0;
         $new->{fails}       = $old->{fails}       // 0;
+        $new->{auth_fails}  = $old->{auth_fails}  // 0;
         $new->{up}          = $old->{up}          // 0;
         $new->{disable_for} = $old->{disable_for} if defined $old->{disable_for};
         $new->{secret_wait} = $old->{secret_wait} if defined $old->{secret_wait};
         $new->{secret_said} = $old->{secret_said} if defined $old->{secret_said};
         if ($old->{disabled}) {
-            $new->{disabled} = 0;
-            $new->{fails}    = 0;
-            $new->{backoff}  = 5;
-            $new->{next_try} = 0;
+            $new->{disabled}   = 0;
+            $new->{fails}      = 0;
+            $new->{auth_fails} = 0;
+            $new->{backoff}    = 5;
+            $new->{next_try}   = 0;
             delete $new->{disable_for};
             log_info("$name: enabled");
         }
@@ -7974,6 +8100,7 @@ sub ctl_nodes {
         _ctl_put(\%n, "$base.config_disabled", $acc->{config_disabled} ? 1 : 0);
         _ctl_put(\%n, "$base.next_try", int($acc->{next_try} // 0));
         _ctl_put(\%n, "$base.fails", $acc->{fails} // 0);
+        _ctl_put(\%n, "$base.auth_fails", $acc->{auth_fails} // 0);
         _ctl_put(\%n, "$base.pass_wait", int($acc->{secret_wait} // 0));
         _ctl_put(\%n, "$base.hook", ($acc->{hook} // '') ne '' ? 1 : 0);
         _ctl_put(\%n, "$base.hyperdelete", $acc->{hyperdelete} ? 1 : 0);
@@ -8071,7 +8198,9 @@ sub ctl_nodes {
 # this latch. resync is how long a watched folder may go since its
 # last sync. hyperdelete is that account's removal flag. A connection
 # cap and its next probe are the learned limit for one server, port,
-# and user. A write that is not applied here is refused.
+# and user. next_try is when that account logs in again. Zero tries
+# on the next loop and clears an authentication hold. A write that
+# is not applied here is refused.
 sub ctl_parts {
     my ($s) = @_;
     my @parts;
@@ -8125,6 +8254,18 @@ sub ctl_set {
         return 'bad value' unless defined $value && ($value eq '0' || $value eq '1');
         my $acc = $accounts{ $part[1] } or return "unknown oid $name";
         $acc->{hyperdelete} = $value eq '1' ? 1 : 0;
+        return;
+    }
+    if (@part == 3 && $part[0] eq 'account' && $part[2] eq 'next_try') {
+        return 'bad value' unless defined $value && $value =~ /^\d+$/;
+        my $acc = $accounts{ $part[1] } or return "unknown oid $name";
+        $acc->{next_try}   = $value + 0;
+        $acc->{backoff}    = 5;
+        $acc->{auth_fails} = 0;
+        if ($value + 0 <= time() && !$acc->{config_disabled}) {
+            $acc->{disabled} = 0;
+            delete $acc->{disable_for};
+        }
         return;
     }
     if (@part == 5 && $part[0] eq 'limit'

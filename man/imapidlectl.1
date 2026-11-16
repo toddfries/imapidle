@@ -71,6 +71,11 @@ A reload reads the value from the configuration again.
 is 1 to sync a removal, or 0 to leave it until the next arrival
 or that folder's resync time.
 A reload reads this value from the configuration again.
+.Ar account.name.next_try
+is when that account logs in again, as seconds since the epoch.
+Zero tries on the next loop.
+Three authentication failures in a row set this one week ahead.
+The write clears that hold.
 .Ar limit.server.port.user.cap
 is how many sessions this process may hold for that server,
 port, and user.

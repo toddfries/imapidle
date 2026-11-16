@@ -104,6 +104,9 @@ set_login_hook_for_test(sub {
     if ($mode eq 'auth') {
         die "1 NO authentication failed\n";
     }
+    if ($mode eq 'down') {
+        die "connection timed out\n";
+    }
     if ($mode eq 'simultaneous') {
         die "Too many simultaneous connections\n";
     }
@@ -144,6 +147,60 @@ ok(!conn_limit_row_for_test('acct'), 'an authentication failure sets no cap');
 is(loaded_account('acct')->{fails}, 1, 'an authentication failure counts');
 ok(account_next_try('acct') > time(), 'an authentication failure waits');
 ok(!loaded_account('acct')->{disabled}, 'one authentication failure does not disable');
+is(loaded_account('acct')->{auth_fails}, 1, 'the first authentication failure starts the streak');
+
+$calls = 0;
+my $second = stderr_of(sub {
+    is(connect_account('acct'), 0, 'the second authentication failure still fails');
+});
+like($second, qr/retry in \d+s/, 'the second authentication failure uses the connect backoff');
+unlike($second, qr/retry in 604800s/, 'the second authentication failure is not yet a week');
+is(loaded_account('acct')->{auth_fails}, 2, 'two authentication failures are still short');
+is(loaded_account('acct')->{fails}, 2, 'the short authentication failures count');
+
+$calls = 0;
+my $third = stderr_of(sub {
+    is(connect_account('acct'), 0, 'the third authentication failure still fails');
+});
+like($third, qr/auth failed, retry in 604800s at \d{8} \d{2}:\d{2}:\d{2}\.\d{6}/,
+    'the third authentication failure waits one week');
+unlike($third, qr/disabled after/, 'three authentication failures do not pause the account');
+is(loaded_account('acct')->{auth_fails}, 3, 'the streak is three');
+is(loaded_account('acct')->{fails}, 2, 'the week does not add another failure');
+is(loaded_account('acct')->{backoff}, 604800, 'the backoff is one week');
+ok(!loaded_account('acct')->{disabled}, 'the account stays enabled during the week');
+my $week_left = int(account_next_try('acct') - time());
+ok($week_left == 604800 || $week_left == 604799, 'the next login is one week out')
+    or diag($week_left);
+
+$calls = 0;
+my $fourth = stderr_of(sub {
+    is(connect_account('acct'), 0, 'a later authentication failure still fails');
+});
+like($fourth, qr/retry in 604800s/, 'a later authentication failure stays on the week');
+is(loaded_account('acct')->{fails}, 2, 'later authentication failures still do not count');
+
+is(ctl_reply('account.acct.auth_fails'), "account.acct.auth_fails=4\n",
+    'the control socket shows the streak');
+is(ctl_reply('account.acct.next_try=0'), "account.acct.next_try=0\n",
+    'the week can be scheduled for the next loop');
+is(account_next_try('acct'), 0, 'the held login is due now');
+is(loaded_account('acct')->{auth_fails}, 0, 'scheduling clears the streak');
+is(loaded_account('acct')->{backoff}, 5, 'scheduling restores the short backoff');
+
+note_success('acct');
+set_monitored_for_test('acct', 0);
+$calls = 0;
+stderr_of(sub { connect_account('acct') for 1 .. 2 });
+is(loaded_account('acct')->{auth_fails}, 2, 'a new streak starts after it is scheduled');
+$mode = 'down';
+my $down = stderr_of(sub {
+    is(connect_account('acct'), 0, 'a timeout is a different failure');
+});
+like($down, qr/retry in \d+s/, 'a timeout uses the connect backoff');
+unlike($down, qr/retry in 604800s/, 'a timeout does not keep the week');
+is(loaded_account('acct')->{auth_fails}, 0, 'a timeout clears the authentication streak');
+$mode = 'auth';
 
 note_success('acct');
 set_monitored_for_test('acct', 0);
@@ -397,5 +454,40 @@ set_next_try_for_test('acct2', time() + 20);
 my $later = loop_timeout();
 ok($later >= 18 && $later <= 20, 'a backoff longer than the probe waits for the backoff')
     or diag($later);
+
+set_monitored_for_test('other', 0);
+set_next_try_for_test('other', 0);
+stderr_of(sub { mark_retry('other') for 1 .. start_give_up() });
+ok(loaded_account('other')->{disabled}, 'the other account is paused');
+is(ctl_reply('account.other.next_try=0'), "account.other.next_try=0\n",
+    'a paused account can be scheduled now');
+ok(!loaded_account('other')->{disabled}, 'scheduling now ends the pause');
+is(account_next_try('other'), 0, 'the paused account is due');
+
+{
+    package AuthList;
+    sub new { bless { caps => $_[1] }, $_[0] }
+    sub IsConnected { 1 }
+    sub capability { return @{ $_[0]->{caps} } }
+}
+set_verbose_for_test(1);
+reset_auth_seen_for_test();
+my $mechs = stderr_of(sub {
+    _note_server_auth('mech.example', 993,
+        AuthList->new([qw(IMAP4rev1 AUTH=PLAIN AUTH=XOAUTH2)]));
+});
+like($mechs, qr/\[tls\] +: \d+\.auth mech\.example:993 PLAIN XOAUTH2/,
+    'verbose mode logs the server authentication mechanisms once');
+my $repeat = stderr_of(sub {
+    _note_server_auth('mech.example', 993,
+        AuthList->new([qw(AUTH=LOGIN)]));
+});
+unlike($repeat, qr/\.auth /, 'the mechanisms are not logged again');
+set_verbose_for_test(0);
+reset_auth_seen_for_test();
+my $silent = stderr_of(sub {
+    _note_server_auth('quiet.example', 993, AuthList->new([qw(AUTH=PLAIN)]));
+});
+unlike($silent, qr/\.auth /, 'without verbose the mechanisms stay quiet');
 
 done_testing;
