@@ -197,6 +197,132 @@ is_deeply([jobs(4604)], [], 'the resync ceiling has not elapsed');
 is_deeply([jobs(4605)], [], 'the ceiling opens the combine window');
 is_deeply([jobs(4610)], ['ch:INBOX wait=0'], 'the folder syncs when the ceiling elapses');
 
+is_deeply(
+    [count_follow_decision({ messages => 10, uidnext => 30, chase => 0 }, 12, 40)],
+    [1, 0],
+    'a higher total after sync schedules',
+);
+is_deeply(
+    [count_follow_decision({ messages => 10, uidnext => 30, chase => 0 }, 10, 31)],
+    [1, 1],
+    'a new UIDNEXT schedules one confirmation',
+);
+is_deeply(
+    [count_follow_decision({ messages => 10, uidnext => 30, chase => 1 }, 10, 32)],
+    [0, 0],
+    'a second UIDNEXT bump does not schedule',
+);
+is_deeply(
+    [count_follow_decision({ messages => 10, uidnext => 30, chase => 1 }, 11, 32)],
+    [1, 0],
+    'mail during the confirmation still schedules',
+);
+is_deeply(
+    [count_follow_decision({ messages => 10, uidnext => 30, chase => 0 }, 9, 31)],
+    [1, 1],
+    'a new UIDNEXT with a lower total confirms once',
+);
+is_deeply(
+    [count_follow_decision({ messages => 10, uidnext => 30, chase => 0 }, 9, 30)],
+    [0, 0],
+    'a lower total alone does not schedule',
+);
+is_deeply(
+    [count_follow_decision({ chase => 0 }, 4, 8)],
+    [0, 0],
+    'a first sample learns the numbers',
+);
+
+{
+    package AfterStatusIMAP;
+    sub new {
+        my ($class, $lines) = @_;
+        return bless { lines => $lines, cmds => [], idle => 0, done => 0 }, $class;
+    }
+    sub IsConnected { 1 }
+    sub LastError   { '' }
+    sub Results     { return ('* 10 EXISTS', '* OK [UIDNEXT 30] Predicted next UID'); }
+    sub done        { $_[0]->{done}++; return 'A1 OK DONE'; }
+    sub idle        { $_[0]->{idle}++; return 'A2'; }
+    sub tag_and_run {
+        my ($self, $cmd) = @_;
+        push @{ $self->{cmds} }, $cmd;
+        return @{ $self->{lines} };
+    }
+}
+package main;
+
+is(selected_uidnext(AfterStatusIMAP->new([])), 30, 'SELECT UIDNEXT is remembered');
+
+reset_schedule_for_test();
+clear_conns_for_test();
+my $akey = plant_idle_for_test('acct', 'INBOX', 420, 'ch');
+my $aimap = AfterStatusIMAP->new(['* STATUS "INBOX" (MESSAGES 12 UIDNEXT 40)', 'A OK']);
+my $aconn = set_conn_imap_for_test($akey, $aimap, 'T1');
+$aconn->{idling}   = 1;
+$aconn->{messages} = 10;
+$aconn->{uidnext}  = 30;
+settle_counts_after({
+    count_snap => {
+        "ch\0INBOX" => { channel => 'ch', box => 'INBOX', messages => 10, uidnext => 30, chase => 0 },
+    },
+});
+is($aconn->{messages}, 12, 'the after-sync total replaces the remembered one');
+is($aconn->{uidnext}, 40, 'the after-sync UIDNEXT is remembered');
+ok(defined schedule_deadline('ch'), 'a higher total queues another sync');
+is($aimap->{done}, 1, 'IDLE is paused for the after-sync STATUS');
+is($aimap->{idle}, 1, 'IDLE resumes after the after-sync STATUS');
+like($aimap->{cmds}[0], qr/^STATUS "INBOX" \(MESSAGES UIDNEXT\)$/, 'STATUS asks for both numbers');
+
+reset_schedule_for_test();
+$aconn->{uidnext_chase} = 1;
+my $taken = _folder_count_snaps('ch:INBOX');
+is($taken->{"ch\0INBOX"}{chase}, 1, 'the forked run records the confirmation');
+is($taken->{"ch\0INBOX"}{messages}, 12, 'the fork copies the remembered total');
+ok(!_chase_on($aconn, 'INBOX'), 'taking the copy spends the confirmation');
+is_deeply(_folder_count_snaps('ch'), {}, 'a whole-channel run has no folder count');
+
+reset_schedule_for_test();
+$aimap->{lines} = ['* STATUS "INBOX" (MESSAGES 12 UIDNEXT 41)', 'A OK'];
+settle_counts_after({
+    count_snap => {
+        "ch\0INBOX" => { channel => 'ch', box => 'INBOX', messages => 12, uidnext => 40, chase => 1 },
+    },
+});
+is($aconn->{uidnext}, 41, 'the confirmation stores the new UIDNEXT');
+ok(!_chase_on($aconn, 'INBOX'), 'the confirmation does not arm another one');
+ok(!defined schedule_deadline('ch'), 'a repeated UIDNEXT bump does not queue');
+
+reset_schedule_for_test();
+$aimap->{lines} = ['* STATUS "INBOX" (MESSAGES 9 UIDNEXT 42)', 'A OK'];
+settle_counts_after({
+    count_snap => {
+        "ch\0INBOX" => { channel => 'ch', box => 'INBOX', messages => 12, uidnext => 41, chase => 0 },
+    },
+});
+is($aconn->{messages}, 9, 'a lower total is stored');
+ok(defined schedule_deadline('ch'), 'that lower total still confirms a new UIDNEXT once');
+ok(_chase_on($aconn, 'INBOX'), 'the confirmation is armed');
+
+clear_conns_for_test();
+reset_schedule_for_test();
+my $pkey = plant_idle_for_test('acct', 'INBOX', 420, 'ch');
+my $pmap = AfterStatusIMAP->new(['* STATUS "INBOX" (MESSAGES 4 UIDNEXT 8)', 'A OK']);
+my $pconn = set_conn_imap_for_test($pkey, $pmap, 'T2');
+$pconn->{mode}    = 'POLL';
+$pconn->{idling}  = 0;
+$pconn->{folders} = [ { name => 'INBOX', debounce => 420 } ];
+$pconn->{seen}    = { INBOX => { messages => 4, uidnext => 7 } };
+settle_counts_after({
+    count_snap => {
+        "ch\0INBOX" => { channel => 'ch', box => 'INBOX', messages => 4, uidnext => 7, chase => 0 },
+    },
+});
+is($pconn->{seen}{INBOX}{uidnext}, 8, 'a poll folder stores the after-sync UIDNEXT');
+is($pmap->{done}, 0, 'a poll connection does not leave IDLE');
+ok(_chase_on($pconn, 'INBOX'), 'the poll folder arms one confirmation');
+ok(defined schedule_deadline('ch'), 'the poll folder queues that confirmation');
+
 done_testing;
 
 sub capture {

@@ -687,6 +687,30 @@ Those four wait for the next arrival or the resync time.
 A
 .Cm NOTIFY
 session still schedules each notice it was asked to watch.
+.Pp
+When an
+.Cm IDLE
+or poll
+.Sy mbsync
+of a watched folder exits 0, that folder is asked
+.Cm STATUS
+.Pq MESSAGES UIDNEXT
+and those two numbers replace the ones that were remembered.
+A higher message total schedules another sync, because mail may have
+arrived after
+.Sy mbsync
+opened the mailbox.
+A higher
+.Cm UIDNEXT
+with no higher total schedules one confirmation sync, so a deletion
+and an arrival during the run are still fetched.
+A confirmation that again moves only
+.Cm UIDNEXT
+stores the new value and does not schedule.
+A flag change that rewrites the UID on every run cannot keep
+.Sy mbsync
+going.
+A lower total is stored and left for the next arrival.
 .Sh FILES
 .Bl -tag -width Ds
 .It Pa ~/.config/imapidle/imapidle.conf

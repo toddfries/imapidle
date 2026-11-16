@@ -3273,6 +3273,7 @@ sub arm_idle {
         last_success => time(),
         last_idle    => time(),
         messages     => selected_exists($imap),
+        uidnext      => selected_uidnext($imap),
     });
     log_info("$name: IDLE $folder->{name} (priority $folder->{priority})");
 }
@@ -3287,6 +3288,23 @@ sub selected_exists {
         for my $line ($imap->Results) {
             next unless defined $line;
             $n = $1 + 0 if $line =~ /^\*\s+(\d+)\s+EXISTS\b/i;
+        }
+        1;
+    };
+    return if !$ok;
+    return $n;
+}
+
+# SELECT advertises the next UID in the response code. The after-sync
+# STATUS compares against it. Undef until a line is seen.
+sub selected_uidnext {
+    my ($imap) = @_;
+    return unless $imap && $imap->can('Results');
+    my $n;
+    my $ok = eval {
+        for my $line ($imap->Results) {
+            next unless defined $line;
+            $n = $1 + 0 if $line =~ /\[UIDNEXT\s+(\d+)\]/i;
         }
         1;
     };
@@ -3985,6 +4003,7 @@ sub reap_children {
         }
         finish_pulse_channel($rec->{pulse}) if ref $rec eq 'HASH';
         finish_track_job($rec, $status, $real, $text) if ref $rec eq 'HASH' && $rec->{track};
+        settle_counts_after($rec) if $status == 0 && ref $rec eq 'HASH';
         maybe_arm_sync_hooks($rec, $status) if ref $rec eq 'HASH';
     }
 }
@@ -5163,6 +5182,7 @@ sub trigger_mbsync {
         close $wr;
         cloexec($rd);
     }
+    my $count_snap = _folder_count_snaps(@args);
     $children{$pid} = {
         label   => "mbsync $shown",
         args    => [@args],
@@ -5171,6 +5191,7 @@ sub trigger_mbsync {
         track      => $meta->{track},
         tunnel_cfg => $tunnel_cfg,
         out_fh     => $capture ? $rd : undef,
+        count_snap => $count_snap,
         started    => time(),
     };
     log_info(mbsync_job_line('start', $pid, @args));
@@ -5703,6 +5724,177 @@ sub vanished_count {
         }
     }
     return $n;
+}
+
+# The connection that is watching this mailbox, if one is up.
+# IDLE is one folder. Poll keeps every configured folder.
+sub _conn_watching {
+    my ($channel, $box) = @_;
+    return unless defined $channel && $channel ne '' && defined $box && $box ne '';
+    my $poll;
+    for my $conn (values %conns) {
+        next unless ($conn->{channel} // '') eq $channel;
+        my $mode = $conn->{mode} // '';
+        if ($mode eq 'IDLE' && ($conn->{folder} // '') eq $box) {
+            return $conn;
+        }
+        next unless $mode eq 'POLL';
+        for my $folder (@{ $conn->{folders} // [] }) {
+            $poll = $conn if ($folder->{name} // '') eq $box;
+        }
+    }
+    return $poll;
+}
+
+sub _chase_on {
+    my ($conn, $box) = @_;
+    return 0 unless $conn;
+    if (($conn->{mode} // '') eq 'POLL') {
+        return $conn->{box_chase}{$box} ? 1 : 0;
+    }
+    return $conn->{uidnext_chase} ? 1 : 0;
+}
+
+sub _chase_set {
+    my ($conn, $box, $on) = @_;
+    return unless $conn;
+    if (($conn->{mode} // '') eq 'POLL') {
+        if ($on) {
+            $conn->{box_chase}{$box} = 1;
+        } else {
+            delete $conn->{box_chase}{$box};
+        }
+        return;
+    }
+    $conn->{uidnext_chase} = $on ? 1 : 0;
+}
+
+# Numbers the next EXISTS is compared with, copied at the moment the
+# child is forked. Taking the copy clears a pending UIDNEXT confirmation
+# so only this run is that confirmation.
+sub _folder_count_snaps {
+    my %snap;
+    for my $arg (@_) {
+        next unless defined $arg;
+        my ($channel, $box) = split /:/, $arg, 2;
+        next unless defined $box && $box ne '';
+        my $conn = _conn_watching($channel, $box) or next;
+        my $poll = ($conn->{mode} // '') eq 'POLL';
+        my $seen = $poll ? $conn->{seen}{$box} : undef;
+        $snap{ $channel . "\0" . $box } = {
+            channel  => $channel,
+            box      => $box,
+            messages => $poll ? ($seen && $seen->{messages}) : $conn->{messages},
+            uidnext  => $poll ? ($seen && $seen->{uidnext}) : $conn->{uidnext},
+            chase    => _chase_on($conn, $box),
+        };
+        _chase_set($conn, $box, 0);
+    }
+    return \%snap;
+}
+
+# $snap is the count at fork. A higher message total is mail the run
+# may have missed. A higher UIDNEXT with no higher total is one
+# confirmation run. A confirmation that itself only moves UIDNEXT
+# adopts the new number and stops, so a flag rewrite cannot requeue
+# forever. Returns (schedule, confirmation).
+sub count_follow_decision {
+    my ($snap, $messages, $uidnext) = @_;
+    return (0, 0) unless ref $snap eq 'HASH';
+    return (0, 0) unless defined $messages && defined $uidnext;
+    my $prev_m = $snap->{messages};
+    my $prev_u = $snap->{uidnext};
+    return (1, 0) if defined $prev_m && $messages > $prev_m;
+    if (defined $prev_u && $uidnext > $prev_u) {
+        return (0, 0) if $snap->{chase};
+        return (1, 1);
+    }
+    return (0, 0);
+}
+
+sub _store_watch_counts {
+    my ($conn, $box, $messages, $uidnext, $chase) = @_;
+    return unless $conn;
+    if (($conn->{mode} // '') eq 'POLL') {
+        $conn->{seen}{$box} //= {};
+        $conn->{seen}{$box}{messages} = $messages;
+        $conn->{seen}{$box}{uidnext}  = $uidnext;
+    } else {
+        $conn->{messages} = $messages;
+        $conn->{uidnext}  = $uidnext;
+    }
+    _chase_set($conn, $box, $chase);
+}
+
+# Leave IDLE, ask STATUS, and resume IDLE. Undef when the count is
+# not available. A failed resume drops the connection the way a probe does.
+sub _status_watching {
+    my ($conn, $box) = @_;
+    return unless $conn && defined $box && $box ne '';
+    my $imap = $conn->{imap};
+    return unless imap_connected($imap);
+    my $idle = ($conn->{mode} // '') eq 'IDLE';
+    if ($idle) {
+        my ($left, @done) = _leave_idle($conn);
+        _queue_mail_lines($conn, @done) if $left;
+        unless ($left) {
+            log_warn(($conn->{name} // 'imap') . ": STATUS after sync: IDLE did not end");
+            return;
+        }
+    }
+    my ($messages, $uidnext);
+    my $ok = eval {
+        my @resp = grep { defined && $_ ne '' } $imap->tag_and_run(
+            'STATUS ' . imap_mailbox($box) . ' (MESSAGES UIDNEXT)'
+        );
+        ($messages, $uidnext) = parse_status_counts(join("\n", @resp));
+        1;
+    };
+    my $err = $@;
+    if ($idle && imap_connected($imap)) {
+        my $tag = eval { $imap->idle() };
+        unless (_note_idle($conn, $tag)) {
+            log_warn(($conn->{name} // 'imap') . ": IDLE after STATUS failed: " . scrub($@));
+            _drop_idle_conn($conn, 'IDLE after STATUS failed');
+        }
+    } elsif ($idle) {
+        _drop_idle_conn($conn, 'IDLE after STATUS failed');
+    }
+    if (!$ok) {
+        log_warn(($conn->{name} // 'imap') . ": STATUS after sync: " . scrub($err));
+        return;
+    }
+    return unless defined $messages && defined $uidnext;
+    return ($messages, $uidnext);
+}
+
+# After mbsync exits 0, make the remembered total match the server
+# and schedule when the run can have missed mail.
+sub settle_counts_after {
+    my ($rec) = @_;
+    return unless ref $rec eq 'HASH' && ref $rec->{count_snap} eq 'HASH';
+    for my $id (sort keys %{ $rec->{count_snap} }) {
+        my $snap = $rec->{count_snap}{$id};
+        next unless ref $snap eq 'HASH';
+        my $conn = _conn_watching($snap->{channel}, $snap->{box}) or next;
+        my ($messages, $uidnext) = _status_watching($conn, $snap->{box});
+        next unless defined $messages && defined $uidnext;
+        my ($sync, $chase) = count_follow_decision($snap, $messages, $uidnext);
+        _store_watch_counts($conn, $snap->{box}, $messages, $uidnext, $chase);
+        my $word = $sync ? 'again' : '';
+        if (!$word && $snap->{chase} && defined $snap->{uidnext} && $uidnext > $snap->{uidnext}
+            && !(defined $snap->{messages} && $messages > $snap->{messages})) {
+            $word = 'steady';
+        }
+        log_info("$snap->{channel}: " . sprintf('%-5s %s status %d uidnext %d',
+            $word, $snap->{box}, $messages, $uidnext)) if $word;
+        next unless $sync;
+        note_mail_event(
+            $snap->{channel}, $snap->{box},
+            gap_for_folder($conn, $snap->{box}),
+            $conn->{wait} // 0,
+        );
+    }
 }
 
 # Updates the remembered remote total. Returns 1 when this line should
