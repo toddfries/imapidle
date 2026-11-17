@@ -33,13 +33,18 @@ reset_schedule_for_test();
 my ($fh, $conf) = tempfile('imapidle-ctl-XXXX', SUFFIX => '.conf', TMPDIR => 1);
 print $fh <<'EOF';
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
 hook = echo hi
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX.Sent;priority=5
+
 EOF
 close $fh;
 is(load_config($conf), '', 'config loads');
@@ -201,5 +206,49 @@ close $block;
 set_ctl_path_for_test("$dir/notdir/imapidle.sock");
 ctl_listen();
 ok(!-e "$dir/notdir/imapidle.sock", 'a path that is not a directory leaves no socket');
+
+my ($hfh, $hpath) = tempfile('imapidle-held-XXXX', SUFFIX => '.conf', TMPDIR => 1);
+print $hfh <<'EOF';
+[held]
+type = account
+disabled = yes
+server = imap.example.com
+user = a@example.com
+pass = secret
+mbsync_channel = heldch
+
+[watch]
+type = idle
+channel = held
+folder0 = INBOX
+EOF
+close $hfh;
+is(load_config($hpath), '', 'a held idle account loads');
+my $held_all = ctl_reply('all');
+unlike($held_all, qr/config_disabled/, 'config_disabled is not a socket node');
+like($held_all, qr/^account\.held\.disabled=1$/m, 'the file hold is the disabled node');
+my $logins = 0;
+set_login_hook_for_test(sub { $logins++; die "connection timed out\n" });
+is(connect_account('held'), 0, 'a disabled account does not log in');
+is($logins, 0, 'a disabled account does not call the login');
+is(ctl_reply('account.held.disabled=0'), "account.held.disabled=0\n",
+    'disabled=0 is a memory write');
+connect_account('held');
+is($logins, 1, 'clearing the pause logs in');
+is(reload_config_now($hpath), '', 'reload reads the file again');
+connect_account('held');
+is($logins, 1, 'reload puts the file hold back');
+plant_idle_for_test('held', 'INBOX', 420, 'heldch');
+ok(conn_exists_for_test('held:INBOX'), 'a connection can be planted');
+my $before = do { open my $in, '<', $hpath or die $!; local $/; <$in> };
+is(ctl_reply('account.held.disabled=1'), "account.held.disabled=1\n",
+    'disabled=1 drops the account');
+ok(!conn_exists_for_test('held:INBOX'), 'disabled=1 drops the connection');
+my $after = do { open my $in2, '<', $hpath or die $!; local $/; <$in2> };
+is($after, $before, 'disabled=1 does not rewrite the config');
+is(ctl_reply('account.missing.disabled=1'),
+    "error unknown oid account.missing.disabled\n",
+    'an unknown account has no disabled node');
+set_login_hook_for_test(undef);
 
 done_testing;

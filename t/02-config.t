@@ -41,22 +41,31 @@ unlike($sasl, qr/\n/, 'the initial response is one line');
 my ($fh, $path) = tempfile('imapidle-XXXX', SUFFIX => '.conf', TMPDIR => 1);
 print $fh <<'EOF';
 [good]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = personal
+
+[good-watch]
+type = idle
+channel = good
 folder0 = INBOX;priority=1
 folder1 = Archive
 
 [cmd]
-type = idle
+type = account
 server = imap.example.com
 user = b@example.com
 pass_cmd = printf '%s\n' tok
 mbsync_channel = work
+
+[cmd-watch]
+type = idle
+channel = cmd
 folder = INBOX
 priority = 9
+
 EOF
 close $fh;
 
@@ -99,7 +108,7 @@ sub write_conf {
 
 my $old = write_conf(<<'EOF');
 [old]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 password = secret
@@ -112,14 +121,14 @@ unlink $old;
 
 my $bad = write_conf(<<'EOF');
 [good]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = personal
 
 [broken]
-type = idle
+type = account
 server = imap.example.com
 user = b@example.com
 pass = x
@@ -153,19 +162,23 @@ unlink $bad;
 
 my $held = write_conf(<<'EOF');
 [live]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = personal
+
+[live-watch]
+type = idle
+channel = live
 folder = INBOX
 
 [park]
-type = idle
+type = account
 disabled = yes
 
 [off]
-type = idle
+type = account
 disabled = Yes
 server = imap.example.com
 user = b@example.com
@@ -202,13 +215,18 @@ unlink $no;
 
 my $xo = write_conf(<<'EOF');
 [ma]
-type = idle
+type = account
 server = outlook.example.com
 user = a@example.com
 pass_cmd = printf '%s\n' tok
 auth = XOAUTH2
 mbsync_channel = ma-ttf
+
+[ma-watch]
+type = idle
+channel = ma
 folder0 = INBOX
+
 EOF
 is(load_config($xo), '', 'xoauth2 account loads');
 is(loaded_account('ma')->{auth}, 'xoauth2', 'auth XOAUTH2 is stored');
@@ -219,7 +237,7 @@ unlink $xo;
 
 my $bogus = write_conf(<<'EOF');
 [bad]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
@@ -258,7 +276,7 @@ type = global
 type = global
 
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
@@ -307,11 +325,16 @@ unlink $unknown_pulse;
 
 my $idle_case = write_conf(<<'EOF');
 [acct]
-type = IDLE
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[watch]
+type = IDLE
+channel = acct
+folder0 = INBOX
 EOF
 is(load_config($idle_case), '', 'type comparison ignores case');
 is(loaded_account('acct')->{role}, 'idle', 'IDLE is an idle account');
@@ -362,7 +385,7 @@ type = global
 tunnel = maybe
 
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
@@ -377,7 +400,7 @@ type = global
 tunnel_timeout = 0
 
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
@@ -392,14 +415,19 @@ type = global
 hyperdelete = yes
 
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
 hyperdelete = no
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX.2026-11;1;3600
 folder1 = Archive;priority=9;7200
+
 EOF
 is(load_config($aged), '', 'a positional folder age loads');
 is(loaded_account('acct')->{hyperdelete}, 0, 'the account hyperdelete wins');
@@ -411,12 +439,17 @@ unlink $aged;
 
 my $legacy = write_conf(<<'EOF');
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX;1
+
 EOF
 is(load_config($legacy), '', 'a two-field bare number loads');
 is(loaded_account('acct')->{folders}[0]{priority}, 5, 'a bare number without a resync time stays priority 5');
@@ -429,12 +462,17 @@ type = global
 hyperdelete = yes
 
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX
+
 EOF
 is(load_config($global_hyper), '', 'a global hyperdelete loads');
 is(loaded_account('acct')->{hyperdelete}, 1, 'an account inherits global hyperdelete');
@@ -442,12 +480,17 @@ unlink $global_hyper;
 
 my $bad_age = write_conf(<<'EOF');
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX;5;10
+
 EOF
 like(load_config($bad_age), qr/bad resync/, 'a resync below 60 seconds is rejected');
 unlink $bad_age;

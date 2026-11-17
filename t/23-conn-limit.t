@@ -47,31 +47,44 @@ reset_schedule_for_test();
 my ($fh, $path) = tempfile('imapidle-XXXX', SUFFIX => '.conf', TMPDIR => 1);
 print $fh <<'EOF';
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX
 folder1 = Junk
 folder2 = More
 
 [acct2]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch2
+
+[acct2-watch]
+type = idle
+channel = acct2
 folder0 = INBOX
 
 [other]
-type = idle
+type = account
 server = imap.example.com
 user = b@example.com
 pass = secret
 mbsync_channel = ch3
+
+[other-watch]
+type = idle
+channel = other
 folder0 = INBOX
 folder1 = Junk
+
 EOF
 close $fh;
 

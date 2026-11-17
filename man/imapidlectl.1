@@ -76,6 +76,16 @@ is when that account logs in again, as seconds since the epoch.
 Zero tries on the next loop.
 Three authentication failures in a row set this one week ahead.
 The write clears that hold.
+.Ar account.name.disabled
+is 0 or 1.
+The write is remembered until the next start or reload.
+The configuration file is not rewritten, and the file is applied
+again at start and at reload.
+.Ar disabled=1
+drops that account's connections and does not set a future login.
+.Ar disabled=0
+clears the pause, the connect backoff, and a pending login hold,
+including an authentication week.
 .Ar limit.server.port.user.cap
 is how many sessions this process may hold for that server,
 port, and user.

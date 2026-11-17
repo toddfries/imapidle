@@ -29,12 +29,17 @@ sub write_conf {
 
 my $one = write_conf(<<'EOF');
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX;priority=5
+
 EOF
 
 is(load_config($one), '', 'initial config loads');
@@ -46,13 +51,18 @@ ok($due > time(), 'account is waiting out a retry');
 
 my $more = write_conf(<<'EOF');
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX;priority=3
 folder1 = Archive;priority=9
+
 EOF
 
 is(reload_config_now($more), '', 'reload accepts another folder');
@@ -68,11 +78,16 @@ is(account_next_try('acct'), 0, 'a new IDLE folder is due to connect');
 
 my $bad = write_conf(<<'EOF');
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX
+
 EOF
 isnt(reload_config_now($bad), '', 'a bad file is rejected');
 is(loaded_account('acct')->{folders}[1]{name}, 'Archive', 'the previous folders stay');
@@ -80,13 +95,18 @@ ok(conn_exists_for_test('acct:INBOX'), 'the open connection stays after a bad fi
 
 my $moved = write_conf(<<'EOF');
 [acct]
-type = idle
+type = account
 server = other.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX;priority=3
 folder1 = Archive;priority=9
+
 EOF
 is(reload_config_now($moved), '', 'reload accepts a new server');
 ok(!conn_exists_for_test('acct:INBOX'), 'a server change drops the connection');
@@ -105,12 +125,17 @@ is(account_next_try('acct'), $notify_due, 'NOTIFY does not reconnect for a new f
 
 my $gone = write_conf(<<'EOF');
 [other]
-type = idle
+type = account
 server = imap.example.com
 user = b@example.com
 pass = secret
 mbsync_channel = ch2
+
+[other-watch]
+type = idle
+channel = other
 folder = INBOX
+
 EOF
 is(reload_config_now($gone), '', 'reload can remove an account');
 ok(!loaded_account('acct'), 'the old account is gone');

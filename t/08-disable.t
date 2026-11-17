@@ -22,12 +22,17 @@ require './imapidle';
 my ($fh, $path) = tempfile('imapidle-XXXX', SUFFIX => '.conf', TMPDIR => 1);
 print $fh <<'EOF';
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX;priority=5
+
 EOF
 close $fh;
 
@@ -160,22 +165,32 @@ sub write_conf {
 
 my $on = write_conf(<<'EOF');
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX
+
 EOF
 my $off = write_conf(<<'EOF');
 [acct]
-type = idle
+type = account
 disabled = yes
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX
+
 EOF
 clear_conns_for_test();
 is(load_config($on), '', 'enabled file loads for the flag');

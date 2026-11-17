@@ -33,7 +33,7 @@ my $go = "$dir/go";
 
 my $path = write_conf(<<"EOF");
 [good]
-type = idle
+type = account
 server = imap.example.com
 user = a\@example.com
 pass = secret
@@ -41,7 +41,7 @@ mbsync_channel = personal
 hook = printf a >> $acct
 
 [bare]
-type = idle
+type = account
 server = imap.example.com
 user = b\@example.com
 pass = secret
@@ -103,7 +103,7 @@ unlink $acct, $glob;
 my $same_cmd = "printf s >> $same";
 my $both = write_conf(<<"EOF");
 [good]
-type = idle
+type = account
 server = imap.example.com
 user = a\@example.com
 pass = secret
@@ -126,7 +126,7 @@ unlink $same;
 my $block = "i=0; while [ ! -f $go ] && [ \$i -lt 100 ]; do sleep 0.05; i=\$((i+1)); done; printf z >> $slow";
 my $held = write_conf(<<"EOF");
 [good]
-type = idle
+type = account
 server = imap.example.com
 user = a\@example.com
 pass = secret

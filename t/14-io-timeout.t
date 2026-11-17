@@ -159,12 +159,17 @@ is($poller->State, Mail::IMAPClient::Unconnected(), 'an idle poll does not mark 
 my ($cfh, $cpath) = tempfile(UNLINK => 1);
 print $cfh <<'EOF';
 [acct]
-type = idle
+type = account
 server = 127.0.0.1
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX
+
 EOF
 close $cfh;
 is(load_config($cpath), '', 'the wait fixture loads');
@@ -194,4 +199,62 @@ cmp_ok(time() - $t0, '<', 1, 'that wait does not sit out its timeout');
 unlink $stop;
 reset_track_for_test();
 
+my $learned = "$run/learned";
+set_learned_for_test($learned);
+open my $lfh, '>', $learned or die "learned: $!";
+print $lfh "slow.example:993\tabsent\n";
+close $lfh;
+is(server_read_cap('slow.example', 993), 45, 'an unset read cap is 45');
+raise_server_read_cap('slow.example', 993);
+is(server_read_cap('slow.example', 993), 68, 'a timeout raises the cap by half');
+like(slurp($learned), qr/^slow\.example:993\tabsent\tio=68$/m, 'the learned file keeps io');
+while (server_read_cap('slow.example', 993) < 900) {
+    raise_server_read_cap('slow.example', 993);
+}
+is(server_read_cap('slow.example', 993), 900, 'the read cap stops at 900');
+raise_server_read_cap('slow.example', 993);
+is(server_read_cap('slow.example', 993), 900, 'another timeout leaves 900');
+idle_sync_decision({ messages => 1 }, '* BYE AccessTokenExpired', 0);
+is(server_read_cap('slow.example', 993), 900, 'a BYE does not raise the cap');
+
+set_io_timeout_for_test(0.3);
+my ($slow_rd, $slow_wr) = pair();
+_note_fd_server($slow_rd, 'slow.example', 993);
+my $slow_reader = bless { Socket => $slow_rd }, 'ImapidleClient';
+$t0 = time();
+is(imap_read_more($slow_reader, { error_on_timeout => 0 }, $slow_rd, 0.6), 0,
+    'a mapped read can wait past the global cap');
+my $slow_wait = time() - $t0;
+cmp_ok($slow_wait, '>', 0.5, 'the learned cap overrides the global clamp');
+cmp_ok($slow_wait, '<', 1.2, 'the caller timeout still ends the wait');
+is(server_read_cap('slow.example', 993), 900, 'a quiet poll does not raise the cap');
+_forget_fd_server($slow_rd);
+close $slow_wr;
+close $slow_rd;
+
+my ($plain_rd, $plain_wr) = pair();
+my $plain_reader = bless { Socket => $plain_rd }, 'ImapidleClient';
+$t0 = time();
+is(imap_read_more($plain_reader, { error_on_timeout => 0 }, $plain_rd, 0.6), 0,
+    'an unmapped read still fails');
+my $plain_wait = time() - $t0;
+cmp_ok($plain_wait, '>', 0.2, 'an unmapped read waits out the global cap');
+cmp_ok($plain_wait, '<', 0.5, 'an unmapped read does not use the caller timeout');
+close $plain_wr;
+close $plain_rd;
+set_io_timeout_for_test($cap);
+
+my %rows = load_learned();
+delete $rows{'slow.example:993'}{io};
+save_learned(%rows);
+is(server_read_cap('slow.example', 993), 45, 'deleting io returns the cap to 45');
+like(slurp($learned), qr/^slow\.example:993\tabsent$/m, 'deleting io keeps the NOTIFY record');
+
 done_testing;
+
+sub slurp {
+    my ($path) = @_;
+    open my $fh, '<', $path or die "read $path: $!";
+    local $/;
+    return scalar <$fh>;
+}

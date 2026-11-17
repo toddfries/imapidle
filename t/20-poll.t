@@ -29,45 +29,65 @@ reset_schedule_for_test();
 
 like(load_config(write_conf(<<'EOF')), qr/\[acct\] bad poll/, 'poll below 60 is rejected');
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
 poll = 30
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX
+
 EOF
 like(load_config(write_conf(<<'EOF')), qr/\[acct\] bad poll/, 'a non-numeric poll is rejected');
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
 poll = soon
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX
+
 EOF
 is(load_config(write_conf(<<'EOF')), '', 'an omitted poll loads');
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX
+
 EOF
 is(loaded_account('acct')->{poll}, 60, 'an omitted poll is 60 seconds');
 
 is(load_config(write_conf(<<'EOF')), '', 'poll of 120 loads');
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
 poll = 120
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX;priority=5
 folder1 = Sent;priority=5
+
 EOF
 is(loaded_account('acct')->{poll}, 120, 'poll of 120 is stored');
 
@@ -158,7 +178,7 @@ like($imap->{cmds}[0], qr/^STATUS "INBOX" \(MESSAGES UIDNEXT\)$/, 'STATUS asks f
 $imap->{replies}{Sent} = '* STATUS "Sent" (MESSAGES 1 UIDNEXT 9)';
 $conn->{poll_next} = 0;
 my $ready = capture(sub { _poll_conn($conn, $t0) });
-like($ready, qr/ch +: ready +Sent /, 'a new UIDNEXT is ready');
+like($ready, qr/acct +: ready +Sent /, 'a new UIDNEXT is ready');
 ok(defined schedule_deadline('ch'), 'a changed folder is scheduled');
 my @jobs = due_mbsync_jobs($t0 + 5);
 is_deeply(\@jobs, [ { args => ['ch:Sent'], wait => 0 } ], 'only the changed folder is due');
@@ -172,7 +192,7 @@ ok(!defined schedule_deadline('ch'), 'unchanged counts do not schedule mbsync');
 $imap->{replies}{INBOX} = '* STATUS "INBOX" (MESSAGES 2 UIDNEXT 10)';
 $conn->{poll_next} = 0;
 my $drop = capture(sub { _poll_conn($conn, $t0 + 6 + 420) });
-like($drop, qr/ch +: ready +INBOX /, 'a dropped message count is ready after the gap');
+like($drop, qr/acct +: ready +INBOX /, 'a dropped message count is ready after the gap');
 ok(defined schedule_deadline('ch'), 'a smaller message count schedules mbsync');
 reset_schedule_for_test();
 

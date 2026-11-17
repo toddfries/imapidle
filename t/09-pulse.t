@@ -358,7 +358,7 @@ ok((grep { $_ eq 'other: down server imap.example.com channel otherbox retry 0s'
     'a pulse login with no socket is down');
 ok((grep { /^fast: pulse sweep 100s 1$/ } @info), 'state names the pulse section');
 
-my $legacy = write_conf(<<'EOF');
+my $legacy = write_conf(<<'EOF'); # keep-inline
 [acct]
 type = idle
 server = imap.example.com
@@ -367,10 +367,13 @@ pass = secret
 mbsync_channel = personal
 folder0 = INBOX
 EOF
-is(load_config($legacy), '', 'an inline idle section still loads');
-is(loaded_account('acct')->{proto}, 'tls', 'an inline idle login is implicit TLS');
-is(loaded_account('acct')->{port}, 993, 'an inline idle login uses port 993');
-is(loaded_account('acct')->{role}, 'idle', 'the inline section is the account');
+my $legacy_err = load_config($legacy);
+like($legacy_err, qr/\[acct\] server/, 'an inline idle section rejects server');
+like($legacy_err, qr/\[acct\] user/, 'an inline idle section rejects user');
+like($legacy_err, qr/\[acct\] pass/, 'an inline idle section rejects pass');
+like($legacy_err, qr/\[acct\] mbsync_channel/, 'an inline idle section rejects mbsync_channel');
+like($legacy_err, qr/\[acct\] missing channel/, 'an inline idle section needs channel');
+is_deeply([account_names()], [], 'an inline idle section loads no account');
 
 my $pair = write_conf(<<'EOF');
 [knf]
@@ -631,6 +634,7 @@ clear_children_for_test();
 @forked = ();
 reset_schedule_for_test();
 set_connections_for_test(1);
+claim_channel_for_test('otherbox');
 set_pulse_box_for_test('otherbox', 'INBOX', $now, 100);
 queue_folder('hot', 'INBOX', $now, $now);
 pump_schedule($now);

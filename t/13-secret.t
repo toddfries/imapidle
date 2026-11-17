@@ -23,12 +23,17 @@ my $dir  = tempdir('imapidle-secret-XXXX', CLEANUP => 1, TMPDIR => 1);
 my $flag = "$dir/ready";
 my $path = write_conf(<<"EOF");
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a\@example.com
 pass_cmd = if [ -f $flag ]; then printf '%s\\n' tok; else exit 1; fi; : NOT-IN-THE-LOG
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX
+
 EOF
 
 set_foreground_for_test(0);

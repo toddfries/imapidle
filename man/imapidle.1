@@ -648,8 +648,26 @@ On
 connections the same timer sends
 .Cm NOOP .
 .Pp
-TCP connect and the TLS handshake share one 45 second limit.
-Each later IMAP read or write is limited to 45 seconds as well.
+TCP connect and each later IMAP read start at a 45 second limit.
+A read timeout or a TCP timeout raises the limit for that server
+and port.
+The next limit is one and a half times the current one, at most
+900 seconds, and it is stored in the learned file.
+A stored value below 45 is ignored.
+A successful command does not lower it.
+A server
+.Cm BYE ,
+including
+.Cm AccessTokenExpired ,
+does not raise it.
+Deleting the learned
+.Va io
+field returns that server to 45 seconds and keeps its NOTIFY and
+ID record.
+The new limit is used on the next connect and the next read.
+A dropped session does not raise the limit.
+The TLS handshake uses the same deadline.
+A handshake timeout does not raise it.
 The socket is non-blocking.
 While one connection waits, the other connections are polled
 and
@@ -736,6 +754,9 @@ folder is synced when new mail arrives.
 The server announces the message total with
 .Cm EXISTS .
 That total is remembered from the mailbox selection.
+A dropped session keeps the total for that account and folder.
+The next selection starts one sync when the new total is higher,
+and does not when the total is the same or lower.
 A later
 .Cm EXISTS
 starts a sync when the total is higher than the remembered number.
@@ -943,16 +964,20 @@ or exactly one of
 .Va pass
 and
 .Va pass_cmd .
-An inline
-.Cm idle
-section also requires
-.Va mbsync_channel .
 An
 .Cm idle
-section that sets neither
-.Va channel
-nor a login is missing
+section requires
 .Va channel .
+Login keys on an
+.Cm idle
+or
+.Cm pulse
+section reject the file.
+An
+.Cm account
+section defaults an omitted
+.Va mbsync_channel
+to its own name.
 The message is written to standard error.
 The process does not fork.
 After the main loop has started, the process exits 0 on

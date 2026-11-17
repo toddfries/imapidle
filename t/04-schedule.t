@@ -15,6 +15,7 @@
 use strict;
 use warnings;
 use File::Temp qw(tempfile tempdir);
+use Socket qw(AF_UNIX SOCK_STREAM PF_UNSPEC);
 use Test::More;
 
 require './imapidle';
@@ -177,13 +178,18 @@ set_foreground_for_test(0);
 my ($cfh, $cpath) = tempfile('imapidle-age-XXXX', SUFFIX => '.conf', TMPDIR => 1);
 print $cfh <<'EOF';
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
 hyperdelete = yes
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX;5;3600
+
 EOF
 close $cfh;
 is(load_config($cpath), '', 'the resync config loads');
@@ -323,7 +329,48 @@ is($pmap->{done}, 0, 'a poll connection does not leave IDLE');
 ok(_chase_on($pconn, 'INBOX'), 'the poll folder arms one confirmation');
 ok(defined schedule_deadline('ch'), 'the poll folder queues that confirmation');
 
+clear_conns_for_test();
+reset_schedule_for_test();
+
+sub arm_exists {
+    my ($n) = @_;
+    socketpair(my $a, my $b, AF_UNIX, SOCK_STREAM, PF_UNSPEC) or die "socketpair: $!";
+    my $imap = ExistsIMAP->new($n);
+    my $acc = loaded_account('acct');
+    my $folder = $acc->{folders}[0];
+    arm_idle('acct', $acc, $folder, $a, $imap);
+    close $b;
+    return "acct:$folder->{name}";
+}
+
+my $gap_key = arm_exists(4);
+ok(!defined schedule_deadline('ch'), 'the first SELECT total is a baseline');
+drop_conn($gap_key, 'test', 1);
+$gap_key = arm_exists(4);
+ok(!defined schedule_deadline('ch'), 'the same SELECT total does not schedule');
+drop_conn($gap_key, 'test', 1);
+$gap_key = arm_exists(3);
+ok(!defined schedule_deadline('ch'), 'a lower SELECT total does not schedule');
+drop_conn($gap_key, 'test', 1);
+$gap_key = arm_exists(6);
+ok(defined schedule_deadline('ch'), 'a higher SELECT total schedules one sync');
+drop_conn($gap_key, 'test', 1);
+
 done_testing;
+
+package ExistsIMAP;
+sub new {
+    my ($class, $n) = @_;
+    return bless { n => $n, up => 1 }, $class;
+}
+sub IsConnected { $_[0]{up} }
+sub idle        { 'A1' }
+sub Results     { return ("* $_[0]{n} EXISTS") }
+sub done        { return ('A1 OK') }
+sub logout      { $_[0]{up} = 0 }
+sub LastError   { '' }
+
+package main;
 
 sub capture {
     my ($code) = @_;

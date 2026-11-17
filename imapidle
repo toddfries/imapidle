@@ -90,6 +90,12 @@ my $MBSYNC_BIN = '/usr/local/bin/mbsync';
 my $TRIGGER_HOOK;
 my $select = IO::Select->new();
 my $IO_MAX = 45;
+# fileno of the socket imap_read_more waits on, so a timeout can name
+# the server. Cleared when that socket is closed.
+my %FD_SERVER;
+# Last SELECT EXISTS for an account and folder, kept across a drop so
+# the next arm can see mail that arrived in the gap.
+my %LAST_EXISTS;
 my $TUNNEL_SEQ = 0;
 my $IO_DEPTH = 0;
 my $INFO_R;
@@ -428,6 +434,7 @@ sub _learned_extra_keys {
         id_hash id_status id_next id_interval id_quiet
         id_changes id_gap_total id_last_change
         cap_hash cap_next cap_force cap_has_notify cap_no_idle
+        io
     );
 }
 
@@ -479,6 +486,12 @@ sub save_learned {
         for my $k (_learned_extra_keys()) {
             my $v = $row->{$k};
             next unless defined $v && $v ne '' && $v ne '0';
+            if ($k eq 'io') {
+                next unless $v =~ /^\d+$/;
+                $v += 0;
+                next if $v <= 45;
+                $v = 900 if $v > 900;
+            }
             $v =~ s/[\r\n\t]//g;
             push @extra, "$k=$v";
         }
@@ -490,6 +503,53 @@ sub save_learned {
     }
     close $fh;
     umask $old;
+}
+
+# Learned read limit for this server. Unset, or a value below 45,
+# stays on the global cap. A stored value above 900 is 900.
+sub server_read_cap {
+    my ($server, $port) = @_;
+    return $IO_MAX unless defined $server && $server ne '' && defined $port;
+    my $row = learned_row($server, $port);
+    my $io = $row && $row->{io};
+    if (defined $io && $io =~ /^\d+$/) {
+        $io += 0;
+        return 900 if $io > 900;
+        return $io if $io >= 45;
+    }
+    return $IO_MAX;
+}
+
+# Half again, the same step as the connect backoff, and never back down.
+# 45 becomes 68, then 102, and stops at 900.
+sub raise_server_read_cap {
+    my ($server, $port) = @_;
+    return unless defined $server && $server ne '' && defined $port;
+    my $cur = server_read_cap($server, $port);
+    my $next = int($cur * 1.5 + 0.5);
+    $next = 900 if $next > 900;
+    return if $next <= $cur;
+    my $key = "$server:$port";
+    my %rows = load_learned();
+    $rows{$key} //= { notify => '', id => '' };
+    $rows{$key}{io} = $next;
+    save_learned(%rows);
+    log_info("$server:$port: read timeout ${cur}s -> ${next}s");
+}
+
+sub _note_fd_server {
+    my ($sock, $server, $port) = @_;
+    return unless $sock && defined $server && $server ne '';
+    my $fd = eval { fileno($sock) };
+    return unless defined $fd && $fd >= 0;
+    $FD_SERVER{$fd} = [ $server, $port + 0 ];
+}
+
+sub _forget_fd_server {
+    my ($sock) = @_;
+    return unless $sock;
+    my $fd = eval { fileno($sock) };
+    delete $FD_SERVER{$fd} if defined $fd;
 }
 
 sub learned_row {
@@ -853,11 +913,23 @@ sub _new_account {
 }
 
 # [pulse] is not an account. A bad value is pushed onto @$problems.
+# These name a login. They belong on type=account, not on a watch.
+sub _reject_account_keys {
+    my ($section, $row, $problems) = @_;
+    return unless ref $row eq 'HASH';
+    for my $key (qw(mbsync_channel server user pass pass_cmd port proto auth)) {
+        next unless exists $row->{$key};
+        next if !defined $row->{$key} || $row->{$key} eq '';
+        push @$problems, "[$section] $key";
+    }
+}
+
 sub _parse_pulse_section {
     my ($name, $row, $problems) = @_;
     my $empty = _blank_pulse();
     return $empty unless ref $row eq 'HASH';
     $name = 'pulse' if !defined $name || $name eq '';
+    _reject_account_keys($name, $row, $problems);
     if (_config_disabled($row->{disabled})) {
         return {
             name     => $name,
@@ -1206,6 +1278,33 @@ sub _track_key {
     return $channel . "\0" . $box;
 }
 
+# The log prefix is the account that claims this mbsync channel.
+# A config hold is not that name. With no such account, the channel
+# itself is the prefix so a unit test without a login still reads.
+sub _log_name {
+    my ($channel) = @_;
+    $channel = '' unless defined $channel;
+    return $channel if $channel eq '';
+    for my $name (keys %accounts) {
+        my $acc = $accounts{$name} or next;
+        next if $acc->{config_disabled};
+        return $name if ($acc->{mbsync_channel} // '') eq $channel;
+    }
+    return $channel;
+}
+
+# A loaded account owns this channel, including one the file holds.
+# A row whose channel nobody claims is stale and is not scheduled.
+sub channel_claimed {
+    my ($channel) = @_;
+    return 0 unless defined $channel && $channel ne '';
+    for my $acc (values %accounts) {
+        next unless ref $acc eq 'HASH';
+        return 1 if ($acc->{mbsync_channel} // '') eq $channel;
+    }
+    return 0;
+}
+
 # $ok is false when LIST failed. $hot is a hash of folderN names.
 sub apply_folder_list {
     my ($channel, $names, $hot, $ok, $now) = @_;
@@ -1220,16 +1319,16 @@ sub apply_folder_list {
     $names //= [];
     my %new = map { $_ => 1 } @$names;
     if (!$st->{had_file}) {
-        log_info("$channel: " . scalar(@$names) . " folders, list saved");
+        log_info(_log_name($channel) . ': ' . scalar(@$names) . ' folders, list saved');
     } else {
         for my $name (sort keys %{ $st->{names} }) {
             next if $new{$name};
-            log_info("$channel: folder $name removed");
+            log_info(_log_name($channel) . ": folder $name removed");
             delete $track{_track_key($channel, $name)};
         }
         for my $name (sort @$names) {
             next if $st->{names}{$name};
-            log_info("$channel: folder $name added");
+            log_info(_log_name($channel) . ": folder $name added");
         }
     }
     my $fresh = !$st->{had_file};
@@ -1241,7 +1340,7 @@ sub apply_folder_list {
     for my $name (@$names) {
         my $id = _track_key($channel, $name);
         if (index($name, ':') >= 0) {
-            log_info("$channel: folder $name not tracked") unless $colon_noted{$id};
+            log_info(_log_name($channel) . ": folder $name not tracked") unless $colon_noted{$id};
             $colon_noted{$id} = 1;
             delete $track{$id};
             next;
@@ -1830,6 +1929,9 @@ sub parse_config_file {
             push @problems, "[$section] sets both channel and server";
             next;
         }
+        # The login and the mbsync name live on the account. An idle
+        # section only names that account and lists folders.
+        _reject_account_keys($section, $row, \@problems);
         if ($has_channel) {
             next if _config_disabled($row->{disabled});
             push @problems, "[$section] bad channel" if _bad_channel_name($row->{channel});
@@ -1843,44 +1945,7 @@ sub parse_config_file {
             };
             next;
         }
-        if (_config_disabled($row->{disabled})) {
-            $fresh{$section} = _held_account($row, 'idle');
-            next;
-        }
-        # A channel= idle section has no login of its own. Asking for
-        # user and pass here hides the missing channel.
-        my $inline = (defined $row->{user} && $row->{user} ne '')
-            || (defined $row->{pass} && $row->{pass} ne '')
-            || (defined $row->{pass_cmd} && $row->{pass_cmd} ne '')
-            || (defined $row->{mbsync_channel} && $row->{mbsync_channel} ne '');
-        unless ($inline) {
-            push @problems, "[$section] missing channel";
-            next;
-        }
-        my ($has_pw, $has_cmd, $auth) = _login_secrets($section, $row, \@problems, 1);
-        my $channel = $row->{mbsync_channel} // '';
-        push @problems, "[$section] bad mbsync_channel"
-            if $channel ne '' && _bad_channel_name($channel);
-        my ($host, $port, $proto) = _apply_endpoint($section, $row, \%srv, \@problems);
-        my $folders = _parse_folders($section, $row, \@problems, 1);
-        my $poll = _section_poll($section, $row, \@problems);
-        next if $blocked->($section) || !$folders;
-        $fresh{$section} = _new_account(
-            host     => $host,
-            port     => $port,
-            proto    => $proto,
-            user     => $row->{user},
-            pass     => $has_pw ? $row->{pass} : undef,
-            pass_cmd => $has_cmd ? $row->{pass_cmd} : undef,
-            channel  => $channel,
-            auth     => $auth,
-            role     => 'idle',
-            folders  => $folders,
-            wait     => $row->{wait},
-            poll     => $poll,
-            hyper    => _section_hyper($row, $hyper_default),
-            hook     => $row->{hook},
-        );
+        push @problems, "[$section] missing channel";
     }
 
     my @pulses;
@@ -2044,10 +2109,10 @@ sub install_pulse {
             my %had = map { $_ => 1 } @{ $prev->{channels} // [] };
             my %now = map { $_ => 1 } @{ $sec->{channels} // [] };
             for my $ch (sort keys %had) {
-                log_info("$ch: pulse removed") unless $now{$ch};
+                log_info(_log_name($ch) . ': pulse removed') unless $now{$ch};
             }
             for my $ch (@{ $sec->{channels} // [] }) {
-                log_info("$ch: pulse added") unless $had{$ch};
+                log_info(_log_name($ch) . ': pulse added') unless $had{$ch};
             }
         } elsif (!$quiet && @{ $sec->{channels} // [] }) {
             log_info("$name: pulse sweep $sec->{sweep}: " . join(' ', @{ $sec->{channels} }));
@@ -2121,7 +2186,7 @@ sub _pulse_account_by_channel {
     return unless defined $channel && $channel ne '';
     for my $name (keys %accounts) {
         my $acc = $accounts{$name} or next;
-        next if $acc->{config_disabled};
+        next if $acc->{disabled};
         next unless ($acc->{role} // '') eq 'pulse';
         return $acc if ($acc->{mbsync_channel} // '') eq $channel;
     }
@@ -2555,7 +2620,16 @@ sub _io_select {
 
 sub io_wait_fd {
     my ($sock, $write, $timeout) = @_;
-    $timeout = $IO_MAX if !defined $timeout || $timeout > $IO_MAX;
+    # A mapped IMAP socket waits up to that server's learned cap.
+    # Connect and handshake sockets are not mapped yet, so they stay
+    # on the global cap and the caller loops until its own deadline.
+    my $cap = $IO_MAX;
+    if ($sock) {
+        my $fd = eval { fileno($sock) };
+        $cap = server_read_cap(@{ $FD_SERVER{$fd} })
+            if defined $fd && $FD_SERVER{$fd};
+    }
+    $timeout = $cap if !defined $timeout || $timeout > $cap;
     $timeout = 0 if $timeout < 0;
     # A login already in progress must not run on into IDLE.
     if (_shutdown_wanted()) {
@@ -2593,10 +2667,21 @@ sub imap_read_more {
     my ($socket, $timeout) = @_;
     return 1 if $socket && eval { $socket->isa('IO::Socket::SSL') && $socket->pending };
     $timeout = 0 if !defined $timeout || $timeout < 0;
-    $timeout = $IO_MAX if $timeout > $IO_MAX;
+    my $fd = $socket ? eval { fileno($socket) } : undef;
+    my $cap = $IO_MAX;
+    my $raised;
+    if (defined $fd && $FD_SERVER{$fd}) {
+        $cap = server_read_cap(@{ $FD_SERVER{$fd} });
+        $raised = $FD_SERVER{$fd};
+    }
+    $timeout = $cap if $timeout > $cap;
     my $err_on = exists $opt->{error_on_timeout} ? $opt->{error_on_timeout} : 1;
     return 1 if io_wait_fd($socket, 0, $timeout);
     return 0 unless $err_on;
+    if ($raised) {
+        delete $FD_SERVER{$fd} if defined $fd;
+        raise_server_read_cap(@$raised);
+    }
     $self->LastError("timeout waiting ${timeout}s for data from server");
     $self->_disconnect if $self->can('_disconnect');
     return 0;
@@ -3372,18 +3457,26 @@ sub imap_transport {
     my $proto = $acc->{proto} // 'tls';
     my $host  = $acc->{server};
     my $port  = $acc->{port};
-    my $deadline = Time::HiRes::time() + $IO_MAX;
-    my $sock = _tcp_connect($host, $port, $deadline);
+    my $deadline = Time::HiRes::time() + server_read_cap($host, $port);
+    my $sock;
+    eval { $sock = _tcp_connect($host, $port, $deadline); 1 };
+    if ($@) {
+        my $err = $@;
+        raise_server_read_cap($host, $port) if $err =~ /tcp timeout/;
+        die $err;
+    }
     if ($proto eq 'notls') {
         log_info("$name: cleartext");
         cloexec($sock);
         $sock->blocking(0);
+        _note_fd_server($sock, $host, $port);
         return $sock;
     }
     _imap_starttls($sock, $deadline) if $proto eq 'starttls';
     my $ssl = _ssl_handshake($sock, $host, $port, $deadline);
     cloexec($ssl);
     $ssl->blocking(0);
+    _note_fd_server($ssl, $host, $port);
     return $ssl;
 }
 
@@ -3404,6 +3497,7 @@ sub login_imap {
         my $fingerprint = $socket->get_fingerprint('SHA256');
         if (!approve_fingerprint($acc->{server}, $acc->{port}, $fingerprint,
                 _tls_session_facts($socket))) {
+            _forget_fd_server($socket);
             $socket->close;
             die 'Certificate fingerprint missing';
         }
@@ -3422,7 +3516,7 @@ sub login_imap {
             return xoauth2_initial($acc->{user}, $password);
         };
     }
-    $login{Timeout}        = $IO_MAX;
+    $login{Timeout}        = server_read_cap($acc->{server}, $acc->{port});
     $login{Readmoremethod} = \&imap_read_more;
     my $imap = ImapidleClient->new(%login);
     $socket->blocking(0) if $socket && $socket->can('blocking');
@@ -3432,6 +3526,7 @@ sub login_imap {
     unless ($imap && $imap->IsAuthenticated) {
         my $err = _scrub_login($login_err, $acc, $password);
         imap_logout($imap);
+        _forget_fd_server($socket);
         $socket->close;
         die "IMAP login: $err";
     }
@@ -3445,6 +3540,7 @@ sub create_imap_connection {
     unless ($imap->select($folder)) {
         my $err = _scrub_login($imap->LastError, $acc, $password);
         imap_logout($imap);
+        _forget_fd_server($socket);
         $socket->close;
         die "SELECT $folder: $err";
     }
@@ -3831,6 +3927,7 @@ sub imap_logout {
 sub close_session {
     my ($imap, $socket) = @_;
     imap_logout($imap);
+    _forget_fd_server($socket);
     eval { $socket->close if $socket };
 }
 
@@ -3863,6 +3960,17 @@ sub arm_idle {
         messages     => selected_exists($imap),
         uidnext      => selected_uidnext($imap),
     });
+    my $seen = selected_exists($imap);
+    my $mem  = $name . "\0" . $folder->{name};
+    my $prev = delete $LAST_EXISTS{$mem};
+    if (defined $prev && defined $seen && $seen > $prev) {
+        note_mail_event(
+            $acc->{mbsync_channel},
+            $folder->{name},
+            $folder->{debounce},
+            $acc->{wait} // 0,
+        );
+    }
     log_info("$name: IDLE $folder->{name} (priority $folder->{priority})");
 }
 
@@ -4062,7 +4170,7 @@ sub _clear_auth_streak {
 sub note_auth_failure {
     my ($name) = @_;
     my $acc = $accounts{$name} or return;
-    return if $acc->{disabled} || $acc->{config_disabled};
+    return if $acc->{disabled};
     $acc->{auth_fails} = ($acc->{auth_fails} // 0) + 1;
     if ($acc->{auth_fails} < 3) {
         mark_retry($name);
@@ -4132,6 +4240,7 @@ sub note_success {
 sub drop_socket {
     my ($sock) = @_;
     return unless $sock;
+    _forget_fd_server($sock);
     eval { $select->remove($sock) };
     delete $sock_to_key{$sock};
 }
@@ -4140,6 +4249,11 @@ sub drop_conn {
     my ($key, $why, $no_retry) = @_;
     return unless defined $key && exists $conns{$key};
     my $conn = delete $conns{$key};
+    if (defined $conn->{folder} && $conn->{folder} ne '' && defined $conn->{messages}) {
+        my $who = $conn->{name} // '';
+        $LAST_EXISTS{$who . "\0" . $conn->{folder}} = $conn->{messages} + 0
+            if $who ne '';
+    }
     drop_socket($conn->{socket});
     my $name = $conn->{name} // '?';
     $why = scrub($why);
@@ -4883,7 +4997,7 @@ sub _hook_commands {
     if ($ch ne '') {
         for my $name (sort keys %accounts) {
             my $acc = $accounts{$name} or next;
-            next if $acc->{config_disabled};
+            next if $acc->{disabled};
             next if ($acc->{mbsync_channel} // '') ne $ch;
             my $hook = _hook_value($acc->{hook});
             if ($hook ne '') {
@@ -4895,7 +5009,7 @@ sub _hook_commands {
     if ($rec->{pulse} && !$account_hook && $ch ne '') {
         for my $name (sort keys %accounts) {
             my $acc = $accounts{$name} or next;
-            next if $acc->{config_disabled};
+            next if $acc->{disabled};
             next if ($acc->{mbsync_channel} // '') ne $ch;
             my $hook = _hook_value($acc->{pulse_hook});
             if ($hook ne '') {
@@ -4974,6 +5088,48 @@ sub maybe_arm_sync_hooks {
     _start_hook($_, $label) for _hook_commands($rec);
 }
 
+# Password of the account that owns the child's channel, so a failed
+# mbsync line does not repeat it.
+sub _secret_for_channel {
+    my ($channel) = @_;
+    return unless defined $channel && $channel ne '';
+    my $held;
+    for my $acc (values %accounts) {
+        next unless ref $acc eq 'HASH';
+        next unless ($acc->{mbsync_channel} // '') eq $channel;
+        next unless defined $acc->{pass} && $acc->{pass} ne '';
+        return $acc->{pass} unless $acc->{config_disabled};
+        $held = $acc->{pass} unless defined $held;
+    }
+    return $held;
+}
+
+# First non-empty stderr line. Whitespace is one space. The account
+# password is replaced. Longer than 160 characters is cut.
+sub _child_err_line {
+    my ($rec) = @_;
+    return '' unless ref $rec eq 'HASH' && $rec->{err_fh};
+    my $fh = delete $rec->{err_fh};
+    local $/;
+    my $text = <$fh> // '';
+    close $fh;
+    my $line = '';
+    for my $row (split /\r?\n/, $text) {
+        $row =~ s/^\s+|\s+$//g;
+        next if $row eq '';
+        $line = $row;
+        last;
+    }
+    $line =~ s/\s+/ /g;
+    my $channel = '';
+    if (ref $rec->{args} eq 'ARRAY' && @{ $rec->{args} }) {
+        ($channel) = split /:/, $rec->{args}[0], 2;
+    }
+    $line = scrub($line, _secret_for_channel($channel));
+    $line = substr($line, 0, 160) if length($line) > 160;
+    return $line;
+}
+
 sub reap_children {
     while (1) {
         my $statb = pack('i', 0);
@@ -5008,11 +5164,13 @@ sub reap_children {
         }
         my @args = _child_args($rec);
         my $slot = ref $rec eq 'HASH' ? $rec->{slot} : undef;
+        my $errline = _child_err_line($rec);
         my $line = mbsync_job_line('stop', $pid, { slot => $slot }, @args);
         $line .= ' ' . exit_how($status);
         my $cli  = mbsync_cli($rec);
         my $tail = note_mbsync_real($cli, $real, $ru);
         $line .= " $tail" if defined $tail && $tail ne '';
+        $line .= " $errline" if $status && defined $errline && $errline ne '';
         $LAST_CHILD_EXIT = $line;
         if ($status == 0) {
             log_info($line);
@@ -5035,8 +5193,10 @@ sub _drop_orphaned_children {
         _unlink_tunnel_cfg($rec);
         my @args = _child_args($rec);
         my $slot = ref $rec eq 'HASH' ? $rec->{slot} : undef;
+        my $errline = _child_err_line($rec);
         my $line = mbsync_job_line('stop', $pid, { slot => $slot }, @args);
         $line .= ' gone';
+        $line .= " $errline" if defined $errline && $errline ne '';
         $LAST_CHILD_EXIT = $line;
         log_warn($line);
         if (ref $rec eq 'HASH' && ($rec->{pulse} // '') ne '' && ($rec->{track} // '') eq '') {
@@ -5121,7 +5281,7 @@ sub prime_named_folders {
     $NAMED_PRIMED = 1;
     for my $name (sort keys %accounts) {
         my $acc = $accounts{$name} or next;
-        next if $acc->{config_disabled} || $acc->{disabled};
+        next if $acc->{disabled};
         my $channel = $acc->{mbsync_channel} // '';
         next if $channel eq '';
         my @names;
@@ -5175,13 +5335,13 @@ sub note_mail_event {
     my $last = $box_last_run{$id} // 0;
     if ($last && $now < $last + $gap) {
         my $when = $last + $gap;
-        log_info("$channel: " . sprintf('%-5s %s next sync in %ds at %s',
+        log_info(_log_name($channel) . ': ' . sprintf('%-5s %s next sync in %ds at %s',
             'kept', $folder, _seconds_until($when, $now), _clock($when)));
         return;
     }
     queue_folder($channel, $folder, $now, $now + $COMBINE_SEC);
     my $when = $batch{$channel}{deadline};
-    log_info("$channel: " . sprintf('%-5s %s mbsync combines in %ds at %s',
+    log_info(_log_name($channel) . ': ' . sprintf('%-5s %s mbsync combines in %ds at %s',
         'ready', $folder, _seconds_until($when, $now), _clock($when)));
 }
 
@@ -5195,7 +5355,7 @@ sub promote_pending {
         my $gap  = $box_gap{$id} // 0;
         next if $last && $now < $last + $gap;
         queue_folder($channel, $folder, $now, $now);
-        log_info("$channel: " . sprintf('%-5s %s minimum interval elapsed; mbsync scheduled',
+        log_info(_log_name($channel) . ': ' . sprintf('%-5s %s minimum interval elapsed; mbsync scheduled',
             'due', $folder));
     }
 }
@@ -5245,7 +5405,7 @@ sub promote_resync {
     $now //= time();
     for my $name (sort keys %accounts) {
         my $acc = $accounts{$name} or next;
-        next if $acc->{config_disabled} || $acc->{disabled};
+        next if $acc->{disabled};
         next if ($acc->{role} // '') ne 'idle';
         my $channel = $acc->{mbsync_channel} // '';
         next if $channel eq '';
@@ -5276,7 +5436,7 @@ sub next_resync_delay {
     my $wait;
     for my $name (keys %accounts) {
         my $acc = $accounts{$name} or next;
-        next if $acc->{config_disabled} || $acc->{disabled};
+        next if $acc->{disabled};
         next if ($acc->{role} // '') ne 'idle';
         my $channel = $acc->{mbsync_channel} // '';
         next if $channel eq '';
@@ -5477,7 +5637,7 @@ sub mbsync_job_line {
         $line .= " $shown" if $shown ne '';
     } else {
         my $hash = sha1_b(join("\0", @args));
-        $line = sprintf('%s: %s %s[%5d]', $channel, $field, $hash, $pid);
+        $line = sprintf('%s: %s %s[%5d]', _log_name($channel), $field, $hash, $pid);
         $line .= ' ' . join(',', @boxes) if @boxes;
     }
     if ($verb eq 'start' && @args) {
@@ -5487,8 +5647,8 @@ sub mbsync_job_line {
     return $line;
 }
 
-# One channel per process. The log names that channel once, then the
-# mailboxes, so every line about it starts with "channel: ".
+# One channel per process. The log names the account that claims it,
+# then the mailboxes. The argument stays channel:box.
 sub mbsync_phrase {
     my ($verb, @args) = @_;
     return $verb unless @args;
@@ -5502,7 +5662,7 @@ sub mbsync_phrase {
         push @boxes, $box if defined $box && $box ne '';
     }
     my $rest = @boxes ? "$verb @boxes" : $verb;
-    return "$channel: $rest";
+    return _log_name($channel) . ": $rest";
 }
 
 sub child_state_line {
@@ -5720,14 +5880,14 @@ sub _idle_section_for {
     my @names = sort keys %accounts;
     for my $name (@names) {
         my $acc = $accounts{$name} or next;
-        next if $acc->{config_disabled};
+        next if $acc->{disabled};
         my $role = $acc->{role} // 'idle';
         next unless $role eq 'idle' || $role eq 'pulse' || $role eq 'account';
         return $name if ($acc->{mbsync_channel} // '') eq $channel;
     }
     for my $name (@names) {
         my $acc = $accounts{$name} or next;
-        next if $acc->{config_disabled};
+        next if $acc->{disabled};
         my $role = $acc->{role} // 'idle';
         next unless $role eq 'idle' || $role eq 'pulse' || $role eq 'account';
         return $name if $name eq $acct_name;
@@ -6088,7 +6248,7 @@ sub tunnel_session {
     $SIG{PIPE} = 'IGNORE';
     my $acc = $accounts{$section};
     die "tunnel $section: unknown section\n" unless $acc;
-    die "tunnel $section: disabled\n" if $acc->{config_disabled} || $acc->{disabled};
+    die "tunnel $section: disabled\n" if $acc->{disabled};
     my $role = $acc->{role} // '';
     if ($role ne 'idle' && $role ne 'pulse' && $role ne 'account') {
         die "tunnel $section: not an account\n";
@@ -6119,6 +6279,7 @@ sub tunnel_session {
     _write_all(\*STDOUT, "* PREAUTH ready\r\n")
         or die "tunnel $section: greeting: $!\n";
     _tunnel_splice($socket);
+    _forget_fd_server($socket);
     eval { $socket->close } if $socket;
     return 1;
 }
@@ -6159,7 +6320,7 @@ sub trigger_mbsync {
     my $tunnel_cfg = _arm_tunnel(@args);
     my $shown = join(' ', @args);
     my $capture = $meta->{capture};
-    my ($rd, $wr);
+    my ($rd, $wr, $erd, $ewr);
     if ($capture) {
         pipe($rd, $wr) or do {
             _unlink_tunnel_cfg({ tunnel_cfg => $tunnel_cfg });
@@ -6167,9 +6328,20 @@ sub trigger_mbsync {
             return 0;
         };
     }
+    pipe($erd, $ewr) or do {
+        _unlink_tunnel_cfg({ tunnel_cfg => $tunnel_cfg });
+        if ($capture) {
+            close $rd;
+            close $wr;
+        }
+        log_error(mbsync_phrase('fork mbsync', @args) . " failed: $!");
+        return 0;
+    };
     my $pid = fork();
     if (!defined $pid) {
         _unlink_tunnel_cfg({ tunnel_cfg => $tunnel_cfg });
+        close $erd;
+        close $ewr;
         if ($capture) {
             close $rd;
             close $wr;
@@ -6185,23 +6357,24 @@ sub trigger_mbsync {
         $SIG{TERM} = 'DEFAULT';
         $SIG{INT}  = 'DEFAULT';
         _restore_wake_mask();
+        close $erd;
         if ($capture) {
             close $rd;
             open STDOUT, '>&', $wr or _exit(127);
             close $wr;
-            close_extra_fds();
-            open STDIN,  '<', '/dev/null';
-            open STDERR, '>', '/dev/null';
         } else {
-            close_extra_fds();
-            open STDIN,  '<', '/dev/null';
-            open STDOUT, '>', '/dev/null';
-            open STDERR, '>', '/dev/null';
+            open STDOUT, '>', '/dev/null' or _exit(127);
         }
+        open STDERR, '>&', $ewr or _exit(127);
+        close $ewr;
+        close_extra_fds();
+        open STDIN, '<', '/dev/null' or _exit(127);
         sleep $wait if $wait > 0;
         my @cmd = mbsync_exec_argv($tunnel_cfg, @args);
         exec @cmd or _exit(1);
     }
+    close $ewr;
+    cloexec($erd);
     if ($capture) {
         close $wr;
         cloexec($rd);
@@ -6215,6 +6388,7 @@ sub trigger_mbsync {
         track      => $meta->{track},
         tunnel_cfg => $tunnel_cfg,
         out_fh     => $capture ? $rd : undef,
+        err_fh     => $erd,
         count_snap => $count_snap,
         started    => time(),
     };
@@ -6262,7 +6436,7 @@ sub finish_pulse_channel {
         $n++;
     }
     _pulse_note_exit($ch, $now);
-    log_info("$ch: pulse next in ${sweep}s") if $n;
+    log_info(_log_name($ch) . ": pulse next in ${sweep}s") if $n;
 }
 
 sub pump_pulse { }
@@ -6346,7 +6520,7 @@ sub _arm_confirm {
     return unless $rec && !$rec->{confirming};
     $rec->{confirming} = 1;
     $rec->{await_sync} = 1;
-    log_info("$channel: $box confirm");
+    log_info(_log_name($channel) . ": $box confirm");
 }
 
 sub due_tracked {
@@ -6359,6 +6533,7 @@ sub due_tracked {
         next unless ($rec->{next} // 0) <= $now || _confirm_due($rec, $now);
         my ($ch, $box) = split /\0/, $id, 2;
         next if !defined $ch || !defined $box || $box eq '';
+        next unless channel_claimed($ch);
         next if tracked_deferred($ch, $box, $now);
         push @due, { id => $id, channel => $ch, box => $box, next => _track_when($rec) };
     }
@@ -6394,7 +6569,7 @@ sub _finish_pulse_box {
     $row->{interval} = $sweep;
     $row->{next}     = $now + $sweep;
     _pulse_note_exit($channel, $now);
-    log_info("$channel: $box pulse next in ${sweep}s");
+    log_info(_log_name($channel) . ": $box pulse next in ${sweep}s");
 }
 
 # First STATUS that finds mail. The wait is the sweep plus a quarter
@@ -6424,7 +6599,7 @@ sub _classify_pulse_mail {
     $rec->{next}       = $due;
     my $in = int($due - $now);
     $in = 0 if $in < 0;
-    log_info("$channel: $box sweep in ${in}s");
+    log_info(_log_name($channel) . ": $box sweep in ${in}s");
 }
 
 sub finish_track_job {
@@ -6444,16 +6619,21 @@ sub finish_track_job {
     $row->{await_sync} = 0;
     my $msgs = mbsync_new_messages($text);
     if (!defined $msgs) {
-        $row->{fails} = ($row->{fails} // 0) + 1;
-        if ($row->{fails} >= 3) {
-            my $old = $row->{interval} // $track_cfg->{initial};
-            my $span = $old * 3;
-            $row->{interval} = next_mailbox_interval($old, []);
-            $row->{samples}  = [];
-            $row->{fails}    = 0;
-            if ($row->{interval} != $old) {
-                log_info("$channel: track $box interval ${old}s -> $row->{interval}s "
-                    . "(0 new in ${span}s, sync 0s)");
+        # A non-zero exit with no summary is the mbsync failure already
+        # on the stop line. It is not a quiet mailbox, so the interval
+        # stays. Exit 0 with no summary is still a miss.
+        if (!$status) {
+            $row->{fails} = ($row->{fails} // 0) + 1;
+            if ($row->{fails} >= 3) {
+                my $old = $row->{interval} // $track_cfg->{initial};
+                my $span = $old * 3;
+                $row->{interval} = next_mailbox_interval($old, []);
+                $row->{samples}  = [];
+                $row->{fails}    = 0;
+                if ($row->{interval} != $old) {
+                    log_info(_log_name($channel) . ": track $box interval ${old}s -> $row->{interval}s "
+                        . "(0 new in ${span}s, sync 0s)");
+                }
             }
         }
     } else {
@@ -6472,7 +6652,7 @@ sub finish_track_job {
             $row->{samples} = [];
             if ($row->{interval} != $old) {
                 my $sync = $n ? int($sum_d / $n + 0.5) : 0;
-                log_info("$channel: track $box interval ${old}s -> $row->{interval}s "
+                log_info(_log_name($channel) . ": track $box interval ${old}s -> $row->{interval}s "
                     . "($sum_m new in ${sum_s}s, sync ${sync}s)");
             }
         }
@@ -6724,7 +6904,7 @@ sub _probe_channel {
             delete $rec->{confirm};
             $rec->{confirming} = 0;
             $sync_n++;
-            log_info("$channel: $box has mail") if $was_empty;
+            log_info(_log_name($channel) . ": $box has mail") if $was_empty;
         }
         1;
     };
@@ -6745,7 +6925,7 @@ sub _probe_channel {
         return;
     }
     my $n = $empty_n + $sync_n;
-    log_info("$channel: STATUS $n probed, $empty_n empty, $sync_n sync") if $n;
+    log_info(_log_name($channel) . ": STATUS $n probed, $empty_n empty, $sync_n sync") if $n;
 }
 
 sub probe_tracked {
@@ -7074,7 +7254,7 @@ sub settle_counts_after {
             && !(defined $snap->{messages} && $messages > $snap->{messages})) {
             $word = 'steady';
         }
-        log_info("$snap->{channel}: " . sprintf('%-5s %s status %d uidnext %d',
+        log_info(_log_name($snap->{channel}) . ': ' . sprintf('%-5s %s status %d uidnext %d',
             $word, $snap->{box}, $messages, $uidnext)) if $word;
         next unless $sync;
         note_mail_event(
@@ -7401,6 +7581,8 @@ sub next_track_delay {
         my $cold_open = slots_for_cold($now) > 0;
         for my $id (keys %track) {
             my $rec = $track{$id} or next;
+            my ($claim_ch) = split /\0/, $id, 2;
+            next unless channel_claimed($claim_ch);
             my $status_only = _pulse_status_only($rec, $now);
             my $future_status = 0;
             if ($rec->{pulse} && !_row_wants_pulse_mbsync($rec, $now)
@@ -7688,7 +7870,7 @@ sub info_lines {
     );
     for my $name (sort keys %accounts) {
         my $acc = $accounts{$name};
-        if ($acc->{config_disabled}) {
+        if ($acc->{config_disabled} && $acc->{disabled}) {
             my $line = "$name: disabled";
             $line .= " server $acc->{server}" if ($acc->{server} // '') ne '';
             $line .= " channel $acc->{mbsync_channel}"
@@ -8097,7 +8279,6 @@ sub ctl_nodes {
         _ctl_put(\%n, "$base.wait", $acc->{wait} // 0);
         _ctl_put(\%n, "$base.poll", defined $acc->{poll} ? $acc->{poll} : 60);
         _ctl_put(\%n, "$base.disabled", $acc->{disabled} ? 1 : 0);
-        _ctl_put(\%n, "$base.config_disabled", $acc->{config_disabled} ? 1 : 0);
         _ctl_put(\%n, "$base.next_try", int($acc->{next_try} // 0));
         _ctl_put(\%n, "$base.fails", $acc->{fails} // 0);
         _ctl_put(\%n, "$base.auth_fails", $acc->{auth_fails} // 0);
@@ -8199,7 +8380,9 @@ sub ctl_nodes {
 # last sync. hyperdelete is that account's removal flag. A connection
 # cap and its next probe are the learned limit for one server, port,
 # and user. next_try is when that account logs in again. Zero tries
-# on the next loop and clears an authentication hold. A write that
+# on the next loop and clears an authentication hold, including one
+# the file asked for; a reload puts that hold back. disabled is the
+# same pause, in memory only. The file is not rewritten. A write that
 # is not applied here is refused.
 sub ctl_parts {
     my ($s) = @_;
@@ -8262,10 +8445,26 @@ sub ctl_set {
         $acc->{next_try}   = $value + 0;
         $acc->{backoff}    = 5;
         $acc->{auth_fails} = 0;
-        if ($value + 0 <= time() && !$acc->{config_disabled}) {
+        if ($value + 0 <= time()) {
             $acc->{disabled} = 0;
             delete $acc->{disable_for};
         }
+        return;
+    }
+    if (@part == 3 && $part[0] eq 'account' && $part[2] eq 'disabled') {
+        return 'bad value' unless defined $value && ($value eq '0' || $value eq '1');
+        my $acct = $part[1];
+        my $acc = $accounts{$acct} or return "unknown oid $name";
+        if ($value eq '1') {
+            $acc->{disabled} = 1;
+            _drop_account_conns($acct, 'disabled');
+            return;
+        }
+        $acc->{disabled}    = 0;
+        $acc->{next_try}    = 0;
+        $acc->{backoff}     = 5;
+        $acc->{fails}       = 0;
+        delete $acc->{disable_for};
         return;
     }
     if (@part == 5 && $part[0] eq 'limit'
@@ -8674,7 +8873,50 @@ sub install_broken_conn_for_test {
     return $key;
 }
 
-sub clear_conns_for_test { %conns = (); %sock_to_key = (); }
+sub clear_conns_for_test {
+    %conns = ();
+    %sock_to_key = ();
+    %FD_SERVER = ();
+    %LAST_EXISTS = ();
+}
+
+# A held account owns this mbsync channel so a planted track row is
+# not treated as stale. The log keeps the channel name. The account
+# is named for the channel so the log column stays that width.
+sub claim_channel_for_test {
+    my ($channel) = @_;
+    return 0 unless defined $channel && $channel ne '';
+    return 1 if channel_claimed($channel);
+    my $name = $channel;
+    $name =~ s/[^A-Za-z0-9_.-]/_/g;
+    $name = 'ch' if $name eq '';
+    my $base = $name;
+    my $n = 2;
+    while (exists $accounts{$name}) {
+        $name = "$base-$n";
+        $n++;
+    }
+    $accounts{$name} = {
+        server          => '',
+        port            => 993,
+        proto           => 'tls',
+        user            => '',
+        mbsync_channel  => $channel,
+        auth            => 'login',
+        role            => 'account',
+        folders         => [],
+        wait            => 0,
+        poll            => 60,
+        hook            => '',
+        backoff         => 5,
+        next_try        => 0,
+        fails           => 0,
+        up              => 0,
+        disabled        => 1,
+        config_disabled => 1,
+    };
+    return 1;
+}
 sub set_foreground_for_test { $FOREGROUND = $_[0] ? 1 : 0; }
 sub set_self_path_for_test   { $SELF_PATH = $_[0]; }
 sub set_config_file_for_test { $CONFIG_FILE = $_[0]; }

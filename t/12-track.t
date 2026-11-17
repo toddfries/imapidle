@@ -30,12 +30,17 @@ set_runtime_dir_for_test($dir);
 
 my $plain = write_conf(<<'EOF');
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX
+
 EOF
 is(load_config($plain), '', 'a file with no track section loads');
 my $cfg = track_cfg_for_test();
@@ -53,11 +58,15 @@ ok((!grep { $_ eq 'track' } account_names()), 'track is not an account');
 
 my $over = write_conf(<<'EOF');
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX
 
 [track]
@@ -76,12 +85,17 @@ is_deeply([account_names()], ['acct'], 'the track section is not connected');
 
 like(load_config(write_conf(<<'EOF')), qr/\[track\] bad empty/, 'empty below 60 is rejected');
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX
+
 [track]
 type = global
 empty = 10
@@ -89,12 +103,17 @@ EOF
 
 like(load_config(write_conf(<<'EOF')), qr/\[track\] bad confirm/, 'confirm below 60 is rejected');
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX
+
 [track]
 type = global
 confirm = 10
@@ -102,12 +121,17 @@ EOF
 
 is(load_config(write_conf(<<'EOF')), '', 'confirm can be set');
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX
+
 [track]
 type = global
 confirm = 120
@@ -116,12 +140,17 @@ is(track_cfg_for_test()->{confirm}, 120, 'confirm overrides the seven days');
 
 like(load_config(write_conf(<<'EOF')), qr/\[track\] bad min/, 'min below 60 is rejected');
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX
+
 [track]
 type = global
 min = 10
@@ -129,12 +158,17 @@ EOF
 
 like(load_config(write_conf(<<'EOF')), qr/\[track\] bad max/, 'max below min is rejected');
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX
+
 [track]
 type = global
 max = 100
@@ -142,12 +176,17 @@ EOF
 
 like(load_config(write_conf(<<'EOF')), qr/\[track\] capability below id/, 'capability shorter than id is rejected');
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX
+
 [track]
 type = global
 capability = 3600
@@ -155,12 +194,17 @@ EOF
 
 like(load_config(write_conf(<<'EOF')), qr/\[track\] bad messages/, 'messages must be at least 1');
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX
+
 [track]
 type = global
 messages = 0
@@ -171,6 +215,13 @@ apply_folder_list('ch', ['Archive'], {}, 1, 1000);
 is(list_next_for_test('ch'), 1000 + 259200, 'a successful list waits the list interval');
 is(reload_config_now($plain), '', 'reload accepts the same file');
 is(list_next_for_test('ch'), 0, 'reload asks for a fresh folder list');
+claim_channel_for_test($_) for qw(fdc left right trkc knf other hotc);
+like(mbsync_job_line('start', 1, { slot => 0 }, 'ch:INBOX'),
+    qr/^acct: 0\.start /,
+    'a claimed channel logs the account');
+like(mbsync_job_line('start', 1, { slot => 0 }, 'fdc:Quiet'),
+    qr/^fdc: 0\.start /,
+    'a held claim still logs the channel');
 
 # --- ID and capability schedule ---
 
@@ -394,12 +445,12 @@ my $id = set_track_due_for_test('fdc', 'Quiet', 0);
 finish_track_job({ track => $id }, 1, 2, "gave up\n", 100);
 my ($quiet) = track_rows_for_test();
 is($quiet->{interval}, 1800, 'one missing summary leaves the interval');
-is($quiet->{fails}, 1, 'the miss is counted');
+is($quiet->{fails}, 0, 'a non-zero exit with no summary is not a miss');
 finish_track_job({ track => $id }, 1, 2, "gave up\n", 200);
 finish_track_job({ track => $id }, 1, 2, "gave up\n", 300);
 ($quiet) = track_rows_for_test();
-is($quiet->{interval}, 3600, 'three missing summaries double the interval');
-is($quiet->{fails}, 0, 'the failure window clears');
+is($quiet->{interval}, 1800, 'three missing summaries leave the interval');
+is($quiet->{fails}, 0, 'three missing summaries do not count a miss');
 
 my $sid = set_track_due_for_test('fdc', 'Slow', 0);
 my $one = "Channels: 1    Boxes: 1    Far: +2 *0 #0 -0    Near: +0 *0 #0 -0\n";
@@ -430,6 +481,11 @@ set_track_due_for_test('fdc', 'Quiet', time() + 10);
 my $track_wait = loop_timeout();
 cmp_ok($track_wait, '>', 8, 'the loop wakes for a tracked folder');
 cmp_ok($track_wait, '<=', 10, 'the loop does not sleep past that folder');
+set_track_due_for_test('fdc', 'Quiet', time() + 10000);
+set_track_due_for_test('nobody', 'Box', time() - 1);
+cmp_ok(loop_timeout(), '>=', 29, 'an unclaimed due row does not wake the loop');
+set_track_due_for_test('nobody', 'Box', time() + 1);
+cmp_ok(loop_timeout(), '>=', 29, 'an unclaimed future row does not wake the loop');
 
 # --- STATUS before mbsync ---
 
@@ -611,7 +667,7 @@ clear_conns_for_test();
     clear_children_for_test();
     finish_track_job({ track => $miss_id }, 1, 2, "gave up\n", $week_now);
     my ($miss) = grep { $_->{box} eq 'Miss' } track_rows_for_test();
-    is($miss->{interval}, 3600, 'three missed confirmations still adjust the interval');
+    is($miss->{interval}, 1800, 'a missed confirmation with no summary leaves the interval');
     is($miss->{empty}, 1, 'a missed confirmation stays empty');
     cmp_ok($miss->{next} - $week_now, '>=', 86399, 'a missed confirmation asks STATUS in a day');
     cmp_ok($miss->{confirm} - $week_now, '>=', 604799, 'a missed confirmation waits another week');
@@ -842,12 +898,17 @@ set_state_dir_for_test("$dir/state");
 
 is(load_config(write_conf(<<'EOF')), '', 'queue fixture loads');
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX
+
 EOF
 my $cap = track_cfg_for_test();
 $cap->{connections} = 4;
@@ -858,6 +919,7 @@ reset_track_for_test();
 $cap = track_cfg_for_test();
 $cap->{connections} = 4;
 install_track($cap, 0);
+claim_channel_for_test($_) for qw(fdc trkc knf other hotc);
 
 my @forked;
 set_trigger_hook_for_test(sub {

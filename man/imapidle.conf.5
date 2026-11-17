@@ -94,38 +94,32 @@ Text after a value is not a comment.
 .Pp
 An
 .Cm account
-section, and an
-.Cm idle
-section that names
-.Va server
-itself, requires
+section requires
 .Va server ,
 .Va user ,
 and exactly one of
 .Va pass
 or
 .Va pass_cmd .
-That inline
-.Cm idle
-section also requires
-.Va mbsync_channel .
-An
-.Cm account
-section uses its own name when
+An omitted
 .Va mbsync_channel
-is omitted.
+becomes the section name.
 An
 .Cm idle
-section may instead set
+section names an account with
 .Va channel
-to an account name and put
-.Va folderN
-there.
+and lists
+.Va folderN .
+Login keys on an
+.Cm idle
+or
+.Cm pulse
+section reject the file.
 An
 .Cm idle
-section that sets neither
+section with no
 .Va channel
-nor a login is missing
+is missing
 .Va channel .
 A
 .Cm pulse
@@ -185,8 +179,6 @@ The comparison ignores case.
 .It Va server
 On an
 .Cm account
-or an inline
-.Cm idle
 section, either the name of a
 .Cm server
 section or a host name.
@@ -195,7 +187,7 @@ sets
 .Va port
 or
 .Va proto .
-Required for those logins.
+Required for an account.
 .It Va host
 Host name of a
 .Cm server
@@ -301,12 +293,10 @@ key there rejects the file.
 .It Va mbsync_channel
 Channel name passed to
 .Sy mbsync .
-An inline
-.Cm idle
-section requires it.
-An
+It belongs on an
 .Cm account
-section defaults it to the section name.
+section.
+An omitted name becomes the section name.
 It must match a channel in the
 .Sy mbsync
 configuration.
@@ -416,7 +406,9 @@ not with
 The default is 5.
 .El
 .Pp
-Every folder in a section shares that section's
+Folders on an
+.Cm idle
+section use the named account's
 .Va mbsync_channel ,
 .Va user ,
 and

@@ -22,12 +22,17 @@ require './imapidle';
 my ($fh, $path) = tempfile('imapidle-XXXX', SUFFIX => '.conf', TMPDIR => 1);
 print $fh <<'EOF';
 [acct]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = ch
+
+[acct-watch]
+type = idle
+channel = acct
 folder0 = INBOX;priority=5
+
 EOF
 close $fh;
 
@@ -63,7 +68,7 @@ is($notify[1], 'acct: NOTIFY server imap.example.com channel ch', 'NOTIFY is rep
 note_child_for_test(9, 'mbsync ch:INBOX');
 my @child = info_lines(1100);
 like($child[0], qr/mbsync 1$/, 'a child is counted');
-is($child[-1], sprintf('ch: child %s[%5d] INBOX', sha1_b('ch:INBOX'), 9),
+is($child[-1], sprintf('acct: child %s[%5d] INBOX', sha1_b('ch:INBOX'), 9),
     'the child command is shown');
 clear_children_for_test();
 

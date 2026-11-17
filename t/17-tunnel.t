@@ -115,7 +115,7 @@ tunnel_timeout = 99
 mbsyncrc = $rc_path
 
 [work]
-type = idle
+type = account
 server = imap.example.com
 user = a\@example.com
 pass = secret
@@ -223,14 +223,14 @@ type = global
 tunnel = yes
 
 [a]
-type = idle
+type = account
 server = imap.example.com
 user = a@example.com
 pass = secret
 mbsync_channel = work
 
 [b]
-type = idle
+type = account
 server = imap.example.com
 user = b@example.com
 pass = secret
