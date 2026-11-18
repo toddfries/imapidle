@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 16 2026 $
+.Dd $Mdocdate: November 18 2026 $
 .Dt IMAPIDLE.CONF 5
 .Os
 .Sh NAME
@@ -852,6 +852,16 @@ Default path.
 State directory, mode 0700.
 The configuration file stays in
 .Pa ~/.config/imapidle/ .
+After startup the tables below are kept in memory.
+The main loop stats them at most once every 10 minutes
+and reads a file again when its size or times changed.
+.Pa certs ,
+.Pa tls-negotiations ,
+and
+.Pa tunnel
+are written from a handshake or for one
+.Sy mbsync
+and are not part of that look.
 .It Pa ~/.local/imapidle/known_hosts
 SHA256 certificate fingerprints.
 A current line is
@@ -898,6 +908,7 @@ or
 .Cm active .
 A rejected or active server may add the name it reported.
 Delete a line to probe that server again.
+The running process notices that on its next stat.
 An older file beside the configuration is copied once.
 The file mode is 0600 when
 .Nm imapidle

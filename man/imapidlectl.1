@@ -13,7 +13,7 @@
 .\" WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-.Dd $Mdocdate: November 16 2026 $
+.Dd $Mdocdate: November 18 2026 $
 .Dt IMAPIDLECTL 1
 .Os
 .Sh NAME
@@ -67,6 +67,51 @@ The value is whole seconds, at least 60.
 The default is 43200.
 A dot inside the mailbox name is still doubled.
 A reload reads the value from the configuration again.
+.Pp
+.Ar account.name.folder.box.last_sync
+is when that folder's
+.Sy mbsync
+last started, in whole seconds since the epoch.
+Zero means this process has not started one.
+.Ar last_sync_clock
+is that time in the local zone, as
+.Ql YYYYMMDD HH:MM:SS.uuuuuu .
+.Ar next_sync
+is
+.Ar last_sync
+plus the folder's resync time, and
+.Ar next_sync_clock
+is that instant in the same form.
+.Ar late
+is how many whole seconds that instant is past, or 0 while
+it is still ahead.
+.Ar priority
+and
+.Ar debounce
+are the folder's priority and its minimum gap, in seconds.
+The same last instant is also
+.Ar schedule.channel.folder.box.last
+and
+.Ar last_clock ,
+using the
+.Sy mbsync
+channel name.
+.Ar pending
+is 1 while an arrival is waiting out that gap.
+.Ar schedule.channel.deadline
+is the channel's combine time, in whole seconds since the
+epoch, and
+.Ar deadline_clock
+is that instant.
+.Ar late
+on the channel is how many seconds that deadline is past.
+.Ar busy
+is 1 while
+.Sy mbsync
+is already running for the channel.
+.Ar schedule.channel.folder.box.queued
+is 1 while the folder sits in that combine window.
+A write of these nodes is refused.
 .Ar account.name.hyperdelete
 is 1 to sync a removal, or 0 to leave it until the next arrival
 or that folder's resync time.
@@ -100,6 +145,50 @@ Both values are kept in
 .Pa ~/.local/imapidle/conn-limit
 and a reload leaves them in place.
 A write this process does not apply is an error.
+.Pp
+.Ar sched.now
+and
+.Ar sched.now_clock
+are the time of this listing.
+.Ar sched.pump_depth
+counts scheduler passes open in this process.
+A listing answered from inside a pass shows 1.
+.Ar sched.hot_pump
+is 1 while a pass already in progress is starting a due
+watched-folder sync.
+.Ar sched.slots_hot
+and
+.Ar sched.slots_cold
+are the free
+.Sy mbsync
+slots for watched folders and for tracked or pulse folders.
+.Ar sched.loop_wait
+is the seconds the main loop would sleep on its next wait.
+.Ar sched.batches
+is how many channels have a combine window open.
+.Ar sched.pending
+is how many folders are waiting on a gap or a window.
+.Ar account.name.next_try_clock
+is listed when
+.Ar next_try
+is in the future, in the same local form as
+.Ar last_sync_clock .
+.Ar account.name.limit_blocked
+is 1 while the learned connection cap is holding a new login.
+.Ar pulse.name.channel.account.last
+is when that pulse channel last finished a sweep, in whole
+seconds since the epoch.
+.Ar conn.name.what.idling
+is 1 while that connection is inside
+.Cm IDLE .
+A pulse connection uses
+.Cm PULSE
+for
+.Ar what .
+.Ar conn.name.what.last_success
+is when that connection last finished a housekeeping pass,
+in whole seconds since the epoch.
+A write of any of these is refused.
 .Pp
 The reply is one node per line.
 An unknown name or a rejected write is an error on standard error,

@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 16 2026 $
+.Dd $Mdocdate: November 18 2026 $
 .Dt IMAPIDLE 1
 .Os
 .Sh NAME
@@ -664,6 +664,7 @@ Deleting the learned
 .Va io
 field returns that server to 45 seconds and keeps its NOTIFY and
 ID record.
+The running process notices that on its next stat.
 The new limit is used on the next connect and the next read.
 A dropped session does not raise the limit.
 The TLS handshake uses the same deadline.
@@ -674,6 +675,22 @@ and
 .Sy mbsync
 can still start.
 A wait that runs out drops that connection.
+.Cm DONE
+and each
+.Cm STATUS
+use one budget for the whole command, the server's current
+read limit.
+An untagged line, including
+.Cm EXISTS ,
+does not start that budget over.
+A
+.Cm DONE
+that runs out fails and that connection is dropped.
+A
+.Cm STATUS
+that runs out leaves the count unknown, and that mailbox is
+synced.
+Neither of those raises the learned limit.
 .Pp
 The first look at a host sends
 .Dl ID ("name" "imapidle" "version" "0.3")
@@ -709,6 +726,7 @@ That arming is logged when the record changes.
 Delete the host's line in
 .Pa learned
 to probe it again.
+The running process notices that on its next stat.
 The primary connection also lists mailboxes when that list is due.
 Extra
 .Cm IDLE
@@ -747,6 +765,9 @@ run, after the 5 second wait.
 The folder is also scheduled when its resync time has passed since
 its last sync.
 The default is 12 hours, and the priority gap still applies.
+.Sy imapidlectl(1)
+lists that last start and the time the resync interval next
+elapses.
 .Pp
 A watched
 .Cm IDLE
