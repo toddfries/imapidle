@@ -235,11 +235,11 @@ close $slow_rd;
 my ($plain_rd, $plain_wr) = pair();
 my $plain_reader = bless { Socket => $plain_rd }, 'ImapidleClient';
 $t0 = time();
-is(imap_read_more($plain_reader, { error_on_timeout => 0 }, $plain_rd, 0.6), 0,
+is(imap_read_more($plain_reader, { error_on_timeout => 0 }, $plain_rd, 2), 0,
     'an unmapped read still fails');
 my $plain_wait = time() - $t0;
 cmp_ok($plain_wait, '>', 0.2, 'an unmapped read waits out the global cap');
-cmp_ok($plain_wait, '<', 0.5, 'an unmapped read does not use the caller timeout');
+cmp_ok($plain_wait, '<', 1.2, 'an unmapped read does not use the caller timeout');
 close $plain_wr;
 close $plain_rd;
 set_io_timeout_for_test($cap);
@@ -249,6 +249,18 @@ delete $rows{'slow.example:993'}{io};
 save_learned(%rows);
 is(server_read_cap('slow.example', 993), 45, 'deleting io returns the cap to 45');
 like(slurp($learned), qr/^slow\.example:993\tabsent$/m, 'deleting io keeps the NOTIFY record');
+
+my ($dead_rd, $dead_wr) = pair();
+print $dead_wr "* 1 EXISTS\r\n" or die "write: $!";
+my $dead_reader = bless { Socket => $dead_rd }, 'ImapidleClient';
+set_read_deadline_for_test(Time::HiRes::time() - 1);
+$t0 = Time::HiRes::time();
+is(imap_read_more($dead_reader, { error_on_timeout => 0 }, $dead_rd, 5), 0,
+    'a command deadline ends the read');
+cmp_ok(Time::HiRes::time() - $t0, '<', 0.5, 'untagged bytes do not extend that deadline');
+clear_read_deadline_for_test();
+close $dead_wr;
+close $dead_rd;
 
 done_testing;
 

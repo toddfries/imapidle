@@ -106,6 +106,27 @@ close $fh;
 is(learned_row('nope.example', 993), undef, 'a bad line is ignored');
 is(learned_row('mail.example', 993)->{notify}, 'rejected', 'a good line still loads');
 
+my %hand = load_learned();
+$hand{'hand.example:993'} = { notify => 'absent', id => '' };
+save_learned(%hand);
+my $look = time();
+refresh_local_state($look);
+is(learned_row('hand.example', 993)->{notify}, 'absent',
+    'a saved host is remembered');
+open my $edit, '>', $path or die "rewrite learned: $!";
+print $edit "hand.example:993\trejected\n";
+close $edit;
+is(learned_row('hand.example', 993)->{notify}, 'absent',
+    'a hand edit stays out of memory until the next stat');
+refresh_local_state($look + 599);
+is(learned_row('hand.example', 993)->{notify}, 'absent',
+    'the stat waits out ten minutes');
+refresh_local_state($look + 600);
+is(learned_row('hand.example', 993)->{notify}, 'rejected',
+    'a changed learned file is read after ten minutes');
+ok(!learned_row('mail.example', 993),
+    'a host deleted from the file is dropped on that read');
+
 set_foreground_for_test(0);
 done_testing;
 

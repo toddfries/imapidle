@@ -356,6 +356,26 @@ $gap_key = arm_exists(6);
 ok(defined schedule_deadline('ch'), 'a higher SELECT total schedules one sync');
 drop_conn($gap_key, 'test', 1);
 
+reset_schedule_for_test();
+my @nested;
+set_trigger_hook_for_test(sub {
+    my ($wait, $args) = @_;
+    push @nested, $args->[0];
+    if ($args->[0] eq 'ch:INBOX') {
+        queue_folder('ch', 'Sent', 2000, 2000);
+        pump_schedule(2000);
+    }
+    return 1;
+});
+queue_folder('ch', 'INBOX', 2000, 2000);
+pump_schedule(2000);
+set_trigger_hook_for_test(undef);
+is_deeply(\@nested, ['ch:INBOX', 'ch:Sent'], 'a probe in progress still starts the next hot folder');
+my $shown = ctl_nodes(2010);
+is($shown->{'schedule.ch.folder.INBOX.last'}, 2000, 'the control socket shows the last sync');
+like($shown->{'schedule.ch.folder.INBOX.last_clock'}, qr/^\d{8} \d{2}:\d{2}:\d{2}\.\d{6}\z/,
+    'the last sync is a local clock');
+
 done_testing;
 
 package ExistsIMAP;

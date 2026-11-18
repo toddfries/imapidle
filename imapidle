@@ -46,6 +46,11 @@ my $CONN_TIME_FILE;
 my $RUNTIME_DIR;
 my $KNOWN_HOSTS;
 my $LEARNED;
+# State files stay in memory. The main loop stats them at most
+# once every 10 minutes and reads a file again when it changed.
+my $STATE_LOOK_EVERY = 600;
+my $STATE_LOOK_AT    = 0;
+my %STATE_STAT;
 my $FOREGROUND = 0;
 my $VERBOSE    = 0;
 my $LOG_OPEN   = 0;
@@ -90,6 +95,9 @@ my $MBSYNC_BIN = '/usr/local/bin/mbsync';
 my $TRIGGER_HOOK;
 my $select = IO::Select->new();
 my $IO_MAX = 45;
+# One IMAP command, not one untagged line. EXISTS during DONE used to
+# refresh the library timeout and hold this pump until the tag arrived.
+my $READ_DEADLINE;
 # fileno of the socket imap_read_more waits on, so a timeout can name
 # the server. Cleared when that socket is closed.
 my %FD_SERVER;
@@ -226,22 +234,51 @@ sub _cert_stamp {
         $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0]);
 }
 
-sub load_known_hosts {
-    my %certs;
-    return %certs unless defined $KNOWN_HOSTS && -f $KNOWN_HOSTS;
-    open my $fh, '<', $KNOWN_HOSTS or return %certs;
+my %KNOWN_CACHE;
+my $KNOWN_LOADED = 0;
+
+sub _known_copy {
+    my %out;
+    for my $host (keys %KNOWN_CACHE) {
+        $out{$host} = [ map { { %{ $_ // {} } } } @{ $KNOWN_CACHE{$host} // [] } ];
+    }
+    return %out;
+}
+
+sub _known_remember {
+    my (%certs) = @_;
+    %KNOWN_CACHE = ();
+    for my $host (keys %certs) {
+        $KNOWN_CACHE{$host} = [
+            map { { %{ $_ // {} } } } @{ $certs{$host} // [] }
+        ];
+    }
+    $KNOWN_LOADED = 1;
+}
+
+sub _known_load_disk {
+    %KNOWN_CACHE = ();
+    $KNOWN_LOADED = 1;
+    _state_mark($KNOWN_HOSTS);
+    return unless defined $KNOWN_HOSTS && -f $KNOWN_HOSTS;
+    open my $fh, '<', $KNOWN_HOSTS or return;
     while (<$fh>) {
         chomp;
         next if /^\s*#/ || /^\s*$/;
         my ($hostkey, $fp, $expired) = split /\s+/, $_, 3;
         next unless $hostkey && $fp;
-        push @{ $certs{$hostkey} }, {
+        push @{ $KNOWN_CACHE{$hostkey} }, {
             fp      => $fp,
             expired => $expired // '',
         };
     }
     close $fh;
-    return %certs;
+    _state_mark($KNOWN_HOSTS);
+}
+
+sub load_known_hosts {
+    _known_load_disk() unless $KNOWN_LOADED;
+    return _known_copy();
 }
 
 sub _current_cert {
@@ -278,6 +315,8 @@ sub save_known_hosts {
     }
     close $fh;
     umask $old;
+    _known_remember(%certs);
+    _state_mark($KNOWN_HOSTS);
 }
 
 sub _tls_version_label {
@@ -438,10 +477,35 @@ sub _learned_extra_keys {
     );
 }
 
-sub load_learned {
-    my %rows;
-    return %rows unless defined $LEARNED && -f $LEARNED;
-    open my $fh, '<', $LEARNED or return %rows;
+my %LEARNED_ROWS;
+my $LEARNED_LOADED = 0;
+
+sub _learned_copy {
+    my %out;
+    for my $host (keys %LEARNED_ROWS) {
+        my $row = $LEARNED_ROWS{$host};
+        $out{$host} = ref $row eq 'HASH' ? { %$row } : {};
+    }
+    return %out;
+}
+
+sub _learned_remember {
+    my (%rows) = @_;
+    %LEARNED_ROWS = ();
+    for my $host (keys %rows) {
+        my $row = $rows{$host};
+        next unless ref $row eq 'HASH';
+        $LEARNED_ROWS{$host} = { %$row };
+    }
+    $LEARNED_LOADED = 1;
+}
+
+sub _learned_load_disk {
+    %LEARNED_ROWS = ();
+    $LEARNED_LOADED = 1;
+    _state_mark($LEARNED);
+    return unless defined $LEARNED && -f $LEARNED;
+    open my $fh, '<', $LEARNED or return;
     while (<$fh>) {
         chomp;
         next if /^\s*#/ || /^\s*$/;
@@ -459,10 +523,15 @@ sub load_learned {
             next unless defined $k && $k ne '' && defined $v;
             $row->{$k} = $v;
         }
-        $rows{$host} = $row;
+        $LEARNED_ROWS{$host} = $row;
     }
     close $fh;
-    return %rows;
+    _state_mark($LEARNED);
+}
+
+sub load_learned {
+    _learned_load_disk() unless $LEARNED_LOADED;
+    return _learned_copy();
 }
 
 sub save_learned {
@@ -503,6 +572,8 @@ sub save_learned {
     }
     close $fh;
     umask $old;
+    _learned_remember(%rows);
+    _state_mark($LEARNED);
 }
 
 # Learned read limit for this server. Unset, or a value below 45,
@@ -1402,6 +1473,7 @@ sub _save_folder_file {
     }
     close $fh;
     umask $old;
+    _mark_folders();
 }
 
 sub _load_folder_file {
@@ -1422,7 +1494,10 @@ sub _load_folder_file {
 
 sub load_folder_files {
     %folder_lists = ();
-    return unless defined $FOLDERS_DIR && -d $FOLDERS_DIR;
+    if (!defined $FOLDERS_DIR || $FOLDERS_DIR eq '' || !-d $FOLDERS_DIR) {
+        _mark_folders();
+        return;
+    }
     opendir my $dh, $FOLDERS_DIR or return;
     for my $name (readdir $dh) {
         next if $name eq '.' || $name eq '..';
@@ -1430,6 +1505,7 @@ sub load_folder_files {
         _load_folder_file($name);
     }
     closedir $dh;
+    _mark_folders();
 }
 
 # user, sys, rss, and the six counters. nr is how many runs added them.
@@ -1548,11 +1624,14 @@ sub _stat_save {
     }
     close $fh;
     umask $old;
+    _state_mark($path);
 }
 
 sub load_stat_files {
     _stat_load($MBSYNC_REAL_FILE, \%MBSYNC_REAL) if defined $MBSYNC_REAL_FILE;
+    _state_mark($MBSYNC_REAL_FILE);
     _stat_load($CONN_TIME_FILE,   \%CONN_TIME);
+    _state_mark($CONN_TIME_FILE);
 }
 
 sub save_stat_files {
@@ -1605,9 +1684,11 @@ sub save_track_file {
     }
     close $fh;
     umask $old;
+    _state_mark($TRACK_FILE);
 }
 
 sub load_track_file {
+    _state_mark($TRACK_FILE);
     return unless defined $TRACK_FILE && -f $TRACK_FILE;
     open my $fh, '<', $TRACK_FILE or return;
     while (<$fh>) {
@@ -1645,6 +1726,7 @@ sub load_track_file {
         }
     }
     close $fh;
+    _state_mark($TRACK_FILE);
 }
 
 sub note_conn_time {
@@ -2139,6 +2221,7 @@ sub install_pulse {
 
 sub _pulse_last_load {
     %PULSE_LAST = ();
+    _state_mark($PULSE_LAST_FILE);
     return unless defined $PULSE_LAST_FILE && -f $PULSE_LAST_FILE;
     open my $fh, '<', $PULSE_LAST_FILE or return;
     while (<$fh>) {
@@ -2150,6 +2233,7 @@ sub _pulse_last_load {
         $PULSE_LAST{$ch} = $when + 0;
     }
     close $fh;
+    _state_mark($PULSE_LAST_FILE);
 }
 
 sub _pulse_last_save {
@@ -2168,6 +2252,7 @@ sub _pulse_last_save {
     }
     close $fh;
     umask $old;
+    _state_mark($PULSE_LAST_FILE);
 }
 
 # The saved whole-channel exit is applied when a mailbox row is created.
@@ -2675,6 +2760,14 @@ sub imap_read_more {
         $raised = $FD_SERVER{$fd};
     }
     $timeout = $cap if $timeout > $cap;
+    if (defined $READ_DEADLINE) {
+        my $left = $READ_DEADLINE - Time::HiRes::time();
+        if ($left <= 0) {
+            $self->LastError('timeout waiting for server');
+            return 0;
+        }
+        $timeout = $left if $left < $timeout;
+    }
     my $err_on = exists $opt->{error_on_timeout} ? $opt->{error_on_timeout} : 1;
     return 1 if io_wait_fd($socket, 0, $timeout);
     return 0 unless $err_on;
@@ -2989,20 +3082,41 @@ sub _cert_warn_file {
     return "$STATE_DIR/cert-warn";
 }
 
-sub load_cert_warn {
-    my %when;
-    my $path = _cert_warn_file() or return %when;
-    return %when unless -f $path;
-    open my $fh, '<', $path or return %when;
+my %CERT_WARN;
+my $CERT_WARN_LOADED = 0;
+my $CERT_WARN_PATH   = '';
+
+sub _cert_warn_invalidate {
+    %CERT_WARN = ();
+    $CERT_WARN_LOADED = 0;
+    $CERT_WARN_PATH = '';
+}
+
+sub _cert_warn_load_disk {
+    my $path = _cert_warn_file() // '';
+    %CERT_WARN = ();
+    $CERT_WARN_LOADED = 1;
+    $CERT_WARN_PATH = $path;
+    _state_mark($path) if $path ne '';
+    return if $path eq '' || !-f $path;
+    open my $fh, '<', $path or return;
     while (my $line = <$fh>) {
         next if $line =~ /^\s*(?:#|$)/;
         chomp $line;
         my ($id, $when) = split /\t/, $line, 2;
         next unless defined $id && $id ne '' && defined $when && $when =~ /^\d+\z/;
-        $when{$id} = $when;
+        $CERT_WARN{$id} = $when;
     }
     close $fh;
-    return %when;
+    _state_mark($path);
+}
+
+sub load_cert_warn {
+    my $path = _cert_warn_file() // '';
+    if ($path ne $CERT_WARN_PATH || !$CERT_WARN_LOADED) {
+        _cert_warn_load_disk();
+    }
+    return %CERT_WARN;
 }
 
 sub save_cert_warn {
@@ -3029,6 +3143,10 @@ sub save_cert_warn {
         return;
     }
     chmod 0600, $path;
+    %CERT_WARN = %when;
+    $CERT_WARN_LOADED = 1;
+    $CERT_WARN_PATH = $path;
+    _state_mark($path);
 }
 
 sub _load_pem_x509 {
@@ -3890,6 +4008,37 @@ sub imap_done {
 
 # DONE is legal only while this process still has the server in IDLE.
 # A second DONE is an unknown command and the server drops the session.
+sub _conn_read_budget {
+    my ($conn) = @_;
+    my $acc = $accounts{ $conn->{name} // '' };
+    my $cap = $IO_MAX;
+    if ($acc && ($acc->{server} // '') ne '') {
+        $cap = server_read_cap($acc->{server}, $acc->{port});
+    }
+    return $cap if defined $cap && $cap > 0;
+    return 45;
+}
+
+# $code runs with a deadline that untagged mail cannot push back.
+sub _with_read_deadline {
+    my ($seconds, $code) = @_;
+    my $prev = $READ_DEADLINE;
+    $seconds = 45 if !defined $seconds || $seconds <= 0;
+    my $end = Time::HiRes::time() + $seconds;
+    $READ_DEADLINE = (!defined $prev || $end < $prev) ? $end : $prev;
+    my $want = wantarray;
+    my @ret;
+    my $ok = eval {
+        if ($want) { @ret = $code->() }
+        else       { $ret[0] = scalar $code->() }
+        1;
+    };
+    my $err = $@;
+    $READ_DEADLINE = $prev;
+    die $err if !$ok;
+    return $want ? @ret : $ret[0];
+}
+
 sub _leave_idle {
     my ($conn) = @_;
     return (1) unless $conn && $conn->{idling};
@@ -3897,7 +4046,11 @@ sub _leave_idle {
     my $imap = $conn->{imap};
     return (0) unless imap_connected($imap);
     my @lines;
-    my $ok = eval { @lines = $imap->done($conn->{tag}); 1 };
+    my $budget = _conn_read_budget($conn);
+    my $ok = eval {
+        @lines = _with_read_deadline($budget, sub { $imap->done($conn->{tag}) });
+        1;
+    };
     @lines = grep { defined && $_ ne '' } @lines;
     return (0, @lines) if !$ok || !imap_connected($imap);
     return (0, @lines) if !@lines || grep { /\b(?:BAD|BYE)\b/i } @lines;
@@ -4475,9 +4628,11 @@ sub _conn_limit_save {
     }
     close $fh;
     umask $old;
+    _state_mark($CONN_LIMIT_FILE);
 }
 
 sub _conn_limit_load {
+    _state_mark($CONN_LIMIT_FILE);
     return unless defined $CONN_LIMIT_FILE && -f $CONN_LIMIT_FILE;
     open my $fh, '<', $CONN_LIMIT_FILE or return;
     while (<$fh>) {
@@ -4497,6 +4652,7 @@ sub _conn_limit_load {
         $CONN_LIMIT{$key} = $row;
     }
     close $fh;
+    _state_mark($CONN_LIMIT_FILE);
 }
 
 sub _conn_limit_info_lines {
@@ -6857,12 +7013,15 @@ sub _probe_channel {
             _queue_mail_lines($conn, @done);
             die($imap->LastError || 'DONE failed') unless $left;
         }
+        my $budget = _conn_read_budget($conn);
         for my $id (@ids) {
             my $rec = $track{$id} or next;
             my (undef, $box) = split /\0/, $id, 2;
-            my @resp = grep { defined && $_ ne '' } $imap->tag_and_run(
-                'STATUS ' . imap_mailbox($box) . ' (MESSAGES UIDNEXT)'
-            );
+            my @resp = grep { defined && $_ ne '' } _with_read_deadline($budget, sub {
+                $imap->tag_and_run(
+                    'STATUS ' . imap_mailbox($box) . ' (MESSAGES UIDNEXT)'
+                );
+            });
             my ($messages, $uidnext) = parse_status_counts(join("\n", @resp));
             if (!defined $messages) {
                 $rec->{await_sync} = 1;
@@ -7034,12 +7193,35 @@ sub set_live_for_test { $LIVE = $_[0] ? 1 : 0; }
 
 # A STATUS read waits inside this pump. A nested pump writes another
 # command and never reads the reply, which is what pegged the CPU.
+# Forking an already-due hot mbsync does not write a command.
 my $PUMP_DEPTH = 0;
+my $HOT_PUMP   = 0;
+
+# Due hot mail only. Safe while a probe is inside an IMAP read:
+# this path forks mbsync and does not send another command.
+sub _pump_hot {
+    my ($now) = @_;
+    return if $HOT_PUMP;
+    return if shutdown_phase() || _pause_gate();
+    $HOT_PUMP = 1;
+    eval {
+        $now //= time();
+        for my $job (due_mbsync_jobs($now, slots_for_hot($now))) {
+            trigger_mbsync($job->{wait}, @{ $job->{args} });
+        }
+        1;
+    };
+    $HOT_PUMP = 0;
+    return;
+}
 
 sub pump_schedule {
     my ($now) = @_;
     return unless $LIVE;
-    return if $PUMP_DEPTH;
+    if ($PUMP_DEPTH) {
+        _pump_hot($now);
+        return;
+    }
     $PUMP_DEPTH++;
     my $err;
     eval {
@@ -8049,7 +8231,150 @@ sub report_info {
     emit_state($_) for info_lines($now);
 }
 
+sub _state_fp {
+    my ($path) = @_;
+    return '' if !defined $path || $path eq '';
+    my @st = stat($path);
+    return '' unless @st;
+    # inode, size, mtime, ctime. A hand edit moves at least one.
+    return join ':', @st[1, 7, 9, 10];
+}
+
+sub _state_mark {
+    my ($path) = @_;
+    return if !defined $path || $path eq '';
+    $STATE_STAT{$path} = _state_fp($path);
+}
+
+sub _state_changed {
+    my ($path) = @_;
+    return 0 if !defined $path || $path eq '';
+    return 0 unless exists $STATE_STAT{$path};
+    return _state_fp($path) ne $STATE_STAT{$path};
+}
+
+sub _folder_paths {
+    my @paths;
+    return @paths unless defined $FOLDERS_DIR && -d $FOLDERS_DIR;
+    opendir my $dh, $FOLDERS_DIR or return @paths;
+    for my $name (readdir $dh) {
+        next if $name eq '.' || $name eq '..';
+        next if $name =~ m{[/\\]};
+        push @paths, "$FOLDERS_DIR/$name";
+    }
+    closedir $dh;
+    return sort @paths;
+}
+
+sub _folders_key {
+    return '' unless defined $FOLDERS_DIR && $FOLDERS_DIR ne '';
+    return 'folders:' . $FOLDERS_DIR;
+}
+
+sub _folders_fp {
+    return '' if _folders_key() eq '';
+    my @bits = (_state_fp($FOLDERS_DIR));
+    for my $path (_folder_paths()) {
+        push @bits, $path, _state_fp($path);
+    }
+    return join '|', @bits;
+}
+
+sub _mark_folders {
+    my $key = _folders_key();
+    return if $key eq '';
+    $STATE_STAT{$key} = _folders_fp();
+}
+
+# A changed file replaces the memory table. Track keeps the fields
+# the file does not store, on rows the file still names.
+sub _reload_track {
+    return unless defined $TRACK_FILE && exists $STATE_STAT{$TRACK_FILE};
+    return unless _state_changed($TRACK_FILE);
+    my %keep = %track;
+    %track = ();
+    %list_next = ();
+    load_track_file();
+    for my $id (keys %track) {
+        my $old = $keep{$id} or next;
+        for my $k (qw(samples fails pulse classified await_sync confirming seed messages sweep)) {
+            next unless exists $old->{$k};
+            next if exists $track{$id}{$k};
+            $track{$id}{$k} = $old->{$k};
+        }
+    }
+}
+
+sub _reload_conn_limit {
+    return unless defined $CONN_LIMIT_FILE && exists $STATE_STAT{$CONN_LIMIT_FILE};
+    return unless _state_changed($CONN_LIMIT_FILE);
+    %CONN_LIMIT = ();
+    _conn_limit_load();
+}
+
+sub _reload_learned {
+    return unless $LEARNED_LOADED && defined $LEARNED && exists $STATE_STAT{$LEARNED};
+    return unless _state_changed($LEARNED);
+    _learned_load_disk();
+}
+
+sub _reload_known {
+    return unless $KNOWN_LOADED && defined $KNOWN_HOSTS && exists $STATE_STAT{$KNOWN_HOSTS};
+    return unless _state_changed($KNOWN_HOSTS);
+    _known_load_disk();
+}
+
+sub _reload_cert_warn {
+    return unless $CERT_WARN_LOADED;
+    my $path = _cert_warn_file() // '';
+    return if $path eq '' || !exists $STATE_STAT{$path};
+    return unless _state_changed($path);
+    _cert_warn_load_disk();
+}
+
+sub _reload_pulse {
+    return unless defined $PULSE_LAST_FILE && exists $STATE_STAT{$PULSE_LAST_FILE};
+    return unless _state_changed($PULSE_LAST_FILE);
+    _pulse_last_load();
+}
+
+sub _reload_stats {
+    for my $pair (
+        [ $MBSYNC_REAL_FILE, \%MBSYNC_REAL ],
+        [ $CONN_TIME_FILE,   \%CONN_TIME ],
+    ) {
+        my ($path, $dest) = @$pair;
+        next unless defined $path && exists $STATE_STAT{$path};
+        next unless _state_changed($path);
+        _stat_load($path, $dest);
+        _state_mark($path);
+    }
+}
+
+sub _reload_folders {
+    my $key = _folders_key();
+    return if $key eq '' || !exists $STATE_STAT{$key};
+    return if ($STATE_STAT{$key} // '') eq _folders_fp();
+    load_folder_files();
+}
+
+sub refresh_local_state {
+    my ($now) = @_;
+    $now //= time();
+    return if $STATE_LOOK_AT && $now < $STATE_LOOK_AT + $STATE_LOOK_EVERY;
+    $STATE_LOOK_AT = $now;
+    _reload_learned();
+    _reload_known();
+    _reload_cert_warn();
+    _reload_conn_limit();
+    _reload_pulse();
+    _reload_stats();
+    _reload_track();
+    _reload_folders();
+}
+
 sub one_iteration {
+    refresh_local_state();
     _drain_fd($CHLD_R);
     reap_children();
     apply_reload();
@@ -8225,6 +8550,18 @@ sub ctl_nodes {
     _ctl_put(\%n, 'connections', scalar keys %conns);
     _ctl_put(\%n, 'mbsync', scalar keys %children);
     _ctl_put(\%n, 'hooks', scalar keys %hook_children);
+    _ctl_put(\%n, 'sched.now', int($now));
+    _ctl_put(\%n, 'sched.now_clock', _clock($now));
+    _ctl_put(\%n, 'sched.pump_depth', $PUMP_DEPTH);
+    _ctl_put(\%n, 'sched.hot_pump', $HOT_PUMP ? 1 : 0);
+    _ctl_put(\%n, 'sched.slots_hot', $track_cfg ? slots_for_hot($now) : 0);
+    _ctl_put(\%n, 'sched.slots_cold', $track_cfg ? slots_for_cold($now) : 0);
+    my $loop_wait = $track_cfg ? eval { loop_timeout() } : undef;
+    _ctl_put(\%n, 'sched.loop_wait', defined $loop_wait ? $loop_wait : '');
+    _ctl_put(\%n, 'sched.batches', scalar keys %batch);
+    my $pending_n = 0;
+    $pending_n += $box_pending{$_} ? 1 : 0 for keys %box_pending;
+    _ctl_put(\%n, 'sched.pending', $pending_n);
     if ($track_cfg) {
         _ctl_put(\%n, 'track.disabled', $track_cfg->{disabled} ? 1 : 0);
         _ctl_put(\%n, 'track.tunnel', $track_cfg->{tunnel} ? 1 : 0);
@@ -8280,6 +8617,10 @@ sub ctl_nodes {
         _ctl_put(\%n, "$base.poll", defined $acc->{poll} ? $acc->{poll} : 60);
         _ctl_put(\%n, "$base.disabled", $acc->{disabled} ? 1 : 0);
         _ctl_put(\%n, "$base.next_try", int($acc->{next_try} // 0));
+        if (($acc->{next_try} // 0) > 0) {
+            _ctl_put(\%n, "$base.next_try_clock", _clock($acc->{next_try}));
+        }
+        _ctl_put(\%n, "$base.limit_blocked", conn_limit_blocked($acc, $now) ? 1 : 0);
         _ctl_put(\%n, "$base.fails", $acc->{fails} // 0);
         _ctl_put(\%n, "$base.auth_fails", $acc->{auth_fails} // 0);
         _ctl_put(\%n, "$base.pass_wait", int($acc->{secret_wait} // 0));
@@ -8294,6 +8635,15 @@ sub ctl_nodes {
             my $resync = $folder->{resync};
             $resync = default_resync() unless defined $resync && $resync >= 60;
             _ctl_put(\%n, "$fb.resync", $resync);
+            my $sid  = _box_id($acc->{mbsync_channel} // '', $folder->{name});
+            my $last = $box_last_run{$sid} // 0;
+            _ctl_put(\%n, "$fb.last_sync", int($last));
+            _ctl_put(\%n, "$fb.last_sync_clock", $last ? _clock($last) : '');
+            my $due = $last ? $last + $resync : 0;
+            _ctl_put(\%n, "$fb.next_sync", int($due));
+            _ctl_put(\%n, "$fb.next_sync_clock", $due ? _clock($due) : '');
+            my $late = $due && $now > $due ? int($now - $due) : 0;
+            _ctl_put(\%n, "$fb.late", $late);
         }
     }
     for my $key (sort keys %conns) {
@@ -8335,6 +8685,7 @@ sub ctl_nodes {
         next unless defined $box;
         my $base = 'schedule.' . ctl_enc($ch) . '.folder.' . ctl_enc($box);
         _ctl_put(\%n, "$base.last", int($box_last_run{$id})) if $box_last_run{$id};
+        _ctl_put(\%n, "$base.last_clock", _clock($box_last_run{$id})) if $box_last_run{$id};
         _ctl_put(\%n, "$base.gap", $box_gap{$id}) if defined $box_gap{$id};
         _ctl_put(\%n, "$base.pending", $box_pending{$id} ? 1 : 0) if $box_pending{$id};
         _ctl_put(\%n, "$base.wait", $box_wait{$id}) if defined $box_wait{$id};
@@ -8343,6 +8694,12 @@ sub ctl_nodes {
         my $b    = $batch{$ch};
         my $base = 'schedule.' . ctl_enc($ch);
         _ctl_put(\%n, "$base.deadline", defined $b->{deadline} ? int($b->{deadline}) : 0);
+        _ctl_put(\%n, "$base.deadline_clock", _clock($b->{deadline})) if defined $b->{deadline};
+        if (defined $b->{deadline}) {
+            my $late = $now > $b->{deadline} ? int($now - $b->{deadline}) : 0;
+            _ctl_put(\%n, "$base.late", $late);
+        }
+        _ctl_put(\%n, "$base.busy", channel_busy($ch) ? 1 : 0);
         my $boxes = $b->{boxes};
         next unless ref $boxes eq 'HASH';
         for my $box (sort keys %$boxes) {
@@ -8922,8 +9279,18 @@ sub set_self_path_for_test   { $SELF_PATH = $_[0]; }
 sub set_config_file_for_test { $CONFIG_FILE = $_[0]; }
 sub set_verbose_for_test    { $VERBOSE    = $_[0] ? 1 : 0; }
 sub last_child_exit_for_test { $LAST_CHILD_EXIT }
-sub set_known_hosts_for_test { $KNOWN_HOSTS = $_[0]; }
-sub set_learned_for_test     { $LEARNED     = $_[0]; }
+sub set_known_hosts_for_test {
+    delete $STATE_STAT{$KNOWN_HOSTS} if defined $KNOWN_HOSTS && $KNOWN_HOSTS ne '';
+    $KNOWN_HOSTS = $_[0];
+    %KNOWN_CACHE = ();
+    $KNOWN_LOADED = 0;
+}
+sub set_learned_for_test {
+    delete $STATE_STAT{$LEARNED} if defined $LEARNED && $LEARNED ne '';
+    $LEARNED = $_[0];
+    %LEARNED_ROWS = ();
+    $LEARNED_LOADED = 0;
+}
 sub note_child_for_test {
     my ($pid, $label) = @_;
     my $text = defined $label ? $label : 'child';
@@ -9121,6 +9488,13 @@ sub plant_bare_notify_for_test {
 
 sub set_state_dir_for_test {
     my ($dir) = @_;
+    %STATE_STAT = ();
+    $STATE_LOOK_AT = 0;
+    %KNOWN_CACHE = ();
+    $KNOWN_LOADED = 0;
+    %LEARNED_ROWS = ();
+    $LEARNED_LOADED = 0;
+    _cert_warn_invalidate();
     $STATE_DIR        = $dir;
     $FOLDERS_DIR      = "$dir/folders";
     $MBSYNC_REAL_FILE = "$dir/mbsync-real";
@@ -9271,6 +9645,8 @@ sub set_io_timeout_for_test { $IO_MAX = $_[0]; }
 sub set_connections_for_test { $track_cfg->{connections} = $_[0]; }
 
 sub set_trigger_hook_for_test { $TRIGGER_HOOK = $_[0]; }
+sub set_read_deadline_for_test { $READ_DEADLINE = $_[0]; }
+sub clear_read_deadline_for_test { undef $READ_DEADLINE; }
 
 sub hold_child_for_test {
     my ($pid, $label) = @_;

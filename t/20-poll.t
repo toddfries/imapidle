@@ -131,6 +131,7 @@ print $old "old.example:993\tabsent\n";
 print $old "forced.example:993\trejected\tcap_no_idle=1\n";
 print $old "quiet.example:993\tabsent\tcap_next=1\n";
 close $old;
+refresh_local_state();
 ok(!server_needs_poll('old.example', 993), 'an old absent line stays on IDLE');
 my $old_log = capture(sub {
     is(setup_notification('ma', { server => 'old.example', port => 993 },
