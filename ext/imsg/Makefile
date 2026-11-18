@@ -1,0 +1,24 @@
+# libc imsg only.
+CC?= cc
+CFLAGS += -O2 -fPIC -Wall
+PERLINC!= perl -MConfig -e 'print "-I$$Config{archlib}/CORE $$Config{ccflags}"'
+TYPEMAP!= perl -MConfig -e 'print "$$Config{privlib}/ExtUtils/typemap"'
+
+all: ../../blib/auto/IMAPIDLE/Imsg/Imsg.so
+
+Imsg.c: Imsg.xs
+	xsubpp -typemap ${TYPEMAP} Imsg.xs > Imsg.c.tmp && mv Imsg.c.tmp Imsg.c
+
+Imsg.o: Imsg.c
+	${CC} ${CFLAGS} ${PERLINC} -c Imsg.c
+
+../../blib/auto/IMAPIDLE/Imsg/Imsg.so: Imsg.o
+	mkdir -p ../../blib/auto/IMAPIDLE/Imsg
+	# Rename into place so a running process keeps the old inode.
+	${CC} -shared -fPIC -o $@.new Imsg.o -lutil
+	mv $@.new $@
+
+clean:
+	rm -f Imsg.c Imsg.o ../../blib/auto/IMAPIDLE/Imsg/Imsg.so
+
+.PHONY: all clean
