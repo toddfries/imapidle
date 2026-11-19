@@ -300,6 +300,46 @@ like($gone, qr/acct +: dropping INBOX: idle refresh failed/,
 like($gone, qr/acct +: retry in \d+s/, 'the account still retries');
 unlike($gone, qr/Trying command when NOT connected|IMAPClient\.pm/,
     'the drop does not dump the library stack');
+
+package TimeoutIMAP;
+sub new { bless { up => 1, calls => [], err => '' }, shift }
+sub IsConnected { $_[0]{up} }
+sub done {
+    my ($self) = @_;
+    push @{ $self->{calls} }, 'done';
+    $self->{up} = 0;
+    $self->{err} = 'timeout waiting 899.827412128448s for data from server';
+    return;
+}
+sub idle   { push @{ $_[0]{calls} }, 'idle';   die "idle\n" }
+sub logout { push @{ $_[0]{calls} }, 'logout'; die "logout\n" }
+sub LastError { $_[0]{err} }
+
+package main;
+
+my $stall = TimeoutIMAP->new;
+my $stall_conn = {
+    name => 'acct', mode => 'IDLE', tag => '40', idling => 1,
+    folder => 'INBOX', imap => $stall,
+};
+my $stall_log = stderr_of(sub {
+    ok(!restart_idle($stall_conn), 'a silent DONE does not re-arm');
+});
+is($stall_log, '', 'a silent DONE waits for the drop line');
+like($stall_conn->{drop_why} // '',
+    qr/timeout waiting 899\.827412128448s for data from server/,
+    'the drop keeps the wait');
+
+my $quiet_key = plant_idle_for_test('acct', 'vendors.2026-11', 420, 'ch');
+my $quiet = stderr_of(sub {
+    drop_conn($quiet_key, 'timeout waiting 899.827412128448s for data from server');
+});
+like($quiet,
+    qr/acct +: vendors\.2026-11 idle refresh timeout, waited 899\.827s with no response/,
+    'a silent IDLE session is one line');
+unlike($quiet, qr/dropping vendors|idle re-arm failed|timeout waiting/,
+    'the raw timeout is not logged beside it');
+like($quiet, qr/acct +: retry in \d+s/, 'the account still retries');
 set_foreground_for_test(0);
 
 done_testing;

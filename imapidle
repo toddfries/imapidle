@@ -4427,10 +4427,31 @@ sub drop_conn {
     $secs = time() - $conn->{started} if defined $conn->{started};
     my $avg = note_conn_time(_conn_time_key($conn), $secs);
     $avg = '' unless defined $avg;
-    log_warn("$name: dropping $what: $why" . ($avg ne '' ? " $avg" : ''));
+    my $silence = _idle_silence_line($conn, $why);
+    if (defined $silence) {
+        log_warn("$name: $silence");
+    } else {
+        log_warn("$name: dropping $what: $why" . ($avg ne '' ? " $avg" : ''));
+    }
     eval { _leave_idle($conn) };
     close_session($conn->{imap}, $conn->{socket});
     mark_retry($name) unless $no_retry;
+}
+
+# The read cap expired on an IDLE session. One line names the folder
+# and the wait. A TCP close keeps the ordinary drop text.
+sub _idle_silence_line {
+    my ($conn, $why) = @_;
+    return unless $conn && ($conn->{mode} // '') eq 'IDLE';
+    my $folder = $conn->{folder} // '';
+    return if $folder eq '';
+    return unless defined $why
+        && $why =~ /timeout waiting ([0-9]+(?:\.[0-9]+)?)s for data from server/;
+    my $n = $1 + 0;
+    my $shown = ($n == int($n)) ? sprintf('%d', int($n)) : sprintf('%.3f', $n);
+    $shown =~ s/0+$//;
+    $shown =~ s/\.$//;
+    return "$folder idle refresh timeout, waited ${shown}s with no response";
 }
 
 # One week, plus the same quarter spread as an empty-mailbox confirm.
@@ -4960,7 +4981,12 @@ sub restart_idle {
         1;
     };
     if (!$ok) {
-        log_warn("$conn->{name}: idle re-arm failed: " . scrub($@));
+        my $why = scrub($@);
+        if ($why =~ /timeout waiting [0-9]+(?:\.[0-9]+)?s for data from server/) {
+            $conn->{drop_why} = $why;
+        } else {
+            log_warn("$conn->{name}: idle re-arm failed: $why");
+        }
         return 0;
     }
     note_idle_rearmed($conn->{name});
@@ -7717,7 +7743,10 @@ sub housekeeping {
         }
         if (($conn->{mode} // '') eq 'IDLE'
             && $now - ($conn->{last_idle} // 0) >= 30) {
-            drop_conn($key, 'idle refresh failed') unless restart_idle($conn);
+            next if restart_idle($conn);
+            my $why = delete $conn->{drop_why};
+            $why = 'idle refresh failed' if !defined $why || $why eq '';
+            drop_conn($key, $why);
         }
     }
 
