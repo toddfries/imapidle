@@ -37,6 +37,25 @@ my $kept = capture(sub {
 like($kept, qr/acct    : \* 1 EXISTS/, 'EXISTS is still logged');
 like($kept, qr/A001 OK IDLE completed/, 'a tagged reply is still logged');
 
+my $delta = capture(sub {
+    trace_imap_line('acct', '* 12 EXISTS', 'INBOX', 10);
+    trace_imap_line('acct', '* 9 EXISTS', 'INBOX', 11);
+    trace_imap_line('acct', '* 9 EXISTS', 'INBOX', 9);
+    trace_imap_line('acct', '* 4 EXISTS', 'INBOX', undef);
+    trace_imap_line('acct', '* 82 RECENT', 'INBOX', 9);
+});
+like($delta, qr/INBOX \* 12 EXISTS \(\+2 from last check\)/,
+    'a higher total shows the rise from the local count');
+like($delta, qr/INBOX \* 9 EXISTS \(-2 from last check\)/,
+    'a lower total shows the drop from the local count');
+like($delta, qr/INBOX \* 9 EXISTS \(\+0 from last check\)/,
+    'an unchanged total shows a zero change');
+like($delta, qr/INBOX \* 4 EXISTS \(no local count\)/,
+    'a missing local count is named');
+like($delta, qr/INBOX \* 82 RECENT/, 'another server line names the folder');
+unlike($delta, qr/RECENT \(.*from last check\)/,
+    'RECENT is not compared with the stored total');
+
 set_verbose_for_test(1);
 my $loud = capture(sub {
     trace_imap_line('acct', '* OK Still here');

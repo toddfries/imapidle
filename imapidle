@@ -4975,10 +4975,23 @@ sub _keepalive_line {
     return $line =~ /^\*\s+OK\s+Still here\b/i;
 }
 
+# $folder names the selected mailbox. $prev is the remembered EXISTS.
+# The signed delta is that local total against the number in this line.
 sub trace_imap_line {
-    my ($name, $line) = @_;
+    my ($name, $line, $folder, $prev) = @_;
     return if !$VERBOSE && _keepalive_line($line);
-    log_info("$name: $line");
+    my $body = $line;
+    if (defined $folder && $folder ne '') {
+        $body = "$folder $line";
+        if ($line =~ /^\*\s+(\d+)\s+EXISTS\b/i) {
+            if (defined $prev) {
+                $body .= sprintf(' (%+d from last check)', $1 - $prev);
+            } else {
+                $body .= ' (no local count)';
+            }
+        }
+    }
+    log_info("$name: $body");
 }
 
 sub note_idle_rearmed {
@@ -7569,6 +7582,7 @@ sub process_notification {
     my $ok = eval {
         my @lines;
         my $spins = 0;
+        my $local = $conn->{messages};
         while ($spins++ < 100) {
             my @data = $conn->{imap}->idle_data(0);
             if (@data == 1 && !defined $data[0]) {
@@ -7580,7 +7594,8 @@ sub process_notification {
                 chomp $line;
                 next if $line eq '';
                 push @lines, $line;
-                trace_imap_line($conn->{name}, $line);
+                trace_imap_line($conn->{name}, $line, $conn->{folder}, $local);
+                $local = $1 + 0 if $line =~ /^\*\s+(\d+)\s+EXISTS\b/i;
             }
         }
         my @mail_lines = _idle_mail_lines($conn, @lines);

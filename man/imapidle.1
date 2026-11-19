@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 18 2026 $
+.Dd $Mdocdate: November 19 2026 $
 .Dt IMAPIDLE 1
 .Os
 .Sh NAME
@@ -797,6 +797,9 @@ A watched
 folder is synced when new mail arrives.
 The server announces the message total with
 .Cm EXISTS .
+The log names the folder and the change from the remembered
+total, for example
+.Ql INBOX * 5265 EXISTS (+2 from last check) .
 That total is remembered from the mailbox selection.
 A dropped session keeps the total for that account and folder.
 The next selection starts one sync when the new total is higher,
