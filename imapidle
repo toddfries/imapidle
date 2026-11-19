@@ -54,6 +54,8 @@ my %STATE_STAT;
 my $FOREGROUND = 0;
 my $VERBOSE    = 0;
 my $LOG_OPEN   = 0;
+# -n keeps loaded state in this process and never rewrites it.
+our $DRY_RUN = 0;
 
 my %accounts;
 my %conns;
@@ -181,7 +183,7 @@ sub log_warn  { log_line(LOG_WARNING, $_[0]); }
 sub log_error { log_line(LOG_ERR,     $_[0]); }
 
 sub usage {
-    print STDERR "usage: imapidle [-dv] [-c file]\n";
+    print STDERR "usage: imapidle [-dvn] [-c file]\n";
     print STDERR "       imapidle --tunnel section [-c file]\n";
     exit 1;
 }
@@ -292,6 +294,7 @@ sub _current_cert {
 
 sub save_known_hosts {
     my %certs = @_;
+    return if $DRY_RUN;
     return unless defined $KNOWN_HOSTS;
     my $old = umask 077;
     open my $fh, '>', $KNOWN_HOSTS or do {
@@ -536,6 +539,7 @@ sub load_learned {
 
 sub save_learned {
     my %rows = @_;
+    return if $DRY_RUN;
     return unless defined $LEARNED;
     my $old = umask 077;
     open my $fh, '>', $LEARNED or do {
@@ -1457,6 +1461,7 @@ sub apply_folder_list {
 
 sub _save_folder_file {
     my ($channel) = @_;
+    return if $DRY_RUN;
     return unless defined $FOLDERS_DIR && $FOLDERS_DIR ne '';
     return if $channel =~ m{[/\\]};
     my $st = $folder_lists{$channel} or return;
@@ -1603,6 +1608,7 @@ sub _stat_load {
 
 sub _stat_save {
     my ($path, $src) = @_;
+    return if $DRY_RUN;
     return unless defined $path && $path ne '';
     my $dir = dirname($path);
     make_path($dir, { mode => 0700 }) if $dir ne '' && $dir ne '.';
@@ -1643,6 +1649,7 @@ sub save_stat_files {
 # plus when LIST is next due. Written on shutdown so a restart
 # does not STATUS or confirm the herd together.
 sub save_track_file {
+    return if $DRY_RUN;
     return unless defined $TRACK_FILE && $TRACK_FILE ne '';
     my $dir = dirname($TRACK_FILE);
     make_path($dir, { mode => 0700 }) if $dir ne '' && $dir ne '.';
@@ -1870,6 +1877,7 @@ sub slots_for_cold {
 
 sub adopt_state_file {
     my ($dest, $src) = @_;
+    return 0 if $DRY_RUN;
     return 0 unless defined $dest && $dest ne '' && defined $src && -f $src;
     return 0 if -e $dest;
     my $dir = dirname($dest);
@@ -2237,6 +2245,7 @@ sub _pulse_last_load {
 }
 
 sub _pulse_last_save {
+    return if $DRY_RUN;
     return unless defined $PULSE_LAST_FILE && $PULSE_LAST_FILE ne '';
     my $dir = dirname($PULSE_LAST_FILE);
     make_path($dir, { mode => 0700 }) if $dir ne '' && $dir ne '.';
@@ -2994,6 +3003,7 @@ sub _tls_clear_callback {
 
 sub _save_hashed_file {
     my ($kind, $host, $port, $body) = @_;
+    return if $DRY_RUN;
     return unless defined $STATE_DIR && $STATE_DIR ne '';
     return unless defined $body && $body ne '';
     return unless defined $host && $host ne '' && defined $port && $port ne '';
@@ -3121,6 +3131,7 @@ sub load_cert_warn {
 
 sub save_cert_warn {
     my (%when) = @_;
+    return if $DRY_RUN;
     my $path = _cert_warn_file() or return;
     my $tmp = "$path.tmp.$$";
     my $old = umask 077;
@@ -4603,6 +4614,7 @@ sub conn_limit_fail {
 }
 
 sub _conn_limit_save {
+    return if $DRY_RUN;
     return unless defined $CONN_LIMIT_FILE && $CONN_LIMIT_FILE ne '';
     my $dir = dirname($CONN_LIMIT_FILE);
     make_path($dir, { mode => 0700 }) if $dir ne '' && $dir ne '.';
@@ -6133,6 +6145,7 @@ sub _tunnel_on {
 
 sub prepare_tunnel_config {
     my (@args) = @_;
+    return if $DRY_RUN;
     return unless _tunnel_on();
     return unless @args;
     my $src = _mbsyncrc_path();
@@ -6470,6 +6483,10 @@ sub trigger_mbsync {
     my ($wait, @args) = @_;
     $wait //= 0;
     return 0 unless @args;
+    if ($DRY_RUN) {
+        log_info(mbsync_phrase('would mbsync', @args));
+        return 0;
+    }
     if (ref $TRIGGER_HOOK eq 'CODE') {
         return $TRIGGER_HOOK->($wait, [@args], $meta);
     }
@@ -8986,6 +9003,7 @@ sub _ctl_dispatch {
 }
 
 sub ctl_listen {
+    return if $DRY_RUN;
     my $path = ctl_socket_path();
     return unless defined $path && $path ne '';
     return if $CTL_LISTEN;
@@ -9058,6 +9076,29 @@ sub main_loop {
     }
 }
 
+sub channel_folder_names {
+    my ($channel) = @_;
+    return () if !defined $channel || $channel eq '';
+    my $st = $folder_lists{$channel} or return ();
+    return sort keys %{ $st->{names} // {} };
+}
+
+sub loaded_track_rows {
+    return scalar keys %track;
+}
+
+# Remember a sync on the loaded folder. -n never writes this out.
+sub note_folder_sync {
+    my ($name, $folder, $when) = @_;
+    return if !defined $name || !defined $folder || $folder eq '';
+    my $acc = $accounts{$name} or return;
+    for my $f (@{ $acc->{folders} // [] }) {
+        next unless ($f->{name} // '') eq $folder;
+        $f->{last_sync} = $when;
+        return;
+    }
+}
+
 sub open_state_dir {
     if (!defined $STATE_DIR || $STATE_DIR eq '') {
         if (defined $ENV{HOME} && $ENV{HOME} ne '') {
@@ -9068,7 +9109,6 @@ sub open_state_dir {
             return;
         }
     }
-    make_path($STATE_DIR, { mode => 0700 });
     $FOLDERS_DIR = "$STATE_DIR/folders"
         if !defined $FOLDERS_DIR || $FOLDERS_DIR eq '';
     $MBSYNC_REAL_FILE = "$STATE_DIR/mbsync-real"
@@ -9083,9 +9123,13 @@ sub open_state_dir {
         if !defined $CONN_LIMIT_FILE || $CONN_LIMIT_FILE eq '';
     my $known   = "$STATE_DIR/known_hosts";
     my $learned = "$STATE_DIR/learned";
-    if (defined $CONFIG_DIR && $CONFIG_DIR ne '') {
-        adopt_state_file($known,   "$CONFIG_DIR/known_hosts");
-        adopt_state_file($learned, "$CONFIG_DIR/learned");
+    # -n reads what is already there and leaves the directory alone.
+    if (!$DRY_RUN) {
+        make_path($STATE_DIR, { mode => 0700 });
+        if (defined $CONFIG_DIR && $CONFIG_DIR ne '') {
+            adopt_state_file($known,   "$CONFIG_DIR/known_hosts");
+            adopt_state_file($learned, "$CONFIG_DIR/learned");
+        }
     }
     $KNOWN_HOSTS = $known;
     $LEARNED     = $learned;
@@ -9104,13 +9148,35 @@ sub startup_fail {
     exit 1;
 }
 
+# -n supervises a hub that owns the loaded state. Idle workers are
+# forked from this process, so they do not inherit that state.
+sub _serve_dry {
+    my $root = dirname($SELF_PATH);
+    require lib;
+    lib->import("$root/lib", "$root/blib");
+    my $loaded = eval { require IMAPIDLE::Split; 1 };
+    startup_fail("dry run: $@") if !$loaded;
+    openlog('imapidle-n', 'cons,pid', 'mail');
+    $LOG_OPEN = 1;
+    $SIG{PIPE} = 'IGNORE';
+    $SIG{HUP}  = 'IGNORE';
+    if ($FOREGROUND) {
+        my $old = select(STDERR);
+        $| = 1;
+        select($old);
+    }
+    IMAPIDLE::Split::serve($CONFIG_FILE, $FOREGROUND);
+    exit 0;
+}
+
 sub run {
     my (@argv) = @_;
     my ($tunnel_section, @rest) = _split_tunnel_argv(@argv);
     local @ARGV = @rest;
     my %opt;
-    getopts('dvc:', \%opt) or usage();
+    getopts('dvnc:', \%opt) or usage();
     usage() if @ARGV;
+    usage() if $opt{n} && defined $tunnel_section;
 
     $FOREGROUND = $opt{d} ? 1 : 0;
     $FOREGROUND = 0 if defined $tunnel_section;
@@ -9122,6 +9188,11 @@ sub run {
         $CONFIG_FILE = _abs_config("$ENV{HOME}/.config/imapidle/imapidle.conf");
     }
     $CONFIG_DIR = dirname($CONFIG_FILE);
+
+    if ($opt{n}) {
+        $DRY_RUN = 1;
+        _serve_dry();
+    }
 
     openlog('imapidle', 'cons,pid', 'mail');
     $LOG_OPEN = 1;

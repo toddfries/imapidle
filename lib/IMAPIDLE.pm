@@ -25,6 +25,10 @@ use constant {
 	IMSG_ATTACH   => 3,
 	IMSG_MAIL     => 4,
 	IMSG_SOCKET   => 5,
+	IMSG_SPAWN    => 6,
+	IMSG_LOGIN    => 7,
+	IMSG_READY    => 8,
+	IMSG_DROP     => 9,
 	IMSG_MAX      => 262144,
 };
 

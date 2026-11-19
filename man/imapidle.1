@@ -22,7 +22,7 @@
 .Nd watch IMAP mailboxes and run mbsync
 .Sh SYNOPSIS
 .Nm imapidle
-.Op Fl dv
+.Op Fl dvn
 .Op Fl c Ar file
 .Nm imapidle
 .Fl -tunnel Ar section
@@ -204,6 +204,29 @@ The first look at a host also logs the authentication
 mechanisms that server offers, once.
 The flag applies when the process is a daemon and with
 .Fl d .
+.It Fl n
+Watch mailboxes without writing state and without running
+.Sy mbsync .
+The configuration and
+.Pa ~/.local/imapidle
+are loaded into memory.
+A sync that would have started is logged, then this process
+waits the predicted number of seconds.
+The wait is that average, or five seconds when no average
+is stored, plus or minus about a quarter of the average.
+The state directory is left untouched.
+Certificates are not checked or stored.
+The control socket is not opened, so this process can run
+beside another
+.Nm .
+.Fl -tunnel
+cannot be combined with this flag.
+.Dv SIGHUP
+is ignored.
+.Dv SIGTERM
+or
+.Dv SIGINT
+stops the process.
 .El
 .Pp
 An unknown certificate is stored in
