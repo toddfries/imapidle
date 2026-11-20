@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 18 2026 $
+.Dd $Mdocdate: November 20 2026 $
 .Dt IMAPIDLE.CONF 5
 .Os
 .Sh NAME
@@ -247,6 +247,16 @@ the IMAP password.
 The command must exit 0.
 Empty output, a non-zero exit, or no exit within 30 seconds fails that
 account only.
+A first line that starts with
+.Li ERROR ,
+contains
+.Dq Access token unavailable ,
+or contains
+.Li ://
+is not a password.
+The account is not connected, and
+.Sy mbsync
+is not started, the same as a non-zero exit.
 Required unless
 .Va pass
 is set.

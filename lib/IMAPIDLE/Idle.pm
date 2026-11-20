@@ -49,6 +49,10 @@ sub run {
 	my $folder = $info->{folder} // 'INBOX';
 	my $secret = $info->{secret};
 	delete $info->{secret};
+	if (!main::secret_line_ok($secret)) {
+		undef $secret;
+		return;
+	}
 
 	my ($fh, $preauth) = _connect($info);
 	if (!$preauth) {

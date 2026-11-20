@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 19 2026 $
+.Dd $Mdocdate: November 20 2026 $
 .Dt IMAPIDLE 1
 .Os
 .Sh NAME
@@ -85,6 +85,11 @@ The error is logged on the first failure and again only after
 The retries in between are quiet.
 A later success logs that the command recovered, and the account
 is not disabled.
+An error line from that command, including an authorisation URL,
+is the same failure.
+The account is not connected and
+.Sy mbsync
+is not started.
 It does not stop the other accounts, and it does not exit the process.
 The process leaves the main loop only on
 .Dv SIGTERM

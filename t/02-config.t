@@ -96,6 +96,20 @@ is($tok, 'tok', 'pass_cmd stdout is the password');
 ok(!defined capture_pass_cmd('exit 1'), 'failing command yields no password');
 ok(!defined capture_pass_cmd('true'), 'empty stdout yields no password');
 ok(!defined capture_pass_cmd('sleep 3', 1), 'hung command yields no password');
+ok(!defined capture_pass_cmd(
+        q{printf '%s\n' 'ERROR Access token unavailable until authorised with URL https://example.invalid/auth'}),
+    'an authorisation error on stdout is not a password');
+ok(!defined capture_pass_cmd(q{printf '%s\n' 'ERROR - Access token unavailable'}),
+    'a dashed authorisation error is not a password');
+ok(!defined capture_pass_cmd(q{printf '%s\n' 'https://example.invalid/auth'}),
+    'a URL on stdout is not a password');
+is(capture_pass_cmd(q{printf '%s\n' 'ya29.a0AfH6SM'}), 'ya29.a0AfH6SM',
+    'a token line is the password');
+is(capture_pass_cmd(q{printf '%s\n' 'two words'}), 'two words',
+    'a password with a space is kept');
+ok(!secret_line_ok('a' x 4097), 'a line over 4096 bytes is not a password');
+ok(secret_line_ok('a' x 4096), 'a 4096 byte line is a password');
+ok(secret_line_ok('two words'), 'spaces do not reject a password');
 unlink $path;
 
 sub write_conf {

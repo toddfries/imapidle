@@ -110,6 +110,114 @@ my $due3 = account_next_try('acct');
 ok($due3 >= $t2 + secret_floor() && $due3 < time() + secret_floor() + 2,
     'the wait starts again at one minute');
 
+my $bad = write_conf(<<'EOF');
+[oauth]
+type = account
+server = imap.example.com
+user = a@example.com
+pass_cmd = printf '%s\n' 'ERROR Access token unavailable until authorised with URL https://example.invalid/auth'
+mbsync_channel = oauthch
+
+[oauth-watch]
+type = idle
+channel = oauth
+folder0 = INBOX
+
+EOF
+set_foreground_for_test(0);
+is(load_config($bad), '', 'an error-line command still loads');
+set_foreground_for_test(1);
+set_login_hook_for_test(sub { die "tcp\n" });
+
+reset_schedule_for_test();
+my $held = time();
+queue_folder('oauthch', 'INBOX', $held, $held);
+my @blocked;
+my $held_log = capture(sub { @blocked = due_mbsync_jobs($held) });
+is(scalar @blocked, 0, 'a bad token does not start mbsync');
+like($held_log, qr/oauth\s+: pass_cmd failed/, 'the bad token is a pass_cmd failure');
+unlike($held_log, qr/example\.invalid/, 'the authorisation URL is not logged');
+unlike($held_log, qr/\btcp\b/, 'scheduling a bad token does not log in');
+my $later = schedule_deadline('oauthch');
+ok(defined $later && $later > $held, 'the batch waits out the command');
+
+my $conn_rc;
+my $conn_log = capture(sub { $conn_rc = connect_account('oauth') });
+is($conn_rc, 0, 'a bad token does not connect');
+unlike($conn_log, qr/\btcp\b/, 'login is not attempted');
+unlike($conn_log, qr/example\.invalid/, 'connect does not log the authorisation URL');
+unlike($conn_log, qr/imap\.example\.com/, 'connect does not name the server');
+
+reset_schedule_for_test();
+reset_track_for_test();
+my $sweep = time();
+set_track_due_for_test('oauthch', 'INBOX', $sweep);
+my $fired = 0;
+set_trigger_hook_for_test(sub { $fired++; return 1 });
+my $sweep_log = capture(sub { pump_tracked($sweep) });
+is($fired, 0, 'a cold sweep does not start mbsync');
+unlike($sweep_log, qr/\btcp\b/, 'a cold sweep does not log in');
+unlike($sweep_log, qr/example\.invalid/, 'a cold sweep does not log the URL');
+my ($swept) = track_rows_for_test();
+ok($swept && $swept->{next} > $sweep, 'the sweep waits out the command');
+ok(!$swept->{await_sync}, 'the sweep is not waiting on mbsync');
+set_trigger_hook_for_test(undef);
+
+my $good = write_conf(<<'EOF');
+[oauth]
+type = account
+server = imap.example.com
+user = a@example.com
+pass_cmd = printf '%s\n' 'ya29.a0AfH6SM'
+mbsync_channel = oauthch
+
+[oauth-watch]
+type = idle
+channel = oauth
+folder0 = INBOX
+
+EOF
+set_foreground_for_test(0);
+is(load_config($good), '', 'a token command loads');
+set_foreground_for_test(1);
+reset_schedule_for_test();
+my $ready = time();
+queue_folder('oauthch', 'INBOX', $ready, $ready);
+my @ready_jobs;
+my $ready_log = capture(sub { @ready_jobs = due_mbsync_jobs($ready) });
+is(scalar @ready_jobs, 1, 'a token lets the batch run');
+is($ready_jobs[0]{args}[0], 'oauthch:INBOX', 'the job names the mailbox');
+unlike($ready_log, qr/\btcp\b/, 'taking the batch does not log in');
+unlike($ready_log, qr/example\.invalid/, 'a token run has no authorisation URL');
+
+my $stored = write_conf(<<'EOF');
+[plain]
+type = account
+server = imap.example.com
+user = a@example.com
+pass = ERROR Access token unavailable https://example.invalid/auth
+mbsync_channel = plainch
+
+[plain-watch]
+type = idle
+channel = plain
+folder0 = INBOX
+
+EOF
+set_foreground_for_test(0);
+is(load_config($stored), '', 'a stored password still loads');
+set_foreground_for_test(1);
+reset_schedule_for_test();
+my $plain_at = time();
+queue_folder('plainch', 'INBOX', $plain_at, $plain_at);
+my @plain;
+my $plain_log = capture(sub { @plain = due_mbsync_jobs($plain_at) });
+is(scalar @plain, 1, 'a stored password is not gated');
+is($plain[0]{args}[0], 'plainch:INBOX', 'the stored-password job names the mailbox');
+unlike($plain_log, qr/\btcp\b/, 'a stored password does not log in from the scheduler');
+unlike($plain_log, qr/example\.invalid/, 'a stored password is not logged');
+set_login_hook_for_test(undef);
+
 set_foreground_for_test(0);
 done_testing;
 

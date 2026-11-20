@@ -1353,6 +1353,45 @@ sub _track_key {
     return $channel . "\0" . $box;
 }
 
+# The account whose pass_cmd guards this mbsync channel. A stored
+# password does not. Prefer the section that actually has a command
+# when more than one row names the channel.
+sub _login_for_channel {
+    my ($channel) = @_;
+    return unless defined $channel && $channel ne '';
+    my ($fallback_name, $fallback);
+    for my $name (sort keys %accounts) {
+        my $acc = $accounts{$name} or next;
+        next if $acc->{config_disabled};
+        next if ($acc->{mbsync_channel} // '') ne $channel;
+        if (defined $acc->{pass_cmd} && $acc->{pass_cmd} ne '') {
+            return ($name, $acc);
+        }
+        ($fallback_name, $fallback) = ($name, $acc) unless $fallback;
+    }
+    return ($fallback_name, $fallback) if $fallback;
+    return;
+}
+
+# Seconds to leave this channel alone, or 0 when a sync may start.
+# A failing command sets the same wait as a login, so the loop does
+# not call it again until that wait is over.
+sub _pass_cmd_blocks {
+    my ($channel, $now) = @_;
+    $now //= time();
+    my ($name, $acc) = _login_for_channel($channel);
+    return 0 unless $name && $acc;
+    return 0 unless defined $acc->{pass_cmd} && $acc->{pass_cmd} ne '';
+    my $due = $acc->{next_try} // 0;
+    if ($due > $now) {
+        return $due - $now;
+    }
+    my $pw = account_pass($name);
+    return 0 if defined $pw && secret_line_ok($pw);
+    my $left = ($accounts{$name}{next_try} // 0) - time();
+    return $left > 0 ? $left : 1;
+}
+
 # The log prefix is the account that claims this mbsync channel.
 # A config hold is not that name. With no such account, the channel
 # itself is the prefix so a unit test without a login still reads.
@@ -2386,8 +2425,22 @@ sub _log_loaded_account {
           . scalar(@{ $acc->{folders} }) . ' folder(s)');
 }
 
-# First line of stdout from sh -c. Empty, timeout, and non-zero exit are undef.
-# The command text and its output are not logged.
+# pizauth show writes "ERROR ... Access token unavailable until
+# authorised with URL https://..." and exits 1. A wrapper can exit 0
+# with that line on stdout. It is not a secret, and nothing connects.
+sub secret_line_ok {
+    my ($line) = @_;
+    return 0 unless defined $line && $line ne '';
+    return 0 if length($line) > 4096;
+    return 0 if $line =~ /^ERROR\b/;
+    return 0 if $line =~ /Access token unavailable/i;
+    return 0 if $line =~ m{://};
+    return 1;
+}
+
+# First line of stdout from sh -c. Empty, timeout, a non-zero exit,
+# and a line that is not a secret are undef. The command text and
+# its output are not logged.
 sub capture_pass_cmd {
     my ($cmd, $timeout) = @_;
     $timeout //= 30;
@@ -2469,8 +2522,7 @@ sub capture_pass_cmd {
     return if $reaped <= 0 || $? != 0;
 
     my ($line) = split /\r?\n/, $buf, 2;
-    return unless defined $line && $line ne '';
-    return if length($line) > 4096;
+    return unless secret_line_ok($line);
     return $line;
 }
 
@@ -5579,6 +5631,13 @@ sub take_due_batches {
         # A bare channel and channel:box are one mbsync. Leave the batch
         # until that process exits; the gap clock starts at the later spawn.
         next if channel_busy($channel);
+        # A bad token must not become an mbsync socket. The batch stays
+        # queued until the command's own wait has elapsed.
+        my $hold = _pass_cmd_blocks($channel, $now);
+        if ($hold) {
+            $batch{$channel}{deadline} = $now + $hold;
+            next;
+        }
         last if defined $limit && @jobs >= $limit;
         my $wait = 0;
         for my $folder (@folders) {
@@ -7181,6 +7240,14 @@ sub pump_tracked {
         next if _needs_probe($job->{id}, $now);
         next if $started{ $job->{channel} } || channel_busy($job->{channel});
         my $row = $track{ $job->{id} };
+        my $hold = _pass_cmd_blocks($job->{channel}, $now);
+        if ($hold) {
+            if ($row) {
+                $row->{next} = $now + $hold;
+                $row->{await_sync} = 0;
+            }
+            next;
+        }
         _arm_confirm($job->{channel}, $job->{box}, $row)
             if $row && _confirm_due($row, $now);
         my %meta = (
