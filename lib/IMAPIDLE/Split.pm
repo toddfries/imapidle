@@ -1182,9 +1182,9 @@ sub _live_hub {
 	main::open_state_dir();
 	main::install_chld_signal();
 	main::install_info_signal();
-	# Those installs block CHLD and INFO except across pselect.
-	# This loop waits with select, so the handlers have to run.
-	main::_restore_wake_mask();
+	# Leave CHLD and INFO blocked. service_wait unblocks them only
+	# for the pselect. An unblocked Perl SIGCHLD during malloc
+	# aborts this process, and a burst of mbsync exits did that.
 	main::ctl_listen();
 	main::prime_named_folders(time());
 
@@ -1221,7 +1221,7 @@ sub _live_hub {
 		$wait = 30 if !defined $wait || $wait > 30;
 		$wait = 0.05 if $wait < 0.05;
 		_service_sync($sel, \%have);
-		my @ready = $sel->can_read($wait);
+		my @ready = main::service_wait($sel, $wait);
 		if (!@ready && $! && $!{EINTR}) {
 			next;
 		}

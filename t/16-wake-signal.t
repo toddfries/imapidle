@@ -15,7 +15,9 @@
 use strict;
 use warnings;
 use File::Temp qw(tempdir);
+use IO::Select;
 use POSIX qw(_exit);
+use Time::HiRes;
 use Test::More;
 
 require './imapidle';
@@ -74,5 +76,27 @@ for my $pid (@pids) {
     $left++ unless defined $got && $got == -1;
 }
 is($left, 0, 'every short child was reaped');
+
+# The live hub waits here. SIGCHLD stays blocked, and a child exit
+# still wakes the wait through the pipe.
+my $sel = IO::Select->new(service_fds());
+ok($sel->count > 0, 'the hub wait watches the child pipe');
+my $late = fork();
+die "fork: $!" unless defined $late;
+if ($late == 0) {
+    select(undef, undef, undef, 0.2);
+    _exit(0);
+}
+my $t0 = Time::HiRes::time();
+my @woke = service_wait($sel, 2);
+my $dt = Time::HiRes::time() - $t0;
+ok(@woke || $!{EINTR}, 'a child exit wakes the hub wait');
+@woke = service_wait($sel, 0.2) unless @woke;
+ok(@woke, 'the child pipe is readable after that wake');
+ok($dt < 1.5, 'the hub wait woke before its timeout');
+ok(wake_holds_chld_for_test(), 'SIGCHLD stays blocked after the hub wait');
+service_ready($_) for @woke;
+waitpid($late, 0);
+is($? >> 8, 0, 'the child that woke the hub exited 0');
 
 done_testing;

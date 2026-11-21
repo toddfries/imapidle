@@ -9264,6 +9264,30 @@ sub service_fds {
     return @fh;
 }
 
+# CHLD and INFO stay blocked except inside this pselect. A Perl
+# handler during malloc aborts the process on OpenBSD.
+sub service_wait {
+    my ($sel, $timeout) = @_;
+    my @handles = $sel->handles;
+    my $rin = '';
+    for my $fh (@handles) {
+        my $fd = fileno($fh);
+        next unless defined $fd;
+        vec($rin, $fd, 1) = 1;
+    }
+    my $win = '';
+    my $ein = '';
+    my $n = _pselect($rin, $win, $ein, $timeout);
+    return if !defined $n || $n <= 0;
+    my @ready;
+    for my $fh (@handles) {
+        my $fd = fileno($fh);
+        next unless defined $fd && vec($rin, $fd, 1);
+        push @ready, $fh;
+    }
+    return @ready;
+}
+
 sub service_ready {
     my ($fh) = @_;
     return 0 unless defined $fh && defined fileno($fh);
