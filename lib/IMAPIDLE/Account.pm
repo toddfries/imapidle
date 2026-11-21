@@ -46,11 +46,10 @@ sub run {
 		return;
 	}
 
-	my ($fh, $preauth) = IMAPIDLE::Idle::_connect($info);
-	if (!$preauth) {
-		IMAPIDLE::Idle::_authenticate($fh, $info, $secret);
-	}
+	my ($fh, $preauth) = IMAPIDLE::Idle::_open_session(
+	    $ib, $info, $secret, $account, '');
 	undef $secret;
+	return if !$fh;
 	$ib->send(IMAPIDLE::IMSG_READY, IMAPIDLE::json_encode({
 		account => $account,
 		mode    => 'status',

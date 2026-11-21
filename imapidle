@@ -4728,6 +4728,49 @@ sub conn_limit_fail {
     return 0;
 }
 
+# The hub has no %conns. $open is how many workers for this login are
+# already in IMAP. A refusal records that count and waits out the week.
+sub note_imsg_conn_limit {
+    my ($name, $err, $open) = @_;
+    my $acc = $accounts{$name} or return 0;
+    my $key = _conn_limit_key($acc) or return 0;
+    $open = 0 if !defined $open || $open < 0;
+    return 0 if $open < 1;
+    my $row = $CONN_LIMIT{$key};
+    if (!$row || !defined $row->{cap}) {
+        $row = { cap => int($open) };
+    }
+    my $max = _conn_limit_server_max($err);
+    $row->{server_max} = $max if defined $max;
+    _conn_limit_schedule($row);
+    $CONN_LIMIT{$key} = $row;
+    delete $CONN_LIMIT_PROBING{$key};
+    _conn_limit_save();
+    _conn_limit_log($name, $row);
+    return $row->{probe} // 0;
+}
+
+sub imsg_conn_limit_blocked {
+    my ($name, $open, $now) = @_;
+    my $acc = $accounts{$name} or return 0;
+    my $key = _conn_limit_key($acc) or return 0;
+    my $row = $CONN_LIMIT{$key} or return 0;
+    return 0 unless defined $row->{cap};
+    $open = 0 if !defined $open || $open < 0;
+    return 0 if $open < $row->{cap};
+    $now //= time();
+    return 0 if ($row->{probe} // 0) <= $now;
+    return 1;
+}
+
+sub imsg_conn_limit_until {
+    my ($name) = @_;
+    my $acc = $accounts{$name} or return 0;
+    my $key = _conn_limit_key($acc) or return 0;
+    my $row = $CONN_LIMIT{$key} or return 0;
+    return $row->{probe} // 0;
+}
+
 sub _conn_limit_save {
     return if $DRY_RUN;
     return unless defined $CONN_LIMIT_FILE && $CONN_LIMIT_FILE ne '';

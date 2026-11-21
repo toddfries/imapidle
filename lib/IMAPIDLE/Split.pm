@@ -703,6 +703,11 @@ sub _dry_worker {
 			main::imsg_folder_up($job->{account}, $job->{folder}, 1)
 			    if $REAL;
 		}
+	} elsif ($REAL && $msg->{type} == IMAPIDLE::IMSG_DROP && $row->{limit}) {
+		my $open = _armed_on_login($jobs, $job->{account}, $job);
+		my $probe = main::note_imsg_conn_limit(
+		    $job->{account}, $row->{detail} // '', $open);
+		$job->{restart_at} = $probe if $probe && $probe > time();
 	} elsif ($msg->{type} == IMAPIDLE::IMSG_MAIL) {
 		my $n = ($row->{total} // 0) + 0;
 		if ($REAL) {
@@ -792,7 +797,11 @@ sub _dry_gone {
 		_drop_flight($job->{channel});
 	}
 	my $wait = $job->{backoff} || 2;
-	$job->{restart_at} = $now + $wait;
+	my $soon = $now + $wait;
+	# A connection-limit refusal already picked a later probe.
+	if (!$job->{restart_at} || $job->{restart_at} < $soon) {
+		$job->{restart_at} = $soon;
+	}
 	$wait *= 2;
 	$wait = 30 if $wait > 30;
 	$job->{backoff} = $wait;
@@ -814,6 +823,15 @@ sub _dry_spawn {
 		next if $job->{kind} ne 'idle' && $job->{kind} ne 'account';
 		next if $job->{up};
 		next if $job->{restart_at} && $job->{restart_at} > $now;
+		if ($REAL) {
+			my $open = _armed_on_login($jobs, $job->{account});
+			if (main::imsg_conn_limit_blocked($job->{account}, $open, $now)) {
+				my $until = main::imsg_conn_limit_until($job->{account});
+				$until = $now + 30 if !$until || $until <= $now;
+				$job->{restart_at} = $until;
+				next;
+			}
+		}
 		$job->{up} = 'pending';
 		$up->send(IMAPIDLE::IMSG_SPAWN, IMAPIDLE::json_encode({
 			id      => $id,
@@ -996,6 +1014,29 @@ sub _guard_channels {
 	}
 	main::set_external_probe($_, 1) for sort keys %ch;
 	return;
+}
+
+sub _same_login {
+	my ($a, $b) = @_;
+	return 0 unless $a && $b;
+	return 0 if ($a->{server} // '') ne ($b->{server} // '');
+	return 0 if (($a->{port} // 0) + 0) != (($b->{port} // 0) + 0);
+	return 0 if ($a->{user} // '') ne ($b->{user} // '');
+	return 1;
+}
+
+# Workers that finished LOGIN for this account's server, port, and user.
+sub _armed_on_login {
+	my ($jobs, $account, $skip) = @_;
+	my $acc = main::loaded_account($account) or return 0;
+	my $n = 0;
+	for my $job (values %$jobs) {
+		next if $skip && $job == $skip;
+		next unless $job->{armed};
+		my $other = main::loaded_account($job->{account}) or next;
+		$n++ if _same_login($acc, $other);
+	}
+	return $n;
 }
 
 sub _armed_imap {

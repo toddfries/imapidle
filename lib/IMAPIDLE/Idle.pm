@@ -54,11 +54,9 @@ sub run {
 		return;
 	}
 
-	my ($fh, $preauth) = _connect($info);
-	if (!$preauth) {
-		_authenticate($fh, $info, $secret);
-	}
+	my ($fh, $preauth) = _open_session($ib, $info, $secret, $account, $folder);
 	undef $secret;
+	return if !$fh;
 	my ($total, $uidnext) = _select_box($fh, $folder);
 	$ib->send(IMAPIDLE::IMSG_READY, IMAPIDLE::json_encode({
 		account => $account,
@@ -231,6 +229,35 @@ sub _drop {
 	return;
 }
 
+# Connect and log in. A user+IP cap is reported to the hub, not raised.
+sub _open_session {
+	my ($ib, $info, $secret, $account, $folder) = @_;
+	my ($fh, $preauth, $err);
+	eval {
+		($fh, $preauth) = _connect($info);
+		_authenticate($fh, $info, $secret) if !$preauth;
+		1;
+	} or $err = main::scrub($@, $secret);
+	if ($err) {
+		if (main::conn_limit_error($err)) {
+			$err = main::scrub($err);
+			$err =~ s/\s+/ /g;
+			$err = substr($err, 0, 160);
+			eval {
+				$ib->send(IMAPIDLE::IMSG_DROP, IMAPIDLE::json_encode({
+					account => $account // '',
+					folder  => $folder // '',
+					limit   => 1,
+					detail  => $err,
+				}));
+			};
+			return;
+		}
+		die "$err\n";
+	}
+	return ($fh, $preauth);
+}
+
 sub _leave {
 	my ($fh, $tag) = @_;
 	eval {
@@ -311,7 +338,10 @@ sub _authenticate {
 	}
 	my $tag = _cmd($fh, 'LOGIN '
 	    . _quote($info->{user}) . ' ' . _quote($secret));
-	_until_tag($fh, $tag);
+	eval { _until_tag($fh, $tag); 1 } or do {
+		my $err = main::scrub($@, $secret);
+		die ($err eq '' ? "login\n" : "$err\n");
+	};
 	return;
 }
 
@@ -364,10 +394,19 @@ sub _until_tag {
 	while (1) {
 		my $line = _line($fh);
 		return if $line =~ /^\Q$tag\E OK\b/i;
-		if ($line =~ /^\Q$tag\E (NO|BAD)\b(?:\s+\[([A-Za-z][A-Za-z0-9-]*)\])?/i) {
+		if ($line =~ /^\Q$tag\E (NO|BAD)\b\s*(.*)$/i) {
 			my $kind = uc $1;
-			my $code = $2 // '';
-			die "imap $tag $kind" . ($code ne '' ? " $code" : '') . "\n";
+			my $tail = $2 // '';
+			my $code = '';
+			$code = $1 if $tail =~ s/^\[([A-Za-z][A-Za-z0-9-]*)\]\s*//;
+			$tail =~ s/[^ -~]+/ /g;
+			$tail =~ s/\s+/ /g;
+			$tail =~ s/\A //;
+			$tail =~ s/ \z//;
+			$tail = substr($tail, 0, 120);
+			die "imap $tag $kind"
+			    . ($code ne '' ? " $code" : '')
+			    . ($tail ne '' ? " $tail" : '') . "\n";
 		}
 		$on->($line) if $on;
 	}
