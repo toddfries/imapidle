@@ -29,7 +29,6 @@ use IMAPIDLE::Imsg;
 
 sub run {
 	my ($sock) = @_;
-	IMAPIDLE::Imsg::set_title('imapidle: account');
 	my $ib = IMAPIDLE::Imsg->open(fileno($sock));
 	OpenBSD::Pledge::pledge(qw(stdio inet dns rpath recvfd))
 	    or die "account pledge: $!\n";
@@ -39,6 +38,7 @@ sub run {
 	my $info = IMAPIDLE::json_decode($msg->{data});
 	die "account login\n" unless $info && $info->{host} && $info->{user};
 	my $account = $info->{account} // '';
+	IMAPIDLE::Imsg::set_worker_title('account', $account, '');
 	my $secret = $info->{secret};
 	delete $info->{secret};
 	if (!main::secret_line_ok($secret)) {

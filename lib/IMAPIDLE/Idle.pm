@@ -36,7 +36,6 @@ my $SEQ = 0;
 
 sub run {
 	my ($sock) = @_;
-	IMAPIDLE::Imsg::set_title('imapidle: idle');
 	my $ib = IMAPIDLE::Imsg->open(fileno($sock));
 	OpenBSD::Pledge::pledge(qw(stdio inet dns rpath recvfd))
 	    or die "idle pledge: $!\n";
@@ -47,6 +46,7 @@ sub run {
 	die "idle login\n" unless $info && $info->{host} && $info->{user};
 	my $account = $info->{account} // '';
 	my $folder = $info->{folder} // 'INBOX';
+	IMAPIDLE::Imsg::set_worker_title('idle', $account, $folder);
 	my $secret = $info->{secret};
 	delete $info->{secret};
 	if (!main::secret_line_ok($secret)) {

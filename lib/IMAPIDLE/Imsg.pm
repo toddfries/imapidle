@@ -23,6 +23,34 @@ use XSLoader;
 
 XSLoader::load('IMAPIDLE::Imsg');
 
+# One argv string. ps shows this, and pgrep -xf matches it whole.
+sub worker_title {
+	my ($peer, $account, $folder) = @_;
+	$peer = ($peer // '') eq 'account' ? 'account' : 'idle';
+	my $title = "imapidle: $peer";
+	my $who = _title_part($account);
+	$title .= " $who" if $who ne '';
+	if ($peer eq 'idle') {
+		my $box = _title_part($folder);
+		$title .= " $box" if $box ne '';
+	}
+	return $title;
+}
+
+sub set_worker_title {
+	my ($peer, $account, $folder) = @_;
+	set_title(worker_title($peer, $account, $folder));
+	return;
+}
+
+sub _title_part {
+	my ($s) = @_;
+	return '' unless defined $s;
+	$s =~ s/[\r\n\t]+/ /g;
+	$s =~ s/^\s+|\s+$//g;
+	return $s;
+}
+
 sub open {
 	my ($class, $fd) = @_;
 	my $self = $class->new($fd + 0);

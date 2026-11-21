@@ -52,6 +52,37 @@ like($result, qr/^imsg ok account=fdc-main folder=INBOX total=3 saw=ping$/,
 waitpid($pid, 0);
 is($?, 0, 'the parent exits 0');
 
+is(IMAPIDLE::Imsg::worker_title('idle', 'title-acct', 'TitleBox'),
+    'imapidle: idle title-acct TitleBox',
+    'an idle title names the account and folder');
+is(IMAPIDLE::Imsg::worker_title('account', 'title-acct', ''),
+    'imapidle: account title-acct',
+    'a pulse title names the account');
+is(IMAPIDLE::Imsg::worker_title('idle', "a\nb", " c\td "),
+    'imapidle: idle a b c d',
+    'a title stays one line');
+
+pipe(my $title_r, my $title_w) or die "pipe: $!";
+my $named = fork();
+die "fork: $!" unless defined $named;
+if ($named == 0) {
+	close $title_r;
+	IMAPIDLE::Imsg::set_worker_title('idle', 'title-acct', 'TitleBox');
+	print $title_w "ready\n";
+	close $title_w;
+	sleep 30;
+	_exit(0);
+}
+close $title_w;
+my $title_ready = <$title_r>;
+like($title_ready, qr/^ready$/, 'the worker set its title');
+my $named_list = `pgrep -xf 'imapidle: idle title-acct TitleBox'`;
+like($named_list, qr/(^|\n)\Q$named\E(\n|\z)/,
+    'pgrep sees the account and folder')
+    or diag(`ps -p $named -ww -o pid,args`);
+kill 'TERM', $named;
+waitpid($named, 0);
+
 done_testing;
 
 sub _autoflush {

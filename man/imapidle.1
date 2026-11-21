@@ -62,6 +62,17 @@ before
 An account with no such process is synced on its timer.
 .Fl n
 is the same split, but it only logs the sync it would run.
+.Nm ps
+shows the supervisor as
+.Ql imapidle: parent
+and the hub as
+.Ql imapidle: hub .
+An idle process is
+.Ql imapidle: idle
+followed by its account and folder.
+A pulse process is
+.Ql imapidle: account
+followed by its account.
 .Pp
 Each account is independent.
 A bad password, a refused certificate, a dead server, or a broken

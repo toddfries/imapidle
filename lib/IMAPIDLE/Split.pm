@@ -204,6 +204,7 @@ sub _idle {
 	die "socket account\n" unless $info
 	    && $info->{account} eq 'fdc-main'
 	    && $info->{folder} eq 'INBOX';
+	IMAPIDLE::Imsg::set_worker_title('idle', $info->{account}, $info->{folder});
 	OpenBSD::Pledge::pledge('stdio')
 	    or die "idle pledge stdio: $!\n";
 	open my $fh, '+<&=', $msg->{fd} or die "mailbox fd: $!\n";
@@ -407,6 +408,8 @@ sub _spawn_worker {
 		# is what the hub's restart path waits on.
 		$SIG{TERM} = $SIG{INT} = $SIG{HUP} = $SIG{CHLD} = 'DEFAULT';
 		close $PARENT_FH if $PARENT_FH;
+		IMAPIDLE::Imsg::set_worker_title(
+		    $peer, $row->{account}, $row->{folder});
 		eval {
 			if ($peer eq 'account') {
 				require IMAPIDLE::Account;
