@@ -703,11 +703,16 @@ sub _dry_worker {
 			main::imsg_folder_up($job->{account}, $job->{folder}, 1)
 			    if $REAL;
 		}
+		# A login that finished after the cap was learned can be the
+		# one that fills the server. Close the extra folder here too.
+		_shed_login($jobs, $job, main::imsg_conn_limit_until($job->{account}))
+		    if $REAL;
 	} elsif ($REAL && $msg->{type} == IMAPIDLE::IMSG_DROP && $row->{limit}) {
 		my $open = _armed_on_login($jobs, $job->{account}, $job);
 		my $probe = main::note_imsg_conn_limit(
 		    $job->{account}, $row->{detail} // '', $open);
 		$job->{restart_at} = $probe if $probe && $probe > time();
+		_shed_login($jobs, $job, $probe);
 	} elsif ($msg->{type} == IMAPIDLE::IMSG_MAIL) {
 		my $n = ($row->{total} // 0) + 0;
 		if ($REAL) {
@@ -788,6 +793,7 @@ sub _dry_gone {
 	}
 	$job->{up} = 0;
 	$job->{armed} = 0;
+	$job->{limit_hold} = 0;
 	if ($REAL) {
 		if (($job->{kind} // '') eq 'account') {
 			main::imsg_folder_up($job->{account}, '', 0);
@@ -1037,6 +1043,55 @@ sub _armed_on_login {
 		$n++ if _same_login($acc, $other);
 	}
 	return $n;
+}
+
+# Close armed workers on this login until the stored cap remains.
+# The largest debounce leaves first. A pulse speaker stays while an
+# idle folder can go. A worker already told to leave is not asked again.
+sub _shed_login {
+	my ($jobs, $job, $probe) = @_;
+	return unless $job && $job->{account};
+	my $cap = main::imsg_conn_limit_cap($job->{account});
+	return if !$cap || $cap < 1;
+	my $now = time();
+	return if !$probe || $probe <= $now;
+	my $acc = main::loaded_account($job->{account}) or return;
+	my @live;
+	for my $other (values %$jobs) {
+		next unless $other->{armed} && !$other->{limit_hold};
+		next if ($other->{kind} // '') ne 'idle'
+		    && ($other->{kind} // '') ne 'account';
+		my $oa = main::loaded_account($other->{account}) or next;
+		next unless _same_login($acc, $oa);
+		push @live, $other;
+	}
+	@live = sort {
+		_shed_rank($a) <=> _shed_rank($b)
+		    || ($a->{id} // '') cmp ($b->{id} // '')
+	} @live;
+	while (@live > $cap) {
+		my $drop = shift @live;
+		$drop->{limit_hold} = 1;
+		$drop->{restart_at} = $probe;
+		my $who = main::_log_name($drop->{channel} // $drop->{account});
+		if (($drop->{kind} // '') eq 'account') {
+			main::log_warn("$who: pulse speaker paused for the "
+			    . 'connection limit');
+		} else {
+			main::log_warn("$who: idle $drop->{folder} paused for the "
+			    . 'connection limit');
+		}
+		eval { $drop->{ib}->send(IMAPIDLE::IMSG_SHUTDOWN, '') }
+		    if $drop->{ib};
+	}
+	return;
+}
+
+# Smaller rank leaves first.
+sub _shed_rank {
+	my ($job) = @_;
+	return 1_000_000 if ($job->{kind} // '') eq 'account';
+	return -($job->{debounce} // 0);
 }
 
 sub _armed_imap {

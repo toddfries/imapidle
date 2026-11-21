@@ -503,4 +503,140 @@ my $silent = stderr_of(sub {
 });
 unlike($silent, qr/\.auth /, 'without verbose the mechanisms stay quiet');
 
+clear_conn_limit_for_test();
+my $none_open = stderr_of(sub {
+    is(note_imsg_conn_limit('acct', $LIMIT, 0), 0,
+        'no armed sibling records no cap');
+});
+ok(!conn_limit_row_for_test('acct'), 'a zero open count writes no row');
+unlike($none_open, qr/connection limit/, 'a zero open count is not logged');
+
+my $plain_cap = stderr_of(sub {
+    ok(note_imsg_conn_limit('acct', 'Too many connections', 5) > time(),
+        'five armed siblings record a week probe');
+});
+is(imsg_conn_limit_cap('acct'), 5, 'without a server number the cap is the open count');
+like($plain_cap, qr/connection limit 5, probe in \d+s/,
+    'the imsg cap is logged');
+unlike($plain_cap, qr/connection limit 5, server/,
+    'a missing server number is left off the imsg line');
+
+my $lowered = stderr_of(sub {
+    ok(note_imsg_conn_limit('acct', $LIMIT, 5) > time(),
+        'a numbered refusal schedules the probe again');
+});
+is(imsg_conn_limit_cap('acct'), 4,
+    'the cap stays one below the server number so mbsync can log in');
+is(conn_limit_row_for_test('acct')->{server_max}, 5,
+    'the server number is stored beside the imsg cap');
+like($lowered, qr/connection limit 4, server 5, probe in \d+s/,
+    'the lowered cap is logged with the server number');
+
+my $kept = stderr_of(sub {
+    note_imsg_conn_limit('acct', $LIMIT, 5);
+});
+is(imsg_conn_limit_cap('acct'), 4, 'a later refusal does not raise the cap');
+like($kept, qr/connection limit 4, server 5/,
+    'the same cap is logged again');
+
+clear_conn_limit_for_test();
+stderr_of(sub { note_imsg_conn_limit('acct', 'Too many connections', 2) });
+stderr_of(sub { note_imsg_conn_limit('acct', $LIMIT, 5) });
+is(imsg_conn_limit_cap('acct'), 2,
+    'a smaller learned cap is not replaced by the server number');
+
+reset_schedule_for_test();
+my $qnow = time();
+my $requeued = stderr_of(sub {
+    requeue_after_conn_limit({
+        args => [ 'ch:INBOX', 'ch:Junk', 'nocolon' ],
+    });
+});
+my $qdl = schedule_deadline('ch');
+ok(defined $qdl && $qdl >= $qnow + 9 && $qdl <= $qnow + 12,
+    'a refused sync is tried again in about ten seconds') or diag($qdl);
+like($requeued, qr/mbsync hit the connection limit, retry in 10s/,
+    'the retry is logged once');
+my $quiet_q = stderr_of(sub {
+    requeue_after_conn_limit({ args => ['nocolon'] });
+});
+unlike($quiet_q, qr/connection limit/, 'an unrelated argument is not a retry');
+
+clear_conn_limit_for_test();
+my $probe = 0;
+my $shed_log = stderr_of(sub {
+    $probe = note_imsg_conn_limit('acct', $LIMIT, 5);
+});
+ok($probe > time(), 'the shed probe is in the future');
+like($shed_log, qr/connection limit 4, server 5/,
+    'five open sessions and a server max of 5 store 4');
+
+my $built = system('make', '-C', 'ext/imsg');
+is($built, 0, 'the imsg wrapper builds') or BAIL_OUT('imsg build failed');
+unshift @INC, 'lib', 'blib';
+require IMAPIDLE::Split;
+
+{
+    package ShedIb;
+    sub new { return bless { n => 0, type => 0 }, $_[0]; }
+    sub send {
+        my ($self, $type) = @_;
+        $self->{n}++;
+        $self->{type} = $type;
+        return 1;
+    }
+}
+
+sub shed_job {
+    my ($id, $account, $folder, $kind, $debounce) = @_;
+    return {
+        id         => $id,
+        account    => $account,
+        folder     => $folder,
+        channel    => (loaded_account($account) || {})->{mbsync_channel} // $account,
+        kind       => $kind,
+        debounce   => $debounce,
+        armed      => 1,
+        ib         => ShedIb->new,
+        restart_at => 0,
+    };
+}
+
+my $failed = shed_job('fail', 'acct', 'More', 'idle', 420);
+$failed->{armed} = 0;
+my %jobs = (
+    fail => $failed,
+    a    => shed_job('a', 'acct', 'A', 'idle', 7),
+    b    => shed_job('b', 'acct', 'B', 'idle', 20),
+    c    => shed_job('c', 'acct', 'C', 'idle', 100),
+    d    => shed_job('d', 'acct', 'D', 'idle', 420),
+    e    => shed_job('e', 'acct2', 'INBOX', 'account', 0),
+    f    => shed_job('f', 'other', 'INBOX', 'idle', 999),
+);
+my $paused = stderr_of(sub {
+    IMAPIDLE::Split::_shed_login(\%jobs, $failed, $probe);
+});
+is($jobs{d}{ib}{n}, 1, 'the lowest priority folder is told to exit');
+is($jobs{d}{ib}{type}, IMAPIDLE::IMSG_SHUTDOWN(), 'that exit is a shutdown');
+is($jobs{d}{restart_at}, $probe, 'the paused folder waits for the probe');
+ok($jobs{d}{limit_hold}, 'the paused folder is not asked twice');
+is($jobs{a}{ib}{n}, 0, 'a short gap stays up');
+is($jobs{b}{ib}{n}, 0, 'the next short gap stays up');
+is($jobs{c}{ib}{n}, 0, 'a middle gap stays up on the first pass');
+is($jobs{e}{ib}{n}, 0, 'a pulse speaker stays while an idle folder can leave');
+is($jobs{f}{ib}{n}, 0, 'a different user is not paused');
+like($paused, qr/acct +: idle D paused for the connection limit/,
+    'the paused folder is logged');
+unlike($paused, qr/other +: idle/, 'the other user is not in that log');
+
+$jobs{h} = shed_job('h', 'acct', 'H', 'idle', 50);
+stderr_of(sub {
+    IMAPIDLE::Split::_shed_login(\%jobs, $failed, $probe);
+});
+is($jobs{d}{ib}{n}, 1, 'the folder already leaving is not shut down again');
+is($jobs{c}{ib}{n}, 1, 'the next lowest priority leaves when another arms');
+is($jobs{h}{ib}{n}, 0, 'a hotter folder than that one stays');
+is($jobs{e}{ib}{n}, 0, 'the pulse speaker still stays');
+is($jobs{c}{restart_at}, $probe, 'the second pause waits for the same probe');
+
 done_testing;

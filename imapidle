@@ -4736,11 +4736,16 @@ sub note_imsg_conn_limit {
     my $key = _conn_limit_key($acc) or return 0;
     $open = 0 if !defined $open || $open < 0;
     return 0 if $open < 1;
-    my $row = $CONN_LIMIT{$key};
-    if (!$row || !defined $row->{cap}) {
-        $row = { cap => int($open) };
-    }
+    my $row = $CONN_LIMIT{$key} //= {};
     my $max = _conn_limit_server_max($err);
+    my $cap = int($open);
+    # mbsync logs in as this same user and needs one of the server's slots.
+    if (defined $max && $max > 1 && $cap > $max - 1) {
+        $cap = $max - 1;
+    }
+    if (!defined $row->{cap} || $row->{cap} > $cap) {
+        $row->{cap} = $cap;
+    }
     $row->{server_max} = $max if defined $max;
     _conn_limit_schedule($row);
     $CONN_LIMIT{$key} = $row;
@@ -4769,6 +4774,30 @@ sub imsg_conn_limit_until {
     my $key = _conn_limit_key($acc) or return 0;
     my $row = $CONN_LIMIT{$key} or return 0;
     return $row->{probe} // 0;
+}
+
+sub imsg_conn_limit_cap {
+    my ($name) = @_;
+    my $acc = $accounts{$name} or return 0;
+    my $key = _conn_limit_key($acc) or return 0;
+    my $row = $CONN_LIMIT{$key} or return 0;
+    return $row->{cap} // 0;
+}
+
+# The startup sync lost the race with IDLE. Try the same folders once
+# the extra worker has been dropped.
+sub requeue_after_conn_limit {
+    my ($rec) = @_;
+    return unless ref $rec eq 'HASH' && ref $rec->{args} eq 'ARRAY';
+    my $now = time();
+    my $n = 0;
+    for my $arg (@{ $rec->{args} }) {
+        next unless defined $arg && $arg =~ /^([^:]+):(.+)$/;
+        queue_folder($1, $2, $now, $now + 10);
+        $n++;
+    }
+    log_warn('mbsync hit the connection limit, retry in 10s') if $n;
+    return;
 }
 
 sub _conn_limit_save {
@@ -5520,6 +5549,7 @@ sub reap_children {
             log_info($line);
         } else {
             log_warn($line);
+            requeue_after_conn_limit($rec) if conn_limit_error($errline);
         }
         if (ref $rec eq 'HASH' && ($rec->{pulse} // '') ne '' && ($rec->{track} // '') eq '') {
             finish_pulse_channel($rec->{pulse});
