@@ -320,11 +320,18 @@ sub _select_box {
 	my $tag = _cmd($fh, 'SELECT ' . _quote($folder));
 	my $total = 0;
 	my $uidnext = 0;
-	_until_tag($fh, $tag, sub {
-		my ($line) = @_;
-		$total = $1 + 0 if $line =~ /^\* (\d+) EXISTS\b/i;
-		$uidnext = $1 + 0 if $line =~ /^\* OK \[UIDNEXT (\d+)\]/i;
-	});
+	eval {
+		_until_tag($fh, $tag, sub {
+			my ($line) = @_;
+			$total = $1 + 0 if $line =~ /^\* (\d+) EXISTS\b/i;
+			$uidnext = $1 + 0 if $line =~ /^\* OK \[UIDNEXT (\d+)\]/i;
+		});
+		1;
+	} or do {
+		my $err = main::scrub($@);
+		$err = 'imap failed' if $err eq '';
+		die "$folder: $err\n";
+	};
 	return ($total, $uidnext);
 }
 
@@ -351,12 +358,17 @@ sub _send {
 	return;
 }
 
+# Response code only. The rest of a NO line can echo the command.
 sub _until_tag {
 	my ($fh, $tag, $on) = @_;
 	while (1) {
 		my $line = _line($fh);
 		return if $line =~ /^\Q$tag\E OK\b/i;
-		die "imap failed\n" if $line =~ /^\Q$tag\E (NO|BAD)\b/i;
+		if ($line =~ /^\Q$tag\E (NO|BAD)\b(?:\s+\[([A-Za-z][A-Za-z0-9-]*)\])?/i) {
+			my $kind = uc $1;
+			my $code = $2 // '';
+			die "imap $tag $kind" . ($code ne '' ? " $code" : '') . "\n";
+		}
 		$on->($line) if $on;
 	}
 }
@@ -366,7 +378,11 @@ sub _until_plus {
 	while (1) {
 		my $line = _line($fh);
 		return if $line =~ /^\+/;
-		die "imap idle\n" if $line =~ /^\Q$tag\E (NO|BAD)\b/i;
+		if ($line =~ /^\Q$tag\E (NO|BAD)\b(?:\s+\[([A-Za-z][A-Za-z0-9-]*)\])?/i) {
+			my $kind = uc $1;
+			my $code = $2 // '';
+			die "imap $tag $kind" . ($code ne '' ? " $code" : '') . "\n";
+		}
 	}
 }
 
