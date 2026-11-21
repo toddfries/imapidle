@@ -41,6 +41,10 @@ our $IDLE;
 our $PARENT_FH;
 our %WORKER_PID;
 
+# Live hub: mbsync and state live here. -n leaves this off.
+my $REAL = 0;
+my %FLIGHT;
+
 END {
 	return if !$ACTIVE || $IS_CHILD;
 	kill 'TERM', $HUB if $HUB;
@@ -253,15 +257,25 @@ sub _autoflush {
 
 # imapidle -n. The hub loads config and state. This process only
 # supervises. A dead hub ends the parent.
+sub serve_live {
+	my ($config, $foreground) = @_;
+	$REAL = 1;
+	return serve($config, $foreground);
+}
+
 sub serve {
 	my ($config, $foreground) = @_;
 	die "dry config\n" if !defined $config || $config eq '';
 	$ACTIVE = 1;
 	main::daemonize() if !$foreground;
 	IMAPIDLE::Imsg::set_title('imapidle: parent');
-	OpenBSD::Pledge::pledge(
-	    qw(stdio proc exec rpath sendfd recvfd inet dns unix unveil))
-	    or die "parent pledge: $!\n";
+	# mbsync is exec'd by the live hub and keeps this pledge.
+	# -n never execs it, so that parent can be narrowed.
+	if (!$REAL) {
+		OpenBSD::Pledge::pledge(
+		    qw(stdio proc exec rpath sendfd recvfd inet dns unix unveil))
+		    or die "parent pledge: $!\n";
+	}
 
 	my ($to_hub, $to_parent) = _spair();
 	$HUB = fork();
@@ -270,7 +284,13 @@ sub serve {
 		$IS_CHILD = 1;
 		$ACTIVE = 0;
 		close $to_hub;
-		eval { _dry_hub($to_parent, $config) };
+		eval {
+			if ($REAL) {
+				_live_hub($to_parent, $config);
+			} else {
+				_dry_hub($to_parent, $config);
+			}
+		};
 		warn $@ if $@;
 		_exit($@ ? 1 : 0);
 	}
@@ -289,7 +309,9 @@ sub _parent_loop {
 	my $hub_status = 0;
 	local $SIG{TERM} = sub { $stop = 1 };
 	local $SIG{INT}  = sub { $stop = 1 };
-	local $SIG{HUP}  = 'IGNORE';
+	local $SIG{HUP}  = $REAL
+	    ? sub { kill 'HUP', $HUB if defined $HUB && $HUB }
+	    : 'IGNORE';
 	local $SIG{PIPE} = 'IGNORE';
 	while (!$hub_dead) {
 		_reap(\$hub_dead, \$hub_status);
@@ -313,7 +335,10 @@ sub _parent_loop {
 			_spawn_worker($ctl, $row);
 		}
 	}
-	my $code = ($stopped && $hub_status == 0) ? 0 : 1;
+	# A live hub that exits 0 asked to stop (control socket or the
+	# shutdown file). -n still requires the parent's own signal.
+	my $clean = ($hub_status == 0) && ($stopped || $REAL);
+	my $code = $clean ? 0 : 1;
 	_finish($code);
 }
 
@@ -469,6 +494,7 @@ sub _dry_jobs {
 					proto    => $acc->{proto} // 'tls',
 					user     => $acc->{user},
 					auth     => $acc->{auth} // 'login',
+					wait     => $acc->{wait} // 0,
 					debounce => $folder->{debounce}
 					    || main::calculate_debounce($folder->{priority} // 5),
 					resync   => $folder->{resync} || main::default_resync(),
@@ -525,6 +551,7 @@ sub _dry_jobs {
 				proto    => $acc->{proto} // 'tls',
 				user     => $acc->{user},
 				auth     => $acc->{auth} // 'login',
+				wait     => $acc->{wait} // 0,
 				boxes    => \@probe,
 				seen     => {},
 				backoff  => 2,
@@ -568,6 +595,11 @@ sub _dry_drain {
 sub _dry_parent {
 	my ($msg, $up, $jobs, $sel, $fd_job) = @_;
 	if ($msg->{type} == IMAPIDLE::IMSG_SHUTDOWN) {
+		# Let a running mbsync finish. -n has nothing to wait for.
+		if ($REAL) {
+			main::request_shutdown('TERM');
+			return 0;
+		}
 		return 1;
 	}
 	if ($msg->{type} != IMAPIDLE::IMSG_ATTACH) {
@@ -626,21 +658,39 @@ sub _dry_worker {
 			my $word = $n == 1 ? 'mailbox' : 'mailboxes';
 			my $who = main::_log_name($job->{channel});
 			main::log_info("$who: pulse speaker up, $n $word");
-			for my $box (@{ $job->{boxes} // [] }) {
-				$job->{ib}->send(IMAPIDLE::IMSG_PROBE,
-				    IMAPIDLE::json_encode({ box => $box }));
+			if ($REAL) {
+				main::imsg_folder_up($job->{account}, '', 1);
+			} else {
+				for my $box (@{ $job->{boxes} // [] }) {
+					$job->{ib}->send(IMAPIDLE::IMSG_PROBE,
+					    IMAPIDLE::json_encode({ box => $box }));
+				}
 			}
 		} else {
 			$job->{total} = ($row->{total} // 0) + 0;
 			$job->{uidnext} = ($row->{uidnext} // 0) + 0;
 			$job->{startup} = 1;
+			main::imsg_folder_up($job->{account}, $job->{folder}, 1)
+			    if $REAL;
 		}
 	} elsif ($msg->{type} == IMAPIDLE::IMSG_MAIL) {
 		my $n = ($row->{total} // 0) + 0;
-		$job->{pending} = 1 if !defined $job->{total} || $n > $job->{total};
+		if ($REAL) {
+			main::note_mail_event(
+			    $job->{channel}, $job->{folder},
+			    $job->{debounce} // 0,
+			    $job->{wait} // 0,
+			) if $n > ($job->{total} // 0);
+		} else {
+			$job->{pending} = 1 if !defined $job->{total} || $n > $job->{total};
+		}
 		$job->{total} = $n;
 	} elsif ($msg->{type} == IMAPIDLE::IMSG_COUNT) {
-		_dry_count($job, $row, $jobs);
+		if ($REAL) {
+			_live_count($job, $row);
+		} else {
+			_dry_count($job, $row, $jobs);
+		}
 	}
 	return;
 }
@@ -703,6 +753,14 @@ sub _dry_gone {
 	}
 	$job->{up} = 0;
 	$job->{armed} = 0;
+	if ($REAL) {
+		if (($job->{kind} // '') eq 'account') {
+			main::imsg_folder_up($job->{account}, '', 0);
+		} else {
+			main::imsg_folder_up($job->{account}, $job->{folder}, 0);
+		}
+		_drop_flight($job->{channel});
+	}
 	my $wait = $job->{backoff} || 2;
 	$job->{restart_at} = $now + $wait;
 	$wait *= 2;
@@ -853,6 +911,201 @@ sub _dry_wake {
 	$d = 0.05 if $d < 0.05;
 	$d = 30 if $d > 30;
 	return $d;
+}
+
+sub _live_count {
+	my ($job, $row) = @_;
+	my $box = $row->{box} // '';
+	return if $box eq '';
+	my $id = ($job->{channel} // '') . "\0" . $box;
+	delete $FLIGHT{$id};
+	return unless defined $row->{messages} && defined $row->{uidnext};
+	main::note_status_sample(
+	    $job->{channel}, $box,
+	    $row->{messages} + 0, $row->{uidnext} + 0, time(),
+	);
+	return;
+}
+
+sub _drop_flight {
+	my ($channel) = @_;
+	return unless defined $channel && $channel ne '';
+	for my $id (keys %FLIGHT) {
+		my ($ch) = split /\0/, $id, 2;
+		delete $FLIGHT{$id} if defined $ch && $ch eq $channel;
+	}
+	return;
+}
+
+sub _live_summary {
+	my ($jobs) = @_;
+	my $idle = 0;
+	my $speakers = 0;
+	for my $job (values %$jobs) {
+		$idle++ if ($job->{kind} // '') eq 'idle';
+		$speakers++ if ($job->{kind} // '') eq 'account';
+	}
+	my $rows = main::loaded_track_rows();
+	main::log_info("imsg: $idle idle folder(s), $speakers pulse speaker(s), "
+	    . "$rows track row(s)");
+	return;
+}
+
+sub _guard_channels {
+	my ($jobs) = @_;
+	my %ch;
+	for my $job (values %$jobs) {
+		my $kind = $job->{kind} // '';
+		next if $kind ne 'idle' && $kind ne 'account';
+		my $name = $job->{channel} // '';
+		next if $name eq '';
+		$ch{$name} = 1;
+	}
+	main::set_external_probe($_, 1) for sort keys %ch;
+	return;
+}
+
+sub _armed_imap {
+	my ($jobs) = @_;
+	my $n = 0;
+	for my $job (values %$jobs) {
+		my $kind = $job->{kind} // '';
+		next if $kind ne 'idle' && $kind ne 'account';
+		$n++ if $job->{armed};
+	}
+	return $n;
+}
+
+# One worker per channel answers STATUS. A pulse speaker wins over an
+# IDLE folder. At most 40 are in flight, which is the probe batch.
+sub _live_probes {
+	my ($jobs) = @_;
+	my $now = time();
+	my %prober;
+	for my $id (sort keys %$jobs) {
+		my $job = $jobs->{$id};
+		next unless $job->{armed} && $job->{ib};
+		my $kind = $job->{kind} // '';
+		next if $kind ne 'idle' && $kind ne 'account';
+		my $ch = $job->{channel} // '';
+		next if $ch eq '';
+		my $cur = $prober{$ch};
+		if (!$cur || ($kind eq 'account' && ($cur->{kind} // '') ne 'account')) {
+			$prober{$ch} = $job;
+		}
+	}
+	for my $ch (sort keys %prober) {
+		my $job = $prober{$ch};
+		my $n = 0;
+		for my $id (keys %FLIGHT) {
+			my ($fch) = split /\0/, $id, 2;
+			$n++ if defined $fch && $fch eq $ch;
+		}
+		my $room = 40 - $n;
+		next if $room <= 0;
+		for my $id (main::due_unprobed_ids($ch, $now)) {
+			last if $room <= 0;
+			next if $FLIGHT{$id};
+			my (undef, $box) = split /\0/, $id, 2;
+			next if !defined $box || $box eq '';
+			$job->{ib}->send(IMAPIDLE::IMSG_PROBE,
+			    IMAPIDLE::json_encode({ box => $box }));
+			$FLIGHT{$id} = 1;
+			$room--;
+		}
+	}
+	return;
+}
+
+sub _service_sync {
+	my ($sel, $have) = @_;
+	my %want;
+	for my $fh (main::service_fds()) {
+		my $fd = fileno($fh);
+		next unless defined $fd;
+		$want{$fd} = $fh;
+		$sel->add($fh) unless $have->{$fd};
+		$have->{$fd} = $fh;
+	}
+	for my $fd (keys %$have) {
+		next if $want{$fd};
+		$sel->remove($have->{$fd}) if $have->{$fd};
+		delete $have->{$fd};
+	}
+	return;
+}
+
+sub _live_hub {
+	my ($up_fh, $config) = @_;
+	$SIG{TERM} = $SIG{INT} = 'DEFAULT';
+	$SIG{PIPE} = 'IGNORE';
+	$SIG{HUP} = \&main::request_reload;
+	IMAPIDLE::Imsg::set_title('imapidle: hub');
+	main::set_imsg_sched(1);
+	my $err = main::load_config($config);
+	if ($err) {
+		main::log_error($err);
+		die "$err\n";
+	}
+	main::open_state_dir();
+	main::install_chld_signal();
+	main::install_info_signal();
+	# Those installs block CHLD and INFO except across pselect.
+	# This loop waits with select, so the handlers have to run.
+	main::_restore_wake_mask();
+	main::ctl_listen();
+	main::prime_named_folders(time());
+
+	my $up = IMAPIDLE::Imsg->open(fileno($up_fh));
+	my $sel = IO::Select->new($up_fh);
+	my %fd_job;
+	my %have;
+	my %jobs = _dry_jobs();
+	_guard_channels(\%jobs);
+	_live_summary(\%jobs);
+	my $quit = 0;
+	while (!$quit) {
+		$quit = _dry_drain($up, \%jobs, $sel, \%fd_job);
+		last if $quit;
+		main::set_imsg_conn_count(_armed_imap(\%jobs));
+		_dry_spawn($up, time(), \%jobs);
+		main::refresh_local_state();
+		main::reap_children();
+		main::apply_reload();
+		my $phase = main::shutdown_phase();
+		if ($phase eq 'exit') {
+			main::_close_for_shutdown();
+			last;
+		}
+		if (!$phase) {
+			main::pump_schedule();
+			_live_probes(\%jobs);
+		}
+		my $now = time();
+		my $wait = main::loop_timeout();
+		my $jobs_wait = _dry_wake($now, \%jobs);
+		$wait = $jobs_wait if !defined $wait || $jobs_wait < $wait;
+		$wait = 1 if $phase eq 'wait' && (!defined $wait || $wait < 1);
+		$wait = 30 if !defined $wait || $wait > 30;
+		$wait = 0.05 if $wait < 0.05;
+		_service_sync($sel, \%have);
+		my @ready = $sel->can_read($wait);
+		if (!@ready && $! && $!{EINTR}) {
+			next;
+		}
+		for my $fh (@ready) {
+			if (main::service_ready($fh)) {
+				next;
+			}
+			$quit = _dry_read($fh, $up_fh, $up, \%jobs, \%fd_job, $sel);
+			last if $quit;
+		}
+	}
+	for my $job (values %jobs) {
+		next unless $job->{ib};
+		eval { $job->{ib}->send(IMAPIDLE::IMSG_SHUTDOWN, '') };
+	}
+	return;
 }
 
 1;

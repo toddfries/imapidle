@@ -44,6 +44,25 @@ and exits.
 The pid in that line is the process that keeps running.
 A failed fork is one error line from the starting process.
 .Pp
+The running daemon is a supervisor and a hub.
+The hub holds the configuration, the state, and the schedule.
+It runs
+.Sy mbsync
+and does not open an IMAP socket.
+Each watched folder is a process that logs in and stays in
+.Cm IDLE .
+Each pulse account is a process that logs in and runs
+.Cm STATUS
+when the schedule asks.
+A tracked mailbox on an account that has one of those processes
+is checked with
+.Cm STATUS
+before
+.Sy mbsync .
+An account with no such process is synced on its timer.
+.Fl n
+is the same split, but it only logs the sync it would run.
+.Pp
 Each account is independent.
 A bad password, a refused certificate, a dead server, or a broken
 mailbox connection is logged and retried on that account.

@@ -94,7 +94,16 @@ my $CTL_PATH;
 my $CTL_LISTEN;
 my %CTL_CLIENT;
 my $MBSYNC_BIN = '/usr/local/bin/mbsync';
+# Tests point this at a stand-in. A relative path is ignored.
+$MBSYNC_BIN = $ENV{IMAPIDLE_MBSYNC}
+    if defined $ENV{IMAPIDLE_MBSYNC} && $ENV{IMAPIDLE_MBSYNC} =~ m{^/};
 my $TRIGGER_HOOK;
+# The imsg hub does not hold IMAP sockets. These record the workers
+# so the old schedule does not try to connect, or spin while it waits.
+my $IMSG_SCHED = 0;
+my $IMSG_CONNS = 0;
+my %IMSG_UP;
+my %EXTERNAL_PROBE;
 my $select = IO::Select->new();
 my $IO_MAX = 45;
 # One IMAP command, not one untagged line. EXISTS during DONE used to
@@ -4325,6 +4334,35 @@ sub next_poll_delay {
     return $wait;
 }
 
+sub set_imsg_sched { $IMSG_SCHED = $_[0] ? 1 : 0 }
+
+sub set_imsg_conn_count { $IMSG_CONNS = ($_[0] // 0) + 0 }
+
+# $folder empty marks the pulse speaker for this account.
+sub imsg_folder_up {
+    my ($name, $folder, $up) = @_;
+    return unless defined $name && $name ne '';
+    $folder = '' unless defined $folder;
+    my $key = "$name\0$folder";
+    if ($up) {
+        $IMSG_UP{$key} = 1;
+    } else {
+        delete $IMSG_UP{$key};
+    }
+}
+
+# Channels whose STATUS runs in a worker. due_tracked waits for that
+# sample instead of starting mbsync for every row that is already due.
+sub set_external_probe {
+    my ($channel, $on) = @_;
+    return unless defined $channel && $channel ne '';
+    if ($on) {
+        $EXTERNAL_PROBE{$channel} = 1;
+    } else {
+        delete $EXTERNAL_PROBE{$channel};
+    }
+}
+
 sub account_covered {
     my ($name) = @_;
     return 1 if $conns{"$name:NOTIFY"};
@@ -4333,9 +4371,13 @@ sub account_covered {
     my $acc = $accounts{$name} or return 0;
     my $role = $acc->{role} // '';
     return 1 if $role eq 'account';
-    return 0 if $role eq 'pulse';
+    if ($role eq 'pulse') {
+        return $IMSG_UP{"$name\0"} ? 1 : 0;
+    }
     for my $f (@{ $acc->{folders} }) {
-        return 0 unless $conns{"$name:$f->{name}"};
+        my $box = $f->{name} // '';
+        return 0 if $box eq '';
+        return 0 unless $conns{"$name:$box"} || $IMSG_UP{"$name\0$box"};
     }
     return 1;
 }
@@ -7121,7 +7163,6 @@ sub _probe_channel {
     }
     my $empty_n = 0;
     my $sync_n  = 0;
-    my $gap = $track_cfg->{empty} // 86400;
     my $ok = eval {
         if ($idle) {
             my ($left, @done) = _leave_idle($conn);
@@ -7138,47 +7179,9 @@ sub _probe_channel {
                 );
             });
             my ($messages, $uidnext) = parse_status_counts(join("\n", @resp));
-            if (!defined $messages) {
-                $rec->{await_sync} = 1;
-                $sync_n++;
-                next;
-            }
-            my $prev = $rec->{uidnext};
-            my $was_empty = $rec->{empty} ? 1 : 0;
-            $rec->{uidnext}  = $uidnext;
-            $rec->{messages} = $messages;
-            if (status_stays_empty($messages, $uidnext, $prev)) {
-                $rec->{empty} = 1;
-                if ($rec->{pulse}) {
-                    $rec->{classified} = 1;
-                    delete $rec->{seed};
-                }
-                unless (defined $rec->{confirm}) {
-                    my $week = $track_cfg->{confirm} // 604800;
-                    $rec->{confirm} = $now + with_quarter_spread($week);
-                }
-                if ($rec->{confirm} <= $now) {
-                    _arm_confirm($channel, $box, $rec);
-                    $sync_n++;
-                    next;
-                }
-                $rec->{await_sync} = 0;
-                $rec->{confirming} = 0;
-                $rec->{next}       = $now + $gap;
-                $empty_n++;
-                next;
-            }
-            if ($rec->{pulse} && !$rec->{classified}) {
-                _classify_pulse_mail($rec, $channel, $box, $now);
-                $sync_n++ if $rec->{await_sync};
-                next;
-            }
-            $rec->{empty}      = 0;
-            $rec->{await_sync} = 1;
-            delete $rec->{confirm};
-            $rec->{confirming} = 0;
-            $sync_n++;
-            log_info(_log_name($channel) . ": $box has mail") if $was_empty;
+            my $kind = note_status_sample($channel, $box, $messages, $uidnext, $now);
+            $empty_n++ if $kind eq 'empty';
+            $sync_n++ if $kind eq 'sync';
         }
         1;
     };
@@ -7220,13 +7223,67 @@ sub probe_tracked {
     }
 }
 
+sub due_unprobed_ids { return _due_unprobed(@_) }
+
 sub _needs_probe {
     my ($id, $now) = @_;
     my $rec = $track{$id} or return 0;
     return 0 if $rec->{await_sync};
     return 0 if ($rec->{next} // 0) > $now;
     my ($ch) = split /\0/, $id, 2;
-    return _primary_for_channel($ch) ? 1 : 0;
+    return 0 if !defined $ch || $ch eq '';
+    return 1 if _primary_for_channel($ch);
+    return 1 if $EXTERNAL_PROBE{$ch};
+    return 0;
+}
+
+# One STATUS sample for a tracked mailbox. 'empty' and 'sync' match
+# the counters _probe_channel used to keep itself. '' is a sample
+# that did not arm a sync.
+sub note_status_sample {
+    my ($channel, $box, $messages, $uidnext, $now) = @_;
+    return '' if !defined $channel || $channel eq '';
+    return '' if !defined $box || $box eq '';
+    $now //= time();
+    my $rec = $track{ _track_key($channel, $box) } or return '';
+    if (!defined $messages) {
+        $rec->{await_sync} = 1;
+        return 'sync';
+    }
+    my $prev = $rec->{uidnext};
+    my $was_empty = $rec->{empty} ? 1 : 0;
+    $rec->{uidnext}  = $uidnext;
+    $rec->{messages} = $messages;
+    my $gap = $track_cfg->{empty} // 86400;
+    if (status_stays_empty($messages, $uidnext, $prev)) {
+        $rec->{empty} = 1;
+        if ($rec->{pulse}) {
+            $rec->{classified} = 1;
+            delete $rec->{seed};
+        }
+        unless (defined $rec->{confirm}) {
+            my $week = $track_cfg->{confirm} // 604800;
+            $rec->{confirm} = $now + with_quarter_spread($week);
+        }
+        if ($rec->{confirm} <= $now) {
+            _arm_confirm($channel, $box, $rec);
+            return 'sync';
+        }
+        $rec->{await_sync} = 0;
+        $rec->{confirming} = 0;
+        $rec->{next}       = $now + $gap;
+        return 'empty';
+    }
+    if ($rec->{pulse} && !$rec->{classified}) {
+        _classify_pulse_mail($rec, $channel, $box, $now);
+        return $rec->{await_sync} ? 'sync' : '';
+    }
+    $rec->{empty}      = 0;
+    $rec->{await_sync} = 1;
+    delete $rec->{confirm};
+    $rec->{confirming} = 0;
+    log_info(_log_name($channel) . ": $box has mail") if $was_empty;
+    return 'sync';
 }
 
 sub pump_tracked {
@@ -7850,6 +7907,16 @@ sub loop_timeout {
             next;
         }
         next if account_covered($name);
+        if ($IMSG_SCHED) {
+            # The worker is the login. An unset next_try is not a
+            # connect that this process should spin on.
+            my $due = $acc->{next_try} // 0;
+            if ($due > $now) {
+                my $d = $due - $now;
+                $wait = $d if $d < $wait;
+            }
+            next;
+        }
         # A learned cap must not busy-poll. The week stays out of
         # next_try so a dropped session can be replaced up to the cap.
         # A real backoff and a nearer probe wait for the later one.
@@ -8675,7 +8742,7 @@ sub ctl_nodes {
     _ctl_put(\%n, 'shutdown', _shutdown_wanted() ? 1 : 0);
     _ctl_put(\%n, 'pause', operations_paused() ? 1 : 0);
     _ctl_put(\%n, 'accounts', scalar keys %accounts);
-    _ctl_put(\%n, 'connections', scalar keys %conns);
+    _ctl_put(\%n, 'connections', (scalar keys %conns) + $IMSG_CONNS);
     _ctl_put(\%n, 'mbsync', scalar keys %children);
     _ctl_put(\%n, 'hooks', scalar keys %hook_children);
     _ctl_put(\%n, 'sched.now', int($now));
@@ -9113,6 +9180,44 @@ sub _ctl_dispatch {
     }
 }
 
+sub service_fds {
+    my @fh;
+    push @fh, $CTL_LISTEN if $CTL_LISTEN && defined fileno($CTL_LISTEN);
+    for my $c (values %CTL_CLIENT) {
+        push @fh, $c->{fh} if $c->{fh} && defined fileno($c->{fh});
+    }
+    push @fh, $CHLD_R if $CHLD_R && defined fileno($CHLD_R);
+    push @fh, $INFO_R if $INFO_R && defined fileno($INFO_R);
+    return @fh;
+}
+
+sub service_ready {
+    my ($fh) = @_;
+    return 0 unless defined $fh && defined fileno($fh);
+    my $fd = fileno($fh);
+    if ($CHLD_R && defined fileno($CHLD_R) && $fd == fileno($CHLD_R)) {
+        _drain_fd($CHLD_R);
+        reap_children();
+        return 1;
+    }
+    if ($INFO_R && defined fileno($INFO_R) && $fd == fileno($INFO_R)) {
+        _drain_info();
+        report_info();
+        return 1;
+    }
+    if ($CTL_LISTEN && defined fileno($CTL_LISTEN) && $fd == fileno($CTL_LISTEN)) {
+        ctl_accept();
+        return 1;
+    }
+    if (my $c = $CTL_CLIENT{$fd}) {
+        ctl_read($c);
+        $c = $CTL_CLIENT{$fd} or return 1;
+        ctl_flush($c) if length($c->{out} // '');
+        return 1;
+    }
+    return 0;
+}
+
 sub ctl_listen {
     return if $DRY_RUN;
     my $path = ctl_socket_path();
@@ -9280,6 +9385,44 @@ sub _serve_dry {
     exit 0;
 }
 
+# The daemon is the same split as -n. The hub runs mbsync and writes
+# state. Workers own the IMAP sockets. The parent does not load the
+# accounts: a short-lived child checks the file so a bad config still
+# fails here, and the tables die with that child.
+sub _serve_imsg {
+    my $root = dirname($SELF_PATH);
+    require lib;
+    lib->import("$root/lib", "$root/blib");
+    my $loaded = eval { require IMAPIDLE::Split; 1 };
+    startup_fail("imsg: $@") if !$loaded;
+    openlog('imapidle', 'cons,pid', 'mail');
+    $LOG_OPEN = 1;
+    $SIG{PIPE} = 'IGNORE';
+    my $check = fork();
+    startup_fail("fork failed: $!") if !defined $check;
+    if ($check == 0) {
+        my $err = load_config($CONFIG_FILE);
+        if ($err) {
+            log_error($err);
+            print STDERR "imapidle: $err\n";
+            _exit(1);
+        }
+        _exit(0);
+    }
+    while (waitpid($check, 0) < 0) {
+        next if $! == EINTR;
+        startup_fail('fork failed');
+    }
+    exit ($? >> 8) if $?;
+    if ($FOREGROUND) {
+        my $old = select(STDERR);
+        $| = 1;
+        select($old);
+    }
+    IMAPIDLE::Split::serve_live($CONFIG_FILE, $FOREGROUND);
+    exit 0;
+}
+
 sub run {
     my (@argv) = @_;
     my ($tunnel_section, @rest) = _split_tunnel_argv(@argv);
@@ -9304,6 +9447,7 @@ sub run {
         $DRY_RUN = 1;
         _serve_dry();
     }
+    _serve_imsg() unless defined $tunnel_section;
 
     openlog('imapidle', 'cons,pid', 'mail');
     $LOG_OPEN = 1;

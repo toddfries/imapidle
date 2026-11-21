@@ -78,31 +78,34 @@ sub run {
 sub _loop {
 	my ($ib, $sock, $fh, $idle_tag, $account, $folder, $total) = @_;
 	my $sel = IO::Select->new($sock, $fh);
+	my $armed_at = time();
 	while (1) {
-		if (_shutdown($ib)) {
-			_leave($fh, $idle_tag);
-			return;
-		}
+		my $did = _commands($ib, $fh, \$idle_tag, $account, $folder, \$total);
+		return if $did < 0;
+		$armed_at = time() if $did > 0;
 		while (defined(my $line = _take($fh))) {
-			if ($line =~ /^\* (\d+) EXISTS\b/i) {
-				my $n = $1 + 0;
-				if ($n > $total) {
-					$total = $n;
-					$ib->send(IMAPIDLE::IMSG_MAIL,
-					    IMAPIDLE::json_encode({
-						account => $account,
-						folder  => $folder,
-						total   => $total,
-					    }));
-				} else {
-					$total = $n;
-				}
-			} elsif ($line =~ /^\* BYE\b/i) {
+			if ($line =~ /^\* BYE\b/i) {
 				_drop($ib, $account, $folder);
 				return;
 			}
+			_note_exists($ib, $account, $folder, \$total, $line);
 		}
-		my @ready = $sel->can_read(30);
+		my $slice = 30 - (time() - $armed_at);
+		$slice = 0.05 if $slice < 0.05;
+		my @ready = $sel->can_read($slice);
+		if (time() - $armed_at >= 30) {
+			my $ok = eval {
+				_rearm($fh, \$idle_tag, $ib, $account, $folder, \$total);
+				1;
+			};
+			if (!$ok) {
+				_drop($ib, $account, $folder);
+				return;
+			}
+			$armed_at = time();
+			main::note_idle_rearmed($account);
+			next;
+		}
 		for my $ready (@ready) {
 			if (fileno($ready) == fileno($sock)) {
 				my $n = $ib->read_more;
@@ -127,12 +130,94 @@ sub _loop {
 	}
 }
 
-sub _shutdown {
-	my ($ib) = @_;
-	for my $msg ($ib->queued) {
-		return 1 if $msg->{type} == IMAPIDLE::IMSG_SHUTDOWN;
+# 1 when IDLE was armed again, -1 when this process should exit.
+sub _commands {
+	my ($ib, $fh, $tag_ref, $account, $folder, $total_ref) = @_;
+	my @msgs = $ib->queued;
+	for my $msg (@msgs) {
+		if ($msg->{type} == IMAPIDLE::IMSG_SHUTDOWN) {
+			_leave($fh, $$tag_ref);
+			return -1;
+		}
 	}
-	return 0;
+	my @probe;
+	for my $msg (@msgs) {
+		push @probe, $msg if $msg->{type} == IMAPIDLE::IMSG_PROBE;
+	}
+	return 0 unless @probe;
+	my $ok = eval {
+		_rearm_done($fh, $tag_ref, $ib, $account, $folder, $total_ref);
+		for my $msg (@probe) {
+			my $row = IMAPIDLE::json_decode($msg->{data}) // {};
+			my $box = $row->{box} // '';
+			next if $box eq '';
+			my ($messages, $uidnext) = _status_box($fh, $box);
+			$ib->send(IMAPIDLE::IMSG_COUNT, IMAPIDLE::json_encode({
+				account  => $account,
+				folder   => $folder,
+				box      => $box,
+				messages => $messages,
+				uidnext  => $uidnext,
+			}));
+		}
+		$$tag_ref = _cmd($fh, 'IDLE');
+		_until_plus($fh, $$tag_ref);
+		1;
+	};
+	if (!$ok) {
+		_drop($ib, $account, $folder);
+		return -1;
+	}
+	return 1;
+}
+
+sub _note_exists {
+	my ($ib, $account, $folder, $total_ref, $line) = @_;
+	return unless defined $line && $line =~ /^\* (\d+) EXISTS\b/i;
+	my $n = $1 + 0;
+	if ($n > $$total_ref) {
+		$$total_ref = $n;
+		$ib->send(IMAPIDLE::IMSG_MAIL, IMAPIDLE::json_encode({
+			account => $account,
+			folder  => $folder,
+			total   => $$total_ref,
+		}));
+	} else {
+		$$total_ref = $n;
+	}
+	return;
+}
+
+sub _rearm_done {
+	my ($fh, $tag_ref, $ib, $account, $folder, $total_ref) = @_;
+	my $on = sub {
+		_note_exists($ib, $account, $folder, $total_ref, $_[0]);
+	};
+	_send($fh, 'DONE');
+	_until_tag($fh, $$tag_ref, $on);
+	return;
+}
+
+sub _rearm {
+	my ($fh, $tag_ref, $ib, $account, $folder, $total_ref) = @_;
+	_rearm_done($fh, $tag_ref, $ib, $account, $folder, $total_ref);
+	$$tag_ref = _cmd($fh, 'IDLE');
+	_until_plus($fh, $$tag_ref);
+	return;
+}
+
+sub _status_box {
+	my ($fh, $box) = @_;
+	my $tag = _cmd($fh, 'STATUS ' . _quote($box) . ' (MESSAGES UIDNEXT)');
+	my ($messages, $uidnext);
+	_until_tag($fh, $tag, sub {
+		my ($line) = @_;
+		return unless $line =~ /^\* STATUS\b/i;
+		$messages = $1 + 0 if $line =~ /\bMESSAGES (\d+)/i;
+		$uidnext  = $1 + 0 if $line =~ /\bUIDNEXT (\d+)/i;
+	});
+	die "status\n" unless defined $messages && defined $uidnext;
+	return ($messages, $uidnext);
 }
 
 sub _drop {
