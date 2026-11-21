@@ -61,6 +61,7 @@ pass = secret
 type = idle
 channel = box
 folder0 = INBOX;priority=1
+folder1 = Archive;priority=1
 EOF
 close $cf;
 
@@ -88,6 +89,7 @@ if ($daemon == 0) {
 	close $err_w;
 	$ENV{HOME} = $home;
 	$ENV{IMAPIDLE_MBSYNC} = $fake;
+	$ENV{IMAPIDLE_SPAWN_PAUSE} = 1;
 	$ENV{PATH} = '/usr/bin:/bin:/usr/local/bin';
 	exec $^X, "$Bin/../imapidle", '-d', '-c', $cfg
 	    or _exit(127);
@@ -123,14 +125,14 @@ while (time() < $until && !-S $sock) {
 }
 ok(-S $sock, 'the control socket is open');
 
-my $idle_pid;
+my @idle_pids;
 my $idle_until = time() + 8;
 while (time() < $idle_until) {
-	($idle_pid) = _role_pids($daemon, 'idle');
-	last if $idle_pid;
+	@idle_pids = _role_pids($daemon, 'idle');
+	last if @idle_pids >= 2;
 	select(undef, undef, undef, 0.1);
 }
-ok($idle_pid, 'an idle worker is running')
+is(scalar @idle_pids, 2, 'both idle workers are running')
     or diag(join("\n", _role_args($daemon)));
 my ($hub_pid) = _role_pids($daemon, 'hub');
 ok($hub_pid, 'the hub is running');

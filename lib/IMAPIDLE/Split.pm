@@ -291,8 +291,14 @@ sub serve {
 				_dry_hub($to_parent, $config);
 			}
 		};
-		warn $@ if $@;
-		_exit($@ ? 1 : 0);
+		if ($@) {
+			my $err = main::scrub($@);
+			$err = 'hub failed' if $err eq '';
+			eval { main::log_error("hub: $err") };
+			warn "imapidle: hub: $err\n";
+			_exit(1);
+		}
+		_exit(0);
 	}
 	close $to_parent;
 	$PARENT_FH = $to_hub;
@@ -329,10 +335,23 @@ sub _parent_loop {
 			}
 			$hub_dead = 1 if $n == 0;
 		}
+		# A later SPAWN can arrive while this process waits for the
+		# ack. Leave those on @later or the ack wait treats them
+		# as the reply and the parent exits.
+		my @later;
 		for my $msg ($ctl->queued) {
 			next unless $msg->{type} == IMAPIDLE::IMSG_SPAWN;
+			push @later, $msg;
+		}
+		while (my $msg = shift @later) {
 			my $row = IMAPIDLE::json_decode($msg->{data}) // {};
-			_spawn_worker($ctl, $row);
+			eval { _spawn_worker($ctl, $row, \@later) };
+			next unless $@;
+			my $err = main::scrub($@);
+			$err = 'parent failed' if $err eq '';
+			eval { main::log_error("parent: $err") };
+			warn "imapidle: parent: $err\n";
+			_finish(1);
 		}
 	}
 	# A live hub that exits 0 asked to stop (control socket or the
@@ -361,7 +380,7 @@ sub _reap {
 }
 
 sub _spawn_worker {
-	my ($ctl, $row) = @_;
+	my ($ctl, $row, $later) = @_;
 	my $id = $row->{id} // '';
 	die "spawn id\n" if $id eq '';
 	my ($hub_end, $worker_end) = _spair();
@@ -371,7 +390,12 @@ sub _spawn_worker {
 		peer => $peer,
 	}), fileno($hub_end));
 	close $hub_end;
-	my $ack = _recv_eintr($ctl);
+	my $ack;
+	while (1) {
+		$ack = _recv_eintr($ctl);
+		last unless $ack && $ack->{type} == IMAPIDLE::IMSG_SPAWN;
+		push @$later, $ack;
+	}
 	die "hub did not ack\n"
 	    unless $ack && $ack->{type} == IMAPIDLE::IMSG_ACK;
 	my $pid = fork();
@@ -392,8 +416,14 @@ sub _spawn_worker {
 				IMAPIDLE::Idle::run($worker_end);
 			}
 		};
-		warn $@ if $@;
-		_exit($@ ? 1 : 0);
+		if ($@) {
+			my $err = main::scrub($@);
+			$err = 'worker failed' if $err eq '';
+			eval { main::log_error("$peer: $err") };
+			warn "imapidle: $peer: $err\n";
+			_exit(1);
+		}
+		_exit(0);
 	}
 	close $worker_end;
 	$WORKER_PID{$id} = $pid;
@@ -791,6 +821,9 @@ sub _dry_spawn {
 			folder  => $job->{folder},
 			peer    => $job->{kind} eq 'account' ? 'account' : 'idle',
 		}));
+		# A test leaves a gap so the next request arrives before the
+		# ack. One read would otherwise hide that race.
+		select(undef, undef, undef, 0.05) if $ENV{IMAPIDLE_SPAWN_PAUSE};
 	}
 	return;
 }
