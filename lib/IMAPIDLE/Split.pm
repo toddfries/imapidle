@@ -340,9 +340,10 @@ sub _spawn_worker {
 	my $id = $row->{id} // '';
 	die "spawn id\n" if $id eq '';
 	my ($hub_end, $worker_end) = _spair();
+	my $peer = ($row->{peer} // '') eq 'account' ? 'account' : 'idle';
 	$ctl->send_fd(IMAPIDLE::IMSG_ATTACH, IMAPIDLE::json_encode({
 		id   => $id,
-		peer => 'idle',
+		peer => $peer,
 	}), fileno($hub_end));
 	close $hub_end;
 	my $ack = _recv_eintr($ctl);
@@ -358,8 +359,13 @@ sub _spawn_worker {
 		$SIG{TERM} = $SIG{INT} = $SIG{HUP} = $SIG{CHLD} = 'DEFAULT';
 		close $PARENT_FH if $PARENT_FH;
 		eval {
-			require IMAPIDLE::Idle;
-			IMAPIDLE::Idle::run($worker_end);
+			if ($peer eq 'account') {
+				require IMAPIDLE::Account;
+				IMAPIDLE::Account::run($worker_end);
+			} else {
+				require IMAPIDLE::Idle;
+				IMAPIDLE::Idle::run($worker_end);
+			}
 		};
 		warn $@ if $@;
 		_exit($@ ? 1 : 0);
@@ -503,6 +509,29 @@ sub _dry_jobs {
 					busy_for   => 0,
 				};
 			}
+			# STATUS for this login is its own process. The hub
+			# does not open the socket. An empty name is the
+			# sweep timer above, not a mailbox to probe.
+			my @probe = grep { $_ ne '' } @boxes;
+			my $id = "account\t$name";
+			$jobs{$id} = {
+				kind     => 'account',
+				id       => $id,
+				account  => $name,
+				folder   => '',
+				channel  => $ch,
+				host     => $acc->{server},
+				port     => $acc->{port},
+				proto    => $acc->{proto} // 'tls',
+				user     => $acc->{user},
+				auth     => $acc->{auth} // 'login',
+				boxes    => \@probe,
+				seen     => {},
+				backoff  => 2,
+				armed    => 0,
+				up       => 0,
+				restart_at => 0,
+			};
 		}
 	}
 	return %jobs;
@@ -530,7 +559,7 @@ sub _dry_drain {
 	for my $id (keys %$jobs) {
 		my $ib = $jobs->{$id}{ib} or next;
 		for my $msg (_take($ib)) {
-			_dry_worker($jobs->{$id}, $msg);
+			_dry_worker($jobs->{$id}, $msg, $jobs);
 		}
 	}
 	return 0;
@@ -587,18 +616,59 @@ sub _dry_login {
 }
 
 sub _dry_worker {
-	my ($job, $msg) = @_;
+	my ($job, $msg, $jobs) = @_;
 	my $row = IMAPIDLE::json_decode($msg->{data}) // {};
 	if ($msg->{type} == IMAPIDLE::IMSG_READY) {
-		$job->{total} = ($row->{total} // 0) + 0;
-		$job->{uidnext} = ($row->{uidnext} // 0) + 0;
 		$job->{armed} = 1;
-		$job->{startup} = 1;
 		$job->{backoff} = 2;
+		if (($job->{kind} // '') eq 'account') {
+			my $n = @{ $job->{boxes} // [] };
+			my $word = $n == 1 ? 'mailbox' : 'mailboxes';
+			my $who = main::_log_name($job->{channel});
+			main::log_info("$who: pulse speaker up, $n $word");
+			for my $box (@{ $job->{boxes} // [] }) {
+				$job->{ib}->send(IMAPIDLE::IMSG_PROBE,
+				    IMAPIDLE::json_encode({ box => $box }));
+			}
+		} else {
+			$job->{total} = ($row->{total} // 0) + 0;
+			$job->{uidnext} = ($row->{uidnext} // 0) + 0;
+			$job->{startup} = 1;
+		}
 	} elsif ($msg->{type} == IMAPIDLE::IMSG_MAIL) {
 		my $n = ($row->{total} // 0) + 0;
 		$job->{pending} = 1 if !defined $job->{total} || $n > $job->{total};
 		$job->{total} = $n;
+	} elsif ($msg->{type} == IMAPIDLE::IMSG_COUNT) {
+		_dry_count($job, $row, $jobs);
+	}
+	return;
+}
+
+# The first count is the baseline. A later change makes that
+# mailbox due. The sweep clock is unchanged when the count holds.
+sub _dry_count {
+	my ($job, $row, $jobs) = @_;
+	my $box = $row->{box} // '';
+	return if $box eq '';
+	return unless defined $row->{messages} && defined $row->{uidnext};
+	my $messages = $row->{messages} + 0;
+	my $uidnext = $row->{uidnext} + 0;
+	my $prev = $job->{seen}{$box};
+	$job->{seen}{$box} = {
+		messages => $messages,
+		uidnext  => $uidnext,
+	};
+	my $who = main::_log_name($job->{channel});
+	main::log_info("$who: STATUS $box messages $messages uidnext $uidnext");
+	return unless $prev;
+	return if $prev->{messages} == $messages && $prev->{uidnext} == $uidnext;
+	my $now = time();
+	for my $other (values %{ $jobs // {} }) {
+		next unless ($other->{kind} // '') eq 'pulse';
+		next if ($other->{account} // '') ne ($job->{account} // '');
+		next if ($other->{folder} // '') ne $box;
+		$other->{next_at} = $now;
 	}
 	return;
 }
@@ -639,6 +709,11 @@ sub _dry_gone {
 	$wait = 30 if $wait > 30;
 	$job->{backoff} = $wait;
 	my $who = main::_log_name($job->{channel});
+	if (($job->{kind} // '') eq 'account') {
+		main::log_warn("$who: pulse speaker dropped, retry in "
+		    . int($job->{restart_at} - $now) . 's');
+		return;
+	}
 	main::log_warn("$who: idle $job->{folder} dropped, retry in "
 	    . int($job->{restart_at} - $now) . 's');
 	return;
@@ -648,7 +723,7 @@ sub _dry_spawn {
 	my ($up, $now, $jobs) = @_;
 	for my $id (sort keys %$jobs) {
 		my $job = $jobs->{$id};
-		next if $job->{kind} ne 'idle';
+		next if $job->{kind} ne 'idle' && $job->{kind} ne 'account';
 		next if $job->{up};
 		next if $job->{restart_at} && $job->{restart_at} > $now;
 		$job->{up} = 'pending';
@@ -656,6 +731,7 @@ sub _dry_spawn {
 			id      => $id,
 			account => $job->{account},
 			folder  => $job->{folder},
+			peer    => $job->{kind} eq 'account' ? 'account' : 'idle',
 		}));
 	}
 	return;
@@ -670,6 +746,7 @@ sub _dry_start {
 	for my $id (sort keys %$jobs) {
 		last if $running >= $cap;
 		my $job = $jobs->{$id};
+		next if ($job->{kind} // '') eq 'account';
 		next if $job->{busy_until} && $job->{busy_until} > $now;
 		next if _dry_channel_busy($job, $now, $jobs);
 		my $due = 0;

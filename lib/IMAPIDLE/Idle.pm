@@ -309,6 +309,13 @@ sub _line {
 	}
 }
 
+sub feed {
+	my ($fh, $bytes) = @_;
+	return unless defined $fh && defined $bytes && $bytes ne '';
+	$HOLD{fileno($fh)} .= $bytes;
+	return;
+}
+
 sub _take {
 	my ($fh) = @_;
 	my $fd = fileno($fh);

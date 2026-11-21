@@ -220,6 +220,10 @@ waits the predicted number of seconds.
 The wait is that average, or five seconds when no average
 is stored, plus or minus about a quarter of the average.
 The state directory is left untouched.
+A pulse account is its own process.
+That process logs in and runs
+.Cm STATUS .
+The process that supervises it does not open an IMAP socket.
 Certificates are not checked or stored.
 The control socket is not opened, so this process can run
 beside another

@@ -29,6 +29,8 @@ use constant {
 	IMSG_LOGIN    => 7,
 	IMSG_READY    => 8,
 	IMSG_DROP     => 9,
+	IMSG_PROBE    => 10,
+	IMSG_COUNT    => 11,
 	IMSG_MAX      => 262144,
 };
 
