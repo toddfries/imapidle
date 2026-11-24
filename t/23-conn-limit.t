@@ -545,6 +545,30 @@ stderr_of(sub { note_imsg_conn_limit('acct', $LIMIT, 5) });
 is(imsg_conn_limit_cap('acct'), 2,
     'a smaller learned cap is not replaced by the server number');
 
+clear_conn_limit_for_test();
+my $held = stderr_of(sub {
+    ok(note_imsg_conn_limit('acct', $LIMIT, 4) > time(),
+        'four armed sessions learn a cap');
+});
+is(imsg_conn_limit_cap('acct'), 4, 'four open sessions stay at 4 under a server max of 5');
+my $held_probe = conn_limit_row_for_test('acct')->{probe};
+my $soon_at = time();
+my $soon_log = stderr_of(sub {
+    my $when = note_imsg_conn_limit('acct', $LIMIT, 1, 3);
+    ok($when > $soon_at + 8 && $when < $soon_at + 12,
+        'a refusal while others are still logging in retries in about ten seconds');
+});
+is(imsg_conn_limit_cap('acct'), 4,
+    'that refusal does not shrink the cap');
+is(conn_limit_row_for_test('acct')->{probe}, $held_probe,
+    'the week probe is left alone while sessions are still opening');
+unlike($soon_log, qr/connection limit/,
+    'the short retry is not logged as a new cap');
+my $ceiling = note_imsg_conn_limit('acct', $LIMIT, 4, 2);
+ok($ceiling > time() + 1000,
+    'at the ceiling a refusal still waits out the week');
+is(imsg_conn_limit_cap('acct'), 4, 'the ceiling refusal keeps the cap');
+
 reset_schedule_for_test();
 my $qnow = time();
 my $requeued = stderr_of(sub {

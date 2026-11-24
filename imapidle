@@ -4743,14 +4743,21 @@ sub conn_limit_fail {
 
 # The hub has no %conns. $open is how many workers for this login are
 # already in IMAP. A refusal records that count and waits out the week.
+# $pending is workers for this login that have been spawned and have not
+# finished LOGIN. Their refusal is the startup race with mbsync, so it
+# retries shortly and does not shrink a cap already learned.
 sub note_imsg_conn_limit {
-    my ($name, $err, $open) = @_;
+    my ($name, $err, $open, $pending) = @_;
     my $acc = $accounts{$name} or return 0;
     my $key = _conn_limit_key($acc) or return 0;
     $open = 0 if !defined $open || $open < 0;
     return 0 if $open < 1;
-    my $row = $CONN_LIMIT{$key} //= {};
+    $pending = 0 if !defined $pending || $pending < 0;
     my $max = _conn_limit_server_max($err);
+    if ($pending > 0 && defined $max && $max > 1 && $open < $max - 1) {
+        return time() + 10;
+    }
+    my $row = $CONN_LIMIT{$key} //= {};
     my $cap = int($open);
     # mbsync logs in as this same user and needs one of the server's slots.
     if (defined $max && $max > 1 && $cap > $max - 1) {

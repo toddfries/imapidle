@@ -577,6 +577,9 @@ When that number is above 1, the remembered count is kept at
 most one below it, so
 .Sy mbsync
 can log in as the same user.
+A refusal while another session for that same login is still
+opening does not lower the count, and that session is tried
+again in about ten seconds.
 An idle folder past that count is closed, lowest priority
 first, and waits for the same week.
 A sync refused for this reason is tried again in about ten

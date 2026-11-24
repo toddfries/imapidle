@@ -712,8 +712,9 @@ sub _dry_worker {
 		    if $REAL;
 	} elsif ($REAL && $msg->{type} == IMAPIDLE::IMSG_DROP && $row->{limit}) {
 		my $open = _armed_on_login($jobs, $job->{account}, $job);
+		my $pending = _pending_on_login($jobs, $job->{account}, $job);
 		my $probe = main::note_imsg_conn_limit(
-		    $job->{account}, $row->{detail} // '', $open);
+		    $job->{account}, $row->{detail} // '', $open, $pending);
 		$job->{restart_at} = $probe if $probe && $probe > time();
 		_shed_login($jobs, $job, $probe);
 	} elsif ($msg->{type} == IMAPIDLE::IMSG_MAIL) {
@@ -1032,6 +1033,22 @@ sub _same_login {
 	return 0 if (($a->{port} // 0) + 0) != (($b->{port} // 0) + 0);
 	return 0 if ($a->{user} // '') ne ($b->{user} // '');
 	return 1;
+}
+
+# Spawned, not yet through LOGIN. A refusal while these exist is the
+# startup race, not a full server.
+sub _pending_on_login {
+	my ($jobs, $account, $skip) = @_;
+	my $acc = main::loaded_account($account) or return 0;
+	my $n = 0;
+	for my $job (values %$jobs) {
+		next if $skip && $job == $skip;
+		next if $job->{armed};
+		next unless $job->{up};
+		my $other = main::loaded_account($job->{account}) or next;
+		$n++ if _same_login($acc, $other);
+	}
+	return $n;
 }
 
 # Workers that finished LOGIN for this account's server, port, and user.
