@@ -1180,6 +1180,7 @@ sub _live_hub {
 		die "$err\n";
 	}
 	main::open_state_dir();
+	main::log_state_keep_verbose();
 	main::install_chld_signal();
 	main::install_info_signal();
 	# Leave CHLD and INFO blocked. service_wait unblocks them only

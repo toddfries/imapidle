@@ -23,7 +23,7 @@ use Errno qw(EINPROGRESS EWOULDBLOCK EINTR EPIPE EAGAIN ECHILD);
 use Socket qw(SHUT_WR SOCK_STREAM);
 use Fcntl;
 use File::Basename qw(dirname);
-use File::Path qw(make_path);
+use File::Path qw(make_path remove_tree);
 use Getopt::Std;
 use IO::Select;
 use IO::Socket::SSL;
@@ -1098,6 +1098,9 @@ sub _blank_track {
         tunnel_timeout => 3600,
         mbsyncrc       => '',
         hook           => '',
+        # Case-insensitive. A final component that starts with draft
+        # or sent is not removed when the sync state cannot be used.
+        state_keep     => '(?:^|/)(?:draft|sent)[^/]*$',
     };
 }
 
@@ -1153,6 +1156,16 @@ sub _parse_track_section {
         $cfg->{mbsyncrc} = $row->{mbsyncrc};
     }
     $cfg->{hook} = _hook_value($row->{hook});
+    if (exists $row->{state_keep} && defined $row->{state_keep}
+        && $row->{state_keep} =~ /\S/) {
+        my $pat = $row->{state_keep};
+        $pat =~ s/^\s+|\s+$//g;
+        if (!eval { qr/$pat/i; 1 }) {
+            $bad->('bad state_keep');
+        } else {
+            $cfg->{state_keep} = $pat;
+        }
+    }
     return $cfg;
 }
 
@@ -5477,17 +5490,22 @@ sub _secret_for_channel {
     return $held;
 }
 
-# First non-empty stderr line. Whitespace is one space. The account
-# password is replaced. Longer than 160 characters is cut.
-sub _child_err_line {
+sub _child_err_text {
     my ($rec) = @_;
     return '' unless ref $rec eq 'HASH' && $rec->{err_fh};
     my $fh = delete $rec->{err_fh};
     local $/;
     my $text = <$fh> // '';
     close $fh;
+    return $text;
+}
+
+# First non-empty stderr line. Whitespace is one space. The account
+# password is replaced. Longer than 160 characters is cut.
+sub _err_line_from {
+    my ($text, $rec) = @_;
     my $line = '';
-    for my $row (split /\r?\n/, $text) {
+    for my $row (split /\r?\n/, $text // '') {
         $row =~ s/^\s+|\s+$//g;
         next if $row eq '';
         $line = $row;
@@ -5495,12 +5513,260 @@ sub _child_err_line {
     }
     $line =~ s/\s+/ /g;
     my $channel = '';
-    if (ref $rec->{args} eq 'ARRAY' && @{ $rec->{args} }) {
+    if (ref $rec eq 'HASH' && ref $rec->{args} eq 'ARRAY' && @{ $rec->{args} }) {
         ($channel) = split /:/, $rec->{args}[0], 2;
     }
     $line = scrub($line, _secret_for_channel($channel));
     $line = substr($line, 0, 160) if length($line) > 160;
     return $line;
+}
+
+sub _child_err_line {
+    my ($rec) = @_;
+    return _err_line_from(_child_err_text($rec), $rec);
+}
+
+# A broken .mbsyncstate, or a UIDVALIDITY change mbsync will not
+# repair. Other mbsync errors are not this.
+sub sync_state_issue {
+    my ($text) = @_;
+    return 0 unless defined $text && $text ne '';
+    return 1 if $text =~ /sync state (?:entry|header)/i;
+    return 1 if $text =~ /Unable to recover from (?:both-sided )?UIDVALIDITY change/i;
+    return 1 if $text =~ /UIDVALIDITY genuinely changed/i;
+    return 0;
+}
+
+sub _state_keep_pattern {
+    my $pat = $track_cfg->{state_keep} // '';
+    $pat =~ s/^\s+|\s+$//g if defined $pat;
+    return '(?:^|/)(?:draft|sent)[^/]*$' if !defined $pat || $pat eq '';
+    return $pat;
+}
+
+# True when this mailbox is one the config says to leave in place.
+sub state_keep_hit {
+    my ($box, $pat) = @_;
+    return 0 if !defined $box || $box eq '';
+    $pat = _state_keep_pattern() if !defined $pat;
+    my $re = eval { qr/$pat/i };
+    return 0 unless $re;
+    return $box =~ $re ? 1 : 0;
+}
+
+# One -v line. Configured mailbox names, and whether a sync-state
+# failure would keep or remove each one.
+sub state_keep_plan {
+    my %box;
+    for my $acc (values %accounts) {
+        next unless ref $acc eq 'HASH';
+        for my $folder (@{ $acc->{folders} // [] }) {
+            my $name = ref $folder eq 'HASH' ? $folder->{name} : $folder;
+            next if !defined $name || $name eq '';
+            $box{$name} = 1;
+        }
+    }
+    my (@keep, @drop);
+    for my $name (sort keys %box) {
+        if (state_keep_hit($name)) {
+            push @keep, $name;
+        } else {
+            push @drop, $name;
+        }
+    }
+    my $line = 'state_keep ' . _state_keep_pattern();
+    $line .= ' keep ' . join(', ', @keep) if @keep;
+    $line .= ' remove ' . join(', ', @drop) if @drop;
+    return $line;
+}
+
+sub log_state_keep_verbose {
+    return unless $VERBOSE;
+    log_info(state_keep_plan());
+    return;
+}
+
+sub _sync_state_file {
+    my ($text) = @_;
+    return '' unless defined $text;
+    return $1 if $text =~ / at (.+\.mbsyncstate):\d+/;
+    return '';
+}
+
+sub _sync_state_box_name {
+    my ($text) = @_;
+    return '' unless defined $text;
+    return $1 if $text =~ /side box ([^:\r\n]+):/;
+    return '';
+}
+
+sub _expand_home {
+    my ($p) = @_;
+    return '' unless defined $p;
+    $p =~ s/^\s+|\s+$//g;
+    return '' if $p eq '';
+    if ($p eq '~' || $p =~ m{^~/}) {
+        my $home = $ENV{HOME} // '';
+        return '' if $home eq '';
+        $p =~ s{^~}{$home};
+    }
+    return $p;
+}
+
+sub _near_maildir {
+    my ($text, $channel) = @_;
+    return unless defined $text && defined $channel && $channel ne '';
+    my (undef, $secs) = _parse_mbsync_rc($text);
+    my $channels = _mbsync_named($secs, 'channel');
+    my $ch = $channels->{$channel} or return;
+    my $near = '';
+    for my $line (@{ $ch->{lines} }) {
+        my @tok = _mbsync_tokens($line);
+        next unless @tok && lc $tok[0] eq 'near';
+        $near = $tok[1] // '';
+        $near =~ s/^:+//;
+        $near =~ s/:+$//;
+        last if $near ne '';
+    }
+    return if $near eq '';
+    my $stores = _mbsync_named($secs, 'maildirstore');
+    my $store = $stores->{$near} or return;
+    my ($path, $inbox) = ('', '');
+    for my $line (@{ $store->{lines} }) {
+        my @tok = _mbsync_tokens($line);
+        next unless @tok;
+        $path  = $tok[1] // '' if lc $tok[0] eq 'path';
+        $inbox = $tok[1] // '' if lc $tok[0] eq 'inbox';
+    }
+    $path  = _expand_home($path);
+    $inbox = _expand_home($inbox);
+    return if $path eq '';
+    $path =~ s{/+$}{};
+    $inbox =~ s{/+$}{} if $inbox ne '';
+    return { path => $path, inbox => $inbox };
+}
+
+sub _read_mbsyncrc_text {
+    my $src = _mbsyncrc_path();
+    return '' if !defined $src || $src eq '' || !-r $src;
+    open my $fh, '<', $src or return '';
+    local $/;
+    my $text = <$fh> // '';
+    close $fh;
+    return $text;
+}
+
+# Mailbox name relative to the store, or undef when $dir is not inside it.
+sub _box_under_store {
+    my ($dir, $store) = @_;
+    return unless defined $dir && $dir ne '' && ref $store eq 'HASH';
+    my $path = $store->{path} // '';
+    return if $path eq '';
+    $dir =~ s{/+$}{};
+    my $inbox = $store->{inbox} // '';
+    return 'INBOX' if $inbox ne '' && $dir eq $inbox;
+    return if index($dir, "$path/") != 0;
+    my $box = substr($dir, length($path) + 1);
+    return if !defined $box || $box eq '' || $box =~ m{(^|/)\.\.(/|$)};
+    return $box;
+}
+
+sub _box_dir {
+    my ($store, $box) = @_;
+    return '' unless ref $store eq 'HASH' && defined $box && $box ne '';
+    if (lc($box) eq 'inbox' && ($store->{inbox} // '') ne '') {
+        return $store->{inbox};
+    }
+    my $path = $store->{path} // '';
+    return '' if $path eq '';
+    return "$path/$box";
+}
+
+sub _sole_box_arg {
+    my ($rec, $channel) = @_;
+    return '' unless ref $rec eq 'HASH' && ref $rec->{args} eq 'ARRAY';
+    my $box = '';
+    for my $arg (@{ $rec->{args} }) {
+        next unless defined $arg && $arg =~ /^([^:]+):(.+)$/;
+        next unless $1 eq $channel;
+        return '' if $box ne '';
+        $box = $2;
+    }
+    return $box;
+}
+
+# Absolute maildir under the store, or undef. The store root itself
+# is not a mailbox.
+sub _removable_maildir {
+    my ($dir, $store_path) = @_;
+    return if !defined $dir || $dir eq '' || $dir !~ m{^/};
+    return if $dir =~ m{(^|/)\.\.(/|$)};
+    return if -l $dir || !-d $dir;
+    return if -l "$dir/cur" || !-d "$dir/cur";
+    my $real = abs_path($dir);
+    my $root = abs_path($store_path);
+    return if !defined $real || !defined $root || $root eq '';
+    return if $real eq $root;
+    return if index($real, "$root/") != 0;
+    return $real;
+}
+
+# Remove the local mailbox and queue that one box again. A name that
+# matches state_keep is left alone. Returns 1 when the directory was
+# removed. $rc_text is the test's copy of the mbsync config.
+sub recover_sync_state {
+    my ($errtext, $rec, $rc_text) = @_;
+    return 0 unless sync_state_issue($errtext);
+    return 0 unless ref $rec eq 'HASH';
+    my $channel = _hook_channel($rec);
+    return 0 if $channel eq '';
+    my $rc = defined $rc_text ? $rc_text : _read_mbsyncrc_text();
+    my $store = _near_maildir($rc, $channel);
+    if (!$store) {
+        log_warn("$channel: sync state, mailbox path unknown");
+        return 0;
+    }
+    my ($box, $dir);
+    my $file = _sync_state_file($errtext);
+    if ($file ne '') {
+        $dir = dirname($file);
+        $dir =~ s{/+$}{};
+        $box = _box_under_store($dir, $store);
+        if (!defined $box) {
+            log_warn("$channel: sync state not removed");
+            return 0;
+        }
+    } else {
+        $box = _sync_state_box_name($errtext);
+        $box = _sole_box_arg($rec, $channel) if $box eq '';
+        if ($box eq '') {
+            log_warn("$channel: sync state, mailbox name unknown");
+            return 0;
+        }
+        $dir = _box_dir($store, $box);
+    }
+    if (state_keep_hit($box)) {
+        log_warn("$channel: $box sync state kept");
+        return 0;
+    }
+    my $real = _removable_maildir($dir, $store->{path});
+    if (!$real) {
+        log_warn("$channel: $box sync state not removed");
+        return 0;
+    }
+    if ($DRY_RUN) {
+        log_warn("$channel: $box would remove $real");
+        return 0;
+    }
+    remove_tree($real, { safe => 1, error => \my $err });
+    if (($err && @$err) || -d $real) {
+        log_warn("$channel: $box sync state not removed");
+        return 0;
+    }
+    log_warn("$channel: $box sync state removed, retry");
+    my $now = time();
+    queue_folder($channel, $box, $now, $now + 1);
+    return 1;
 }
 
 sub reap_children {
@@ -5537,7 +5803,8 @@ sub reap_children {
         }
         my @args = _child_args($rec);
         my $slot = ref $rec eq 'HASH' ? $rec->{slot} : undef;
-        my $errline = _child_err_line($rec);
+        my $errtext = _child_err_text($rec);
+        my $errline = _err_line_from($errtext, $rec);
         my $line = mbsync_job_line('stop', $pid, { slot => $slot }, @args);
         $line .= ' ' . exit_how($status);
         my $cli  = mbsync_cli($rec);
@@ -5549,7 +5816,14 @@ sub reap_children {
             log_info($line);
         } else {
             log_warn($line);
-            requeue_after_conn_limit($rec) if conn_limit_error($errline);
+            if (conn_limit_error($errline)) {
+                requeue_after_conn_limit($rec);
+            } elsif (($status & 127) == 0 && sync_state_issue($errtext)) {
+                recover_sync_state($errtext, $rec);
+            } elsif (($status & 127) == 0 && $VERBOSE && $errline ne '') {
+                my $ch = _hook_channel($rec);
+                log_info(($ch ne '' ? $ch : 'mbsync') . ': not a sync-state error');
+            }
         }
         if (ref $rec eq 'HASH' && ($rec->{pulse} // '') ne '' && ($rec->{track} // '') eq '') {
             finish_pulse_channel($rec->{pulse});
@@ -5591,6 +5865,18 @@ my %box_last_run;
 my %box_pending;
 my %box_wait;
 my %batch;
+
+sub batch_folders_for_test {
+    my @out;
+    for my $ch (sort keys %batch) {
+        for my $box (sort keys %{ $batch{$ch}{boxes} // {} }) {
+            push @out, "$ch:$box";
+        }
+    }
+    return @out;
+}
+
+sub reset_batch_for_test { %batch = (); }
 
 sub _named_queued { return keys %batch ? 1 : 0; }
 
@@ -8236,6 +8522,7 @@ sub reload_config_now {
     install_track($track, 1);
     _request_list_refresh();
     log_info('config reloaded');
+    log_state_keep_verbose();
     return '';
 }
 

@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 20 2026 $
+.Dd $Mdocdate: November 24 2026 $
 .Dt IMAPIDLE 1
 .Os
 .Sh NAME
@@ -237,6 +237,14 @@ was armed again.
 They are omitted by default.
 The first look at a host also logs the authentication
 mechanisms that server offers, once.
+It also logs the
+.Va state_keep
+pattern and, for each configured mailbox, whether a
+sync-state failure would keep or remove it.
+An
+.Sy mbsync
+error that is not a sync-state failure logs
+.Ql not a sync-state error .
 The flag applies when the process is a daemon and with
 .Fl d .
 .It Fl n
@@ -490,6 +498,42 @@ this run against its average.
 Every one of those figures is totaled either way.
 A zero status is informational.
 Any other exit is a warning.
+A sync-state failure is handled separately.
+That is an unreadable or incomplete
+.Pa .mbsyncstate ,
+or a UIDVALIDITY change
+.Sy mbsync
+will not recover.
+The local mailbox is removed and that one box is synced again,
+so the server copy is downloaded.
+.Va state_keep
+in
+.Pa [track]
+is a case-insensitive regular expression of mailbox names
+that are left in place.
+The default is
+.Ql (?:^|/)(?:draft|sent)[^/]*$
+which matches a final component that starts with
+.Cm draft
+or
+.Cm sent .
+That keeps
+.Cm Drafts ,
+.Cm Sent ,
+.Cm Sent Items ,
+.Cm Sent Messages ,
+and
+.Cm Sent Mail ,
+including
+.Ql [Gmail]/Sent Mail .
+.Cm Trash ,
+.Cm Calendar ,
+and
+.Cm INBOX
+do not match, so those mailboxes are removed.
+Any other
+.Sy mbsync
+error is only the warning, and the mailbox is not removed.
 The IMAP loop does not wait for
 .Sy mbsync
 to finish.

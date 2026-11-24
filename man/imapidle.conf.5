@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 20 2026 $
+.Dd $Mdocdate: November 24 2026 $
 .Dt IMAPIDLE.CONF 5
 .Os
 .Sh NAME
@@ -779,6 +779,41 @@ when that file exists, otherwise
 .Ev XDG_CONFIG_HOME
 defaults to
 .Pa ~/.config .
+.It Va state_keep
+Case-insensitive regular expression of mailbox names that are
+not removed when
+.Sy mbsync
+reports a broken
+.Pa .mbsyncstate
+or a UIDVALIDITY change it will not recover.
+A name that does not match is removed and that one box is
+synced again.
+Any other
+.Sy mbsync
+error is a warning and does not remove the mailbox.
+The default is
+.Ql (?:^|/)(?:draft|sent)[^/]*$
+which matches a final component that starts with
+.Cm draft
+or
+.Cm sent .
+That keeps
+.Cm Drafts ,
+.Cm Sent ,
+.Cm Sent Items ,
+.Cm Sent Messages ,
+and
+.Cm Sent Mail ,
+including
+.Ql [Gmail]/Sent Mail .
+.Cm Trash ,
+.Cm Calendar ,
+and
+.Cm INBOX
+do not match.
+An empty value keeps that default.
+A pattern that does not compile is rejected.
+Setting this key replaces the default.
 .It Va hook
 A command passed to
 .Pa /bin/sh
@@ -1064,6 +1099,7 @@ capability = 604800
 connections = 2
 tunnel = no
 tunnel_timeout = 3600
+state_keep = (?:^|/)(?:draft|sent)[^/]*$
 .Ed
 .Sh SEE ALSO
 .Xr syslog 3 ,
