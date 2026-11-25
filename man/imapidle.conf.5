@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 24 2026 $
+.Dd $Mdocdate: November 25 2026 $
 .Dt IMAPIDLE.CONF 5
 .Os
 .Sh NAME
@@ -37,19 +37,24 @@ of
 .Cm server ,
 .Cm account ,
 .Cm idle ,
+.Cm pulse ,
 or
-.Cm pulse .
+.Cm dns .
 The comparison ignores case.
 The section name is a label used in log lines.
 At most one
 .Cm global
-section is allowed.
+section is allowed, and at most one
+.Cm dns
+section.
 A missing
 .Va type ,
 an unknown
 .Va type ,
-or a second
+a second
 .Cm global
+section, or a second
+.Cm dns
 section rejects the file.
 .Cm server
 names a host, a port, and how the session is encrypted.
@@ -167,10 +172,37 @@ are not accepted.
 .Cm server ,
 .Cm account ,
 .Cm idle ,
+.Cm pulse ,
 or
-.Cm pulse .
+.Cm dns .
 Required.
 The comparison ignores case.
+.It Va min_ttl
+On a
+.Cm dns
+section, the fewest seconds a positive answer is kept.
+The default is 86400.
+An empty value keeps that default.
+A remote TTL that is longer is kept for that TTL unless
+.Va max_ttl
+is set.
+A name that does not resolve is tried again after 30
+seconds, then 60, then 120, and so on.
+The wait stops doubling at the negative TTL from the SOA
+when the reply has one, and at
+.Va min_ttl
+when it does not.
+A negative TTL under 30 seconds still waits 30 seconds.
+.It Va max_ttl
+On a
+.Cm dns
+section, an optional ceiling in seconds.
+When it is omitted or empty, a remote TTL above
+.Va min_ttl
+is kept as the server sent it.
+A value below
+.Va min_ttl
+is rejected.
 .It Va disabled
 Set to
 .Cm yes
@@ -907,6 +939,18 @@ and
 are written from a handshake or for one
 .Sy mbsync
 and are not part of that look.
+.Pa dnscache.db
+is written when a lookup finishes.
+.It Pa ~/.local/imapidle/dnscache.db
+Addresses for the configured server names.
+The hub writes a row when a lookup finishes and reads
+the file again on the next start.
+A positive answer is kept for at least
+.Va min_ttl
+seconds.
+The file mode is 0600 when
+.Nm imapidle
+creates it.
 .It Pa ~/.local/imapidle/known_hosts
 SHA256 certificate fingerprints.
 A current line is

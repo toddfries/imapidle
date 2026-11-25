@@ -30,7 +30,7 @@ use IMAPIDLE::Imsg;
 sub run {
 	my ($sock) = @_;
 	my $ib = IMAPIDLE::Imsg->open(fileno($sock));
-	OpenBSD::Pledge::pledge(qw(stdio inet dns rpath recvfd))
+	OpenBSD::Pledge::pledge(qw(stdio inet rpath recvfd))
 	    or die "account pledge: $!\n";
 	my $msg = $ib->recv;
 	return if !$msg || $msg->{type} == IMAPIDLE::IMSG_SHUTDOWN;

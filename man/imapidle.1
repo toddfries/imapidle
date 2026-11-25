@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: November 24 2026 $
+.Dd $Mdocdate: November 25 2026 $
 .Dt IMAPIDLE 1
 .Os
 .Sh NAME
@@ -73,6 +73,28 @@ followed by its account and folder.
 A pulse process is
 .Ql imapidle: account
 followed by its account.
+.Pp
+The hub resolves each server name and keeps the addresses in
+.Pa ~/.local/imapidle/dnscache.db .
+A worker is given those addresses and does not look the name up.
+The name is still the name checked on the certificate.
+A positive answer is kept for at least
+.Va min_ttl
+seconds, 86400 by default.
+A longer TTL from the server is kept for that TTL unless
+.Va max_ttl
+is set.
+A name that does not resolve is tried again after 30 seconds,
+then 60, then 120, and so on, up to the negative TTL in the SOA
+when the reply has one, and up to
+.Va min_ttl
+when it does not.
+A negative TTL under 30 seconds still waits 30 seconds.
+One name does not delay another.
+.Sy mbsync
+still resolves the name itself.
+See
+.Sy imapidle.conf(5) .
 .Pp
 Each account is independent.
 A bad password, a refused certificate, a dead server, or a broken
@@ -810,7 +832,7 @@ synced.
 Neither of those raises the learned limit.
 .Pp
 The first look at a host sends
-.Dl ID ("name" "imapidle" "version" "0.3")
+.Dl ID ("name" "imapidle" "version" "0.4")
 and
 .Cm CAPABILITY
 on the connection that then watches the account.
@@ -973,6 +995,17 @@ sends
 .Dv SIGTERM .
 .It Pa ~/.local/imapidle/
 State directory, mode 0700.
+.It Pa ~/.local/imapidle/dnscache.db
+Addresses for the configured server names.
+The hub writes a row when a lookup finishes and reads the
+file again on the next start.
+A positive answer is not queried again until its TTL, and
+not before
+.Va min_ttl
+seconds.
+The file mode is 0600 when
+.Nm
+creates it.
 .It Pa ~/.local/imapidle/tunnel/
 Mode 0600 copies of the
 .Sy mbsync

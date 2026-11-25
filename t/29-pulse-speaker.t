@@ -24,6 +24,8 @@ use IO::Socket::INET ();
 use POSIX qw(_exit WNOHANG);
 use Socket qw(AF_UNIX SOCK_STREAM);
 
+my $asr = system('make', '-C', "$Bin/../ext/asr");
+is($asr, 0, 'the asr wrapper builds') or BAIL_OUT('asr build failed');
 my $built = system('make', '-C', "$Bin/../ext/imsg");
 is($built, 0, 'the imsg wrapper builds') or BAIL_OUT('imsg build failed');
 

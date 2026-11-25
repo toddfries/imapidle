@@ -21,11 +21,16 @@ package IMAPIDLE::Idle;
 use strict;
 use warnings;
 
-use Errno qw(EAGAIN EINTR EWOULDBLOCK);
+use Errno qw(EAGAIN EINTR EISCONN EINPROGRESS EWOULDBLOCK);
+use IO::Handle ();
 use IO::Select ();
 use IO::Socket::INET ();
 use IO::Socket::SSL ();
 use OpenBSD::Pledge ();
+use Socket qw(
+	AF_INET AF_INET6 SOCK_STREAM SOL_SOCKET SO_ERROR
+	inet_pton pack_sockaddr_in pack_sockaddr_in6
+);
 use Time::HiRes ();
 
 use IMAPIDLE ();
@@ -37,7 +42,7 @@ my $SEQ = 0;
 sub run {
 	my ($sock) = @_;
 	my $ib = IMAPIDLE::Imsg->open(fileno($sock));
-	OpenBSD::Pledge::pledge(qw(stdio inet dns rpath recvfd))
+	OpenBSD::Pledge::pledge(qw(stdio inet rpath recvfd))
 	    or die "idle pledge: $!\n";
 	my $msg = $ib->recv;
 	return if !$msg || $msg->{type} == IMAPIDLE::IMSG_SHUTDOWN;
@@ -239,6 +244,16 @@ sub _open_session {
 		1;
 	} or $err = main::scrub($@, $secret);
 	if ($err) {
+		if ($err eq 'dns') {
+			eval {
+				$ib->send(IMAPIDLE::IMSG_DROP, IMAPIDLE::json_encode({
+					account => $account // '',
+					folder  => $folder // '',
+					dns     => 1,
+				}));
+			};
+			return;
+		}
 		if (main::conn_limit_error($err)) {
 			$err = main::scrub($err);
 			$err =~ s/\s+/ /g;
@@ -269,58 +284,98 @@ sub _leave {
 	return;
 }
 
-sub _connect {
-	my ($info) = @_;
-	my $proto = $info->{proto} // 'tls';
-	my $host = $info->{host};
-	my $port = $info->{port};
+# The hub already resolved the name. This process has no dns pledge,
+# so the socket is built with inet_pton and the name stays SSL_hostname.
+sub _tcp {
+	my ($addr, $port) = @_;
+	return if !defined $addr || $addr eq '';
+	my $v6 = $addr =~ /:/;
+	my $fam = $v6 ? AF_INET6 : AF_INET;
+	my $bin = inet_pton($fam, $addr);
+	return if !defined $bin;
+	my $sa = $v6 ? pack_sockaddr_in6($port, $bin) : pack_sockaddr_in($port, $bin);
+	socket(my $sock, $fam, SOCK_STREAM, 0) or return;
+	bless $sock, 'IO::Socket::INET';
+	$sock->blocking(0);
+	my $ok = connect($sock, $sa);
+	if (!$ok && $!{EISCONN}) {
+		$ok = 1;
+	} elsif (!$ok && ($!{EINPROGRESS} || $!{EWOULDBLOCK} || $!{EAGAIN} || $!{EINTR})) {
+		my $win = '';
+		vec($win, fileno($sock), 1) = 1;
+		my $n = select(undef, $win, undef, 30);
+		if (!defined $n || $n <= 0) {
+			close $sock;
+			return;
+		}
+		my $packed = getsockopt($sock, SOL_SOCKET, SO_ERROR);
+		if (!defined $packed) {
+			close $sock;
+			return;
+		}
+		if (unpack('i', $packed)) {
+			close $sock;
+			return;
+		}
+		$ok = 1;
+	}
+	if (!$ok) {
+		close $sock;
+		return;
+	}
+	$sock->blocking(1);
+	$sock->autoflush(1);
+	return $sock;
+}
+
+sub _promote {
+	my ($fh, $proto, $host) = @_;
 	if ($proto eq 'notls') {
-		my $fh = IO::Socket::INET->new(
-			PeerAddr => $host,
-			PeerPort => $port,
-			Proto    => 'tcp',
-			Timeout  => 30,
-		) or die "connect\n";
-		$fh->autoflush(1);
 		my $greet = _line($fh);
 		die "greeting\n" unless $greet =~ /^\* (OK|PREAUTH)\b/i;
 		return ($fh, $greet =~ /PREAUTH/i ? 1 : 0);
 	}
 	if ($proto eq 'starttls') {
-		my $fh = IO::Socket::INET->new(
-			PeerAddr => $host,
-			PeerPort => $port,
-			Proto    => 'tcp',
-			Timeout  => 30,
-		) or die "connect\n";
-		$fh->autoflush(1);
 		my $greet = _line($fh);
 		die "greeting\n" unless $greet =~ /^\* (OK|PREAUTH)\b/i;
 		_send($fh, 'a0 STARTTLS');
 		my $line = _line($fh);
 		die "starttls\n" unless $line =~ /^a0 OK\b/i;
-		my $tls = IO::Socket::SSL->start_SSL(
-			$fh,
-			SSL_verify_mode => IO::Socket::SSL::SSL_VERIFY_NONE(),
-			SSL_hostname    => $host,
-			Timeout         => 30,
-		);
-		die "tls\n" unless $tls;
-		$tls->autoflush(1);
-		return ($tls, 0);
 	}
-	my $fh = IO::Socket::SSL->new(
-		PeerAddr        => $host,
-		PeerPort        => $port,
-		Proto           => 'tcp',
-		Timeout         => 30,
+	my $tls = IO::Socket::SSL->start_SSL(
+		$fh,
 		SSL_verify_mode => IO::Socket::SSL::SSL_VERIFY_NONE(),
 		SSL_hostname    => $host,
-	) or die "connect\n";
-	$fh->autoflush(1);
-	my $greet = _line($fh);
+		Timeout         => 30,
+	);
+	die "tls\n" unless $tls;
+	$tls->autoflush(1);
+	if ($proto eq 'starttls') {
+		return ($tls, 0);
+	}
+	my $greet = _line($tls);
 	die "greeting\n" unless $greet =~ /^\* (OK|PREAUTH)\b/i;
-	return ($fh, $greet =~ /PREAUTH/i ? 1 : 0);
+	return ($tls, $greet =~ /PREAUTH/i ? 1 : 0);
+}
+
+sub _connect {
+	my ($info) = @_;
+	my $proto = $info->{proto} // 'tls';
+	my $host = $info->{host};
+	my $port = $info->{port};
+	my @addrs = grep { defined $_ && $_ ne '' } @{ $info->{addrs} // [] };
+	die "dns\n" unless @addrs;
+	my $tcp_fail = 0;
+	for my $addr (@addrs) {
+		my $fh = _tcp($addr, $port);
+		if (!$fh) {
+			$tcp_fail++;
+			next;
+		}
+		return _promote($fh, $proto, $host);
+	}
+	die "dns\n" if $tcp_fail == @addrs;
+	die "connect\n";
 }
 
 sub _authenticate {

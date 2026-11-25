@@ -35,7 +35,7 @@ use POSIX qw(:sys_wait_h :signal_h _exit setsid);
 use Sys::Syslog qw(:standard :macros);
 use Time::HiRes qw(time);
 
-my $VERSION = '0.3';
+my $VERSION = '0.4';
 my $CONFIG_DIR;
 my $CONFIG_FILE;
 my $SELF_PATH = abs_path($0) // $0;
@@ -56,6 +56,10 @@ my $VERBOSE    = 0;
 my $LOG_OPEN   = 0;
 # -n keeps loaded state in this process and never rewrites it.
 our $DRY_RUN = 0;
+# Positive answers are kept at least this long. max_ttl is optional.
+my $DNS_LIMITS = { min_ttl => 86400 };
+my $PARSED_DNS = { min_ttl => 86400 };
+my $DNS_READY = 0;
 
 my %accounts;
 my %conns;
@@ -1107,6 +1111,87 @@ sub _blank_track {
 $track_cfg = _blank_track();
 
 # [track] is not an account. Missing section means these defaults.
+sub _parse_dns_section {
+    my ($name, $row, $problems) = @_;
+    my $lim = { min_ttl => 86400 };
+    $PARSED_DNS = $lim;
+    return $lim unless ref $row eq 'HASH';
+    $name = 'dns' if !defined $name || $name eq '';
+    my $bad = sub { push @$problems, "[$name] $_[0]"; };
+    if (exists $row->{min_ttl} && defined $row->{min_ttl} && $row->{min_ttl} =~ /\S/) {
+        my $v = $row->{min_ttl};
+        $v =~ s/^\s+|\s+$//g;
+        if ($v !~ /^\d+$/ || $v > 2147483647) {
+            $bad->('bad min_ttl');
+        } else {
+            $lim->{min_ttl} = $v + 0;
+        }
+    }
+    if (exists $row->{max_ttl} && defined $row->{max_ttl} && $row->{max_ttl} =~ /\S/) {
+        my $v = $row->{max_ttl};
+        $v =~ s/^\s+|\s+$//g;
+        if ($v !~ /^\d+$/ || $v > 2147483647) {
+            $bad->('bad max_ttl');
+        } else {
+            $lim->{max_ttl} = $v + 0;
+        }
+    }
+    if (defined $lim->{max_ttl} && $lim->{max_ttl} < $lim->{min_ttl}) {
+        $bad->('max_ttl below min_ttl');
+    }
+    $PARSED_DNS = $lim;
+    return $lim;
+}
+
+sub install_dns_limits {
+    $DNS_LIMITS = { min_ttl => $PARSED_DNS->{min_ttl} // 86400 };
+    $DNS_LIMITS->{max_ttl} = $PARSED_DNS->{max_ttl}
+        if defined $PARSED_DNS->{max_ttl};
+    return unless $DNS_READY;
+    require IMAPIDLE::Dns;
+    IMAPIDLE::Dns::configure($DNS_LIMITS->{min_ttl}, $DNS_LIMITS->{max_ttl});
+    return;
+}
+
+sub dns_open {
+    require IMAPIDLE::Dns;
+    IMAPIDLE::Dns::configure($DNS_LIMITS->{min_ttl} // 86400, $DNS_LIMITS->{max_ttl});
+    return if $DNS_READY;
+    my $path;
+    if ($DRY_RUN) {
+        $path = ':memory:';
+    } else {
+        return if !defined $STATE_DIR || $STATE_DIR eq '';
+        $path = "$STATE_DIR/dnscache.db";
+    }
+    IMAPIDLE::Dns::open_cache($path);
+    $DNS_READY = 1;
+    return;
+}
+
+sub dns_addresses {
+    my ($host) = @_;
+    require IMAPIDLE::Dns;
+    my $addrs = eval { IMAPIDLE::Dns::addresses($host) };
+    return $addrs if ref $addrs eq 'ARRAY' && @$addrs;
+    return;
+}
+
+sub dns_invalidate {
+    my ($host) = @_;
+    return unless $DNS_READY;
+    require IMAPIDLE::Dns;
+    eval { IMAPIDLE::Dns::invalidate($host); 1 };
+    return;
+}
+
+sub dns_limits_for_test {
+    return {
+        min_ttl => $DNS_LIMITS->{min_ttl},
+        max_ttl => $DNS_LIMITS->{max_ttl},
+    };
+}
+
 sub _parse_track_section {
     my ($name, $row, $problems) = @_;
     my $cfg = _blank_track();
@@ -1972,7 +2057,7 @@ sub parse_config_file {
       or return (undef, "Cannot read $file: " . (Config::Tiny->errstr // $!));
 
     my (@problems, %server_rows, %account_rows, %idle_rows, @pulse_rows);
-    my ($global_name, $global_row);
+    my ($global_name, $global_row, $dns_name, $dns_row);
     my $hyper_default = 0;
     for my $section (keys %{$cfg}) {
         next if $section eq '_';
@@ -2017,6 +2102,15 @@ sub parse_config_file {
         }
         if ($type eq 'pulse') {
             push @pulse_rows, [ $section, $row ];
+            next;
+        }
+        if ($type eq 'dns') {
+            if ($dns_row) {
+                push @problems, "[$section] second dns section";
+                next;
+            }
+            $dns_name = $section;
+            $dns_row = $row;
             next;
         }
         push @problems, "[$section] bad type";
@@ -2162,6 +2256,7 @@ sub parse_config_file {
         $seen_ch{$ch} = 1;
     }
 
+    _parse_dns_section($dns_name, $dns_row, \@problems);
     my $track = _parse_track_section($global_name, $global_row, \@problems);
     if (@problems) {
         return (undef, join("\n", @problems));
@@ -2419,6 +2514,7 @@ sub load_config {
     install_servers($srv);
     install_pulse($off, 0, $quiet);
     install_track($track, 0, $quiet);
+    install_dns_limits();
     if (!$quiet) {
         _log_loaded_account($_) for sort keys %accounts;
     }
@@ -9570,8 +9666,27 @@ sub service_wait {
         vec($rin, $fd, 1) = 1;
     }
     my $win = '';
+    # DNS queries share this wait. Their descriptors are not handed
+    # back to the hub; a finished reply is applied before we return.
+    if ($DNS_READY) {
+        my $watch = IMAPIDLE::Dns::watch();
+        for my $fd (@{ $watch->{read} // [] }) {
+            vec($rin, $fd, 1) = 1 if defined $fd && $fd >= 0;
+        }
+        for my $fd (@{ $watch->{write} // [] }) {
+            vec($win, $fd, 1) = 1 if defined $fd && $fd >= 0;
+        }
+        if (defined $watch->{timeout}
+            && (!defined $timeout || $watch->{timeout} < $timeout)) {
+            $timeout = $watch->{timeout};
+        }
+    }
     my $ein = '';
+    $! = 0;
     my $n = _pselect($rin, $win, $ein, $timeout);
+    if ($DNS_READY) {
+        IMAPIDLE::Dns::ready($rin, $win, defined $n ? $n : -1);
+    }
     return if !defined $n || $n <= 0;
     my @ready;
     for my $fh (@handles) {

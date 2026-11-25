@@ -272,7 +272,12 @@ sub serve {
 	IMAPIDLE::Imsg::set_title('imapidle: parent');
 	# mbsync is exec'd by the live hub and keeps this pledge.
 	# -n never execs it, so that parent can be narrowed.
+	# DBI and the resolver are mapped first. The pledge has no
+	# prot_exec, and the hub opens the cache after it.
 	if (!$REAL) {
+		require DBI;
+		require DBD::SQLite;
+		require IMAPIDLE::Asr;
 		OpenBSD::Pledge::pledge(
 		    qw(stdio proc exec rpath sendfd recvfd inet dns unix unveil))
 		    or die "parent pledge: $!\n";
@@ -474,6 +479,7 @@ sub _dry_hub {
 		die "$err\n";
 	}
 	main::open_state_dir();
+	main::dns_open();
 	OpenBSD::Pledge::pledge(
 	    qw(stdio rpath sendfd recvfd proc exec unix inet dns))
 	    or die "hub pledge: $!\n";
@@ -491,7 +497,10 @@ sub _dry_hub {
 		_dry_finish($now, \%jobs);
 		_dry_spawn($up, $now, \%jobs);
 		_dry_start($now, \%jobs);
-		my @ready = $sel->can_read(_dry_wake($now, \%jobs));
+		my @ready = main::service_wait($sel, _dry_wake($now, \%jobs));
+		if (!@ready && $! && $!{EINTR}) {
+			next;
+		}
 		for my $fh (@ready) {
 			$quit = _dry_read($fh, $up_fh, $up, \%jobs, \%fd_job, $sel);
 			last if $quit;
@@ -672,6 +681,7 @@ sub _dry_login {
 		host    => $job->{host},
 		port    => $job->{port} + 0,
 		proto   => $job->{proto},
+		addrs   => $job->{addrs} // [],
 		user    => $job->{user},
 		secret  => $secret,
 		auth    => $job->{auth},
@@ -710,6 +720,8 @@ sub _dry_worker {
 		# one that fills the server. Close the extra folder here too.
 		_shed_login($jobs, $job, main::imsg_conn_limit_until($job->{account}))
 		    if $REAL;
+	} elsif ($msg->{type} == IMAPIDLE::IMSG_DROP && $row->{dns}) {
+		main::dns_invalidate($job->{host} // '');
 	} elsif ($REAL && $msg->{type} == IMAPIDLE::IMSG_DROP && $row->{limit}) {
 		my $open = _armed_on_login($jobs, $job->{account}, $job);
 		my $pending = _pending_on_login($jobs, $job->{account}, $job);
@@ -842,6 +854,9 @@ sub _dry_spawn {
 				next;
 			}
 		}
+		my $addrs = main::dns_addresses($job->{host} // '');
+		next unless $addrs && @$addrs;
+		$job->{addrs} = $addrs;
 		$job->{up} = 'pending';
 		$up->send(IMAPIDLE::IMSG_SPAWN, IMAPIDLE::json_encode({
 			id      => $id,
@@ -1197,6 +1212,7 @@ sub _live_hub {
 		die "$err\n";
 	}
 	main::open_state_dir();
+	main::dns_open();
 	main::log_state_keep_verbose();
 	main::install_chld_signal();
 	main::install_info_signal();
